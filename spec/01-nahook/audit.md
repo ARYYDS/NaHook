@@ -69,13 +69,13 @@ $env:CGO_ENABLED = '1'; go test -race -count=1 ./...
 $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -trimpath -o "O:\WinCache\nahook\dist\$(git rev-parse --short=8 HEAD)\" ./cmd/...; Remove-Item Env:GOOS, Env:GOARCH
 ```
 
-这一条的适用范围：仓库里还没有 `cmd/` 时（T1–T5），改成执行下面这条，用同样的环境变量交叉编译全部库包，不产出二进制：
+上面这条产出二进制，只在 T8 的 `scripts/build.ps1` 里执行。日常门禁执行下面这条：用同样的环境变量交叉编译仓库里的全部包（包括 `cmd/` 和没被任何 `cmd` 引用的库包），不产出二进制：
 
 ```powershell
 $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -trimpath ./...; Remove-Item Env:GOOS, Env:GOARCH
 ```
 
-从 T6（开始有 `cmd/`）起，必须执行 `./cmd/...` 那一条。
+不要把日常门禁换成 `./cmd/...`：那样只会编译被 `cmd` 引用到的包，没被引用的库包就漏掉了 linux 交叉编译检查（`cmd/mockrelay` 不引用任何 `internal` 包）。
 
 另外两条要求：
 

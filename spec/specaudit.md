@@ -270,3 +270,25 @@ DSH 交付回报里的风险点和自行决定，架构侧的裁决：
 | T6 前置加上 T5；T7 提到 T5 前面，先填 T0 结论出来之前的空档 | tasks §1、T5、T6 |
 | mockrelay：`-listen`、`/__mode` 和 `/__log` 的格式、帧格式、固定内容；新增 `slow`、`hold_rate_limit`、`stall_rate_limit`、`hold_http429`；`http429`、`quota` 写明响应体；路径不匹配时回 400 | design §6.6；tasks T7；audit T-C3、T-F15 |
 | NewAPI 自己的终态错误（消息末尾是本次 request id）原样放行，不重试 | design §1.6、§8；interface §3；tasks T5；audit T-F17、K7 |
+
+### 7.9 T7 审计（提交 `91bf3aa`，由架构侧直接审计、直接修复）
+
+DSH 交付回报里的自行决定和风险点，架构侧的裁决：
+
+| 事项 | 裁决 | 回写位置 |
+|---|---|---|
+| `/__mode` 成功时回显 `{"script":[…]}` | 采纳 | 01 design §6.6 |
+| 没设过脚本时回 503，并照样记账 | 采纳。官方默认不自动禁用渠道，打开后按状态码也只禁用 401，503 不会把测试渠道禁掉 | 01 design §6.6 |
+| 帧里加了 OpenAI 帧的常规字段 | 采纳。官方 NewAPI 逐帧解析成 `dto.ResponsesStreamResponse`，这些字段都能解析；完整字节以测试里的黄金常量为准 | 01 design §6.6 |
+| delta 文本 `Hello`、` world`、`!` 循环；`slow` 的发送时机；N=3 时和 `ok` 逐字节相同 | 采纳 | 01 design §6.6 |
+| 秒数用 `strconv.Atoi` 校验，`01`、`+1` 也接受 | 接受：它们都是正整数 | — |
+| 控制面统一用 `json.Marshal` 加一次 `Write` | 采纳 | — |
+| 门禁 ④ 从 T6 起改用 `./cmd/...` | 改为日常门禁始终用 `./...`；`./cmd/...` 产出二进制，只在 T8 的构建脚本里执行。只编译 `./cmd/...` 会漏掉没被 `cmd` 引用的库包 | 01 audit §3 |
+
+审计发现的问题，在 `audit/T7` 分支上修复：
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| L-a | P2 | 业务请求的处理函数不读请求体。请求带请求体时，net/http 要等请求体读完才启动检测断开的后台读，而 NewAPI 发出的请求一定带请求体，所以 NewAPI 断开后 `hold`、`slow`、`stall` 仍会等满。原测试只传入已经取消的 ctx，测不到这条路径 | 等待之前先读完请求体；新增 `TestClosedConnectionStopsHold`，用真实 TCP 连接加请求体来测 |
+
+修复提交 `5cc175c`。Win11 门禁：gofmt 无输出；vet 退出码 0；`go test -race ./...` 五个包全部 ok，顶层 80 个 PASS、0 个 FAIL；新测试连跑 3 次稳定；反证：把 `server.go` 换回 `91bf3aa` 的版本，新测试在 5.00s 时失败（"hold:5 kept waiting after the client closed its connection"）；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF。

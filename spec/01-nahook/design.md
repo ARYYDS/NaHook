@@ -607,6 +607,10 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `hold_http429:<秒>` | 两条都适用 | 先不回响应头，等 N 秒后再按 `http429` 回（T-F17：NewAPI 的心跳先提交了 200，最终错误会以 SSE 帧的形式写出） |
 
 - 脚本项和请求路径不匹配时（比如 `rate_limit` 碰上 chat 路径），回 400 `{"error":{"message":"mockrelay: item <项> does not apply to <路径>"}}`。这次请求照样记进 `/__log`。
+- 启动后还没设过脚本时，业务请求回 503 `{"error":{"message":"mockrelay: no script configured"}}`，照样记进 `/__log`（`item` 为空串）。官方 NewAPI 默认不自动禁用渠道，打开后按状态码也只禁用 401（`NEWAPI/common/constants.go:134`、`NEWAPI/setting/operation_setting/status_code_ranges.go:17`），所以 503 不会把测试渠道禁掉。
+- `/__mode` 成功时回 200 `{"script":[…]}`，原样回显被接受的脚本。控制面的响应都是 `application/json`。
+- delta 的文本按 `Hello`、` world`、`!` 循环。帧里除了上面写死的字段，还带有 OpenAI 帧的常规字段（`object`、`created_at`、`status`、`item_id`、`output_index`、`content_index`、`choices`）。每一帧的完整字节以 `cmd/mockrelay/server_test.go` 里的黄金常量为准；官方 NewAPI 逐帧解析成 `dto.ResponsesStreamResponse`，用量取自 `response.completed`（`NEWAPI/relay/channel/openai/relay_responses.go:80-96`）。
+- 业务请求在开始任何等待之前，先把请求体读完（见 §8）。
 
 ### 6.7 `internal/obs`
 
@@ -678,5 +682,6 @@ GitHub Release（公开）
 | 在代 429 里改写或脱敏上游 message | 和 h3 不一致 | 原样保留。NewAPI 只会脱敏渠道自己的 Base URL；LT 的报错文案里没有渠道地址（`自动调度/07-lt-measurements.md` §2） |
 | 配置的临时文件写到 `/tmp` 再改名 | 跨文件系统时 rename 不是原子的 | 临时文件放在同一目录，并对文件和目录都做 fsync |
 | socket 文件残留 | 重启时 Listen 失败 | 启动时先删掉；或交给 `RuntimeDirectory` 管理 |
+| 处理函数不读请求体，就开始等待（mockrelay 的 `hold`、`slow`、`stall`） | 请求带请求体时，net/http 要等请求体读完才启动检测断开的后台读，所以对端断开后 `r.Context()` 不会被取消，等待会一直持续到结束 | 等待之前先 `io.Copy(io.Discard, r.Body)`（Go 源码 `net/http/server.go` 里 `startBackgroundRead` 的注释：请求带请求体时，要等请求体全部读完才启动后台读）。nahook 的 `classify` 会先把请求体读进缓存，所以不受影响 |
 | 一直不读完、不关闭被拦截的那次响应体 | 连接泄漏 | 被拦截后立即 `resp.Body.Close()` |
 | 只要 200 SSE 里出现限流帧就重试 | 打开心跳时，NewAPI 会先提交 200，按 RetryTimes 重试完以后再把自己的终态错误写进流里；nahook 再重试一轮，两层重试就叠加了 | 消息以 ` (request id: <本次的 X-Oneapi-Request-Id>)` 结尾时原样放行（§1.6；`NEWAPI/controller/relay.go:99-101`） |
