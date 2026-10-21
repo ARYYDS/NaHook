@@ -358,7 +358,7 @@ Caddy      nahook                        NewAPI                上游
 
 ```text
   … 第 3 次重试仍被拦截：n=3 ≥ max=3
-  │◄─429 {"error":{…}}─│ proxy429.Write（X-Oneapi-Request-Id 取自最后一次尝试）
+  │◄─429 {"error":{…}}─│ proxy429.Write（白名单头取自最后一次尝试，§1.4）
 ```
 
 ### 3.4 热修改上限

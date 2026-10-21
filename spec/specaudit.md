@@ -237,3 +237,5 @@ DSH 交付回报里的风险点和自行决定，架构侧的裁决：
 | K-a | P2 | 代 429 不带 CORS 头：浏览器端客户端带着 Origin 发请求时，h3 的 429 有 `Access-Control-Allow-Origin`，nahook 的没有，浏览器会因为跨域校验失败而读不到错误 | 按白名单从上一次尝试复制响应头 |
 | K-b | P3 | 代 429 不带 `X-New-Api-Version` | 同上 |
 | K-c | P3 | 状态码先提交、后序列化：序列化一旦失败，就是一个没有响应体的 429 | 先序列化；失败时把 code 换成 null 重试 |
+
+修复提交 `ea75cf0`（`audit/T4`）。Win11 门禁：gofmt 无输出；vet 退出码 0；`go test -race ./...` 四个包全部 ok，顶层 55 个 PASS、0 个 FAIL；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF。
