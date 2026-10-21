@@ -48,8 +48,9 @@ func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []
 		res := startup.Read(resp.Body)
 		if res.Verdict == startup.VerdictRateLimit && newAPIFinalError(res, rid) {
 			// NewAPI's own terminal error: it committed 200 with its heartbeat,
-			// exhausted RetryTimes and wrote the error into the stream with this
-			// request's id at the end. Retrying here would stack two retry loops.
+			// exhausted RetryTimes and wrote the error into the stream (the two
+			// ways to recognise it are on newAPIFinalError). Retrying here would
+			// stack two retry loops.
 			h.st.Inc(obs.Passthrough)
 			release(w, resp, res.Prefix, res.Rest)
 			return

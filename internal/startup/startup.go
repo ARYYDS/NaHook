@@ -106,6 +106,7 @@ func Read(body io.Reader) Result {
 	var eventName string
 	events := 0
 	commentOnly := true // every non-empty line of the current event is a comment
+	hasComment := false // the current event has at least one comment line
 	heartbeats := 0     // comment-only events seen before the deciding frame
 	dataSeen := false   // an earlier event carried more than comments
 
@@ -136,6 +137,7 @@ func Read(body io.Reader) Result {
 				// (interface 2.5: 注释帧). It does not end the comment-only
 				// state, so the event only counts as a heartbeat if every line
 				// looks like this one.
+				hasComment = true
 			case trimmed != "":
 				// Some other non-empty line still means upstream data started.
 				commentOnly = false
@@ -168,17 +170,21 @@ func Read(body io.Reader) Result {
 						Untyped:       !typed,
 					}
 				case decisionContinue:
-					if commentOnly {
-						heartbeats++
-					} else {
+					switch {
+					case !commentOnly:
 						dataSeen = true
+					case hasComment:
+						heartbeats++
 					}
+					// An event of blank lines only carries nothing: SSE does not
+					// dispatch it, so it is neither a heartbeat nor upstream data.
 				}
 			}
 			event.Reset()
 			dataLines = nil
 			eventName = ""
 			commentOnly = true
+			hasComment = false
 		}
 
 		if readErr != nil {

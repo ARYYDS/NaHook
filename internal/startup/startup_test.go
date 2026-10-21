@@ -353,6 +353,17 @@ func TestReadHeartbeatFlags(t *testing.T) {
 			stream:  ping + eventOnly + untyped + done,
 			untyped: true,
 		},
+		{
+			name:    "a blank line on its own is not a heartbeat",
+			stream:  "\n" + untyped + done,
+			untyped: true,
+		},
+		{
+			name:          "a blank line next to a heartbeat does not hide it",
+			stream:        "\n" + ping + untyped + done,
+			heartbeatOnly: true,
+			untyped:       true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -376,5 +387,21 @@ func TestReadHeartbeatFlags(t *testing.T) {
 				t.Fatalf("Rest = %q, want %q", rest, tt.wantRest)
 			}
 		})
+	}
+}
+
+// TestReadRawJSONAfterHeartbeatIsReleased is rc.45's terminal error after a
+// heartbeat: c.JSON appends the error with no data: line, so no event can be
+// decided and the whole stream is released at EOF (design §1.6).
+func TestReadRawJSONAfterHeartbeatIsReleased(t *testing.T) {
+	stream := ": PING\n\n: PING\n\n" +
+		`{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"` + ltMessage + `"}}`
+	res := Read(strings.NewReader(stream))
+
+	if res.Verdict != VerdictRelease {
+		t.Fatalf("Verdict = %d, want release", res.Verdict)
+	}
+	if got := string(res.Prefix) + string(drain(res.Rest)); got != stream {
+		t.Fatalf("Prefix+Rest != original stream:\n got %q\nwant %q", got, stream)
 	}
 }
