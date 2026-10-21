@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -85,7 +86,11 @@ func TestWriteGolden(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			Write(rec, tt.requestID, tt.upstream)
+			var upstream http.Header
+			if tt.requestID != "" {
+				upstream = http.Header{"X-Oneapi-Request-Id": {tt.requestID}}
+			}
+			Write(rec, upstream, tt.upstream)
 
 			if rec.Code != http.StatusTooManyRequests {
 				t.Fatalf("status = %d, want 429", rec.Code)
@@ -149,7 +154,7 @@ func TestWriteGolden(t *testing.T) {
 // a struct reorder must not slip through as "still valid JSON".
 func TestWriteFieldOrder(t *testing.T) {
 	rec := httptest.NewRecorder()
-	Write(rec, "", startup.UpstreamError{
+	Write(rec, nil, startup.UpstreamError{
 		Message: "m",
 		Type:    "t",
 		Param:   "p",
@@ -166,17 +171,70 @@ func TestWriteFieldOrder(t *testing.T) {
 	}
 }
 
-// TestWriteInvalidCodeDoesNotPanic keeps a caller bug from taking the request
-// down: startup only emits canonical JSON, so this path is unreachable in
-// production.
-func TestWriteInvalidCodeDoesNotPanic(t *testing.T) {
+// TestWriteInvalidCodeFallsBackToNull keeps a caller bug from taking the
+// request down or leaving a 429 without a body: startup only emits canonical
+// JSON, so this path is unreachable in production (design §1.4).
+func TestWriteInvalidCodeFallsBackToNull(t *testing.T) {
 	rec := httptest.NewRecorder()
-	Write(rec, "", startup.UpstreamError{Message: "m", Code: json.RawMessage(`{"bad`)})
+	Write(rec, nil, startup.UpstreamError{Message: "m", Type: "t", Code: json.RawMessage(`{"bad`)})
 
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", rec.Code)
 	}
 	if got := rec.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
 		t.Fatalf("Content-Type = %q", got)
+	}
+	want := `{"error":{"message":"m","type":"t","param":"","code":null}}`
+	if got := rec.Body.String(); got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+// TestWriteCopiesAllowlistedHeaders checks the header allowlist of design §1.4:
+// what NewAPI's middleware puts on its own 429 is copied from the last attempt,
+// everything that belongs to the SSE response or the upstream is not.
+func TestWriteCopiesAllowlistedHeaders(t *testing.T) {
+	upstream := http.Header{
+		"X-Oneapi-Request-Id":              {"req-cors"},
+		"X-New-Api-Version":                {"v0.9.1"},
+		"Vary":                             {"Origin", "Access-Control-Request-Method"},
+		"Access-Control-Allow-Origin":      {"https://chat.example.com"},
+		"Access-Control-Allow-Credentials": {"true"},
+		"Access-Control-Expose-Headers":    {"X-Oneapi-Request-Id"},
+		// Not canonical: a header map built by hand must still match.
+		"access-control-max-age": {"43200"},
+
+		"Content-Type":                 {"text/event-stream"},
+		"Content-Length":               {"123"},
+		"Cache-Control":                {"no-cache"},
+		"X-Accel-Buffering":            {"no"},
+		"Connection":                   {"keep-alive"},
+		"Transfer-Encoding":            {"chunked"},
+		"Date":                         {"Tue, 20 Oct 2026 08:00:00 GMT"},
+		"Retry-After":                  {"1"},
+		"Openai-Processing-Ms":         {"42"},
+		"X-Ratelimit-Remaining-Tokens": {"0"},
+	}
+	rec := httptest.NewRecorder()
+	Write(rec, upstream, startup.UpstreamError{Message: "m"})
+
+	want := http.Header{
+		"X-Oneapi-Request-Id":              {"req-cors"},
+		"X-New-Api-Version":                {"v0.9.1"},
+		"Vary":                             {"Origin", "Access-Control-Request-Method"},
+		"Access-Control-Allow-Origin":      {"https://chat.example.com"},
+		"Access-Control-Allow-Credentials": {"true"},
+		"Access-Control-Expose-Headers":    {"X-Oneapi-Request-Id"},
+		"Access-Control-Max-Age":           {"43200"},
+		"Content-Type":                     {"application/json; charset=utf-8"},
+	}
+	if got := rec.Header(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("headers:\n got %v\nwant %v", got, want)
+	}
+
+	// The copy must not alias the upstream slices.
+	upstream["Vary"][0] = "changed"
+	if got := rec.Header()["Vary"][0]; got != "Origin" {
+		t.Fatalf("Vary aliases the upstream header: %q", got)
 	}
 }

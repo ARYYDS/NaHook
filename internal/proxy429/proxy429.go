@@ -10,12 +10,23 @@ package proxy429
 import (
 	"encoding/json"
 	"net/http"
+	"net/textproto"
+	"strings"
 
 	"github.com/ARYYDS/NaHook/internal/startup"
 )
 
 // contentType is what NEWAPI controller/relay.go:105 sets before c.JSON.
 const contentType = "application/json; charset=utf-8"
+
+// copied lists the headers taken from the last upstream attempt, besides every
+// Access-Control-* header: NewAPI's middleware adds them to every response, so
+// h3's own 429 carries them too (design §1.4).
+var copied = map[string]bool{
+	"X-Oneapi-Request-Id": true, // NEWAPI middleware/request-id.go:16
+	"X-New-Api-Version":   true, // NEWAPI middleware/cors.go:20, mounted globally at main.go:198
+	"Vary":                true, // CORS, NEWAPI router/relay-router.go:16
+}
 
 // envelope and openAIError mirror NEWAPI relaykit/types/error.go:13-19. The
 // field order is the wire order. metadata is not emitted: it is omitempty there
@@ -35,29 +46,35 @@ type openAIError struct {
 // write to w: the caller decides to answer 429 only after it knows that nothing
 // has been sent yet (design §1.6).
 //
-// requestID is the X-Oneapi-Request-Id of the last upstream attempt; it is
-// copied as is and the header is omitted when it is empty. The message is never
-// rewritten and no Retry-After is added, so the response stays consistent with
-// what NewAPI itself would have produced.
-func Write(w http.ResponseWriter, requestID string, e startup.UpstreamError) {
-	h := w.Header()
-	h.Set("Content-Type", contentType)
-	if requestID != "" {
-		h.Set("X-Oneapi-Request-Id", requestID)
-	}
-	w.WriteHeader(http.StatusTooManyRequests)
-
-	body, err := json.Marshal(envelope{Error: openAIError{
+// upstream is the response header of the last upstream attempt. Only the
+// request id, X-New-Api-Version, Vary and the Access-Control-* headers are
+// copied; SSE, hop-by-hop, Content-* and forwarded headers are not. The message
+// is never rewritten and no Retry-After is added, so the response stays
+// consistent with what NewAPI itself would have produced.
+func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError) {
+	oe := openAIError{
 		Message: e.Message,
 		Type:    e.Type,
 		Param:   e.Param,
 		Code:    e.Code, // already canonical from startup; nil marshals as null
-	}})
-	if err != nil {
-		// Unreachable while Code comes from startup's canonical encoder: the
-		// three string fields always marshal. The 429 is already committed, so
-		// there is nothing left to change.
-		return
 	}
+	// Marshal before committing the status, so the 429 always has a JSON body.
+	body, err := json.Marshal(envelope{Error: oe})
+	if err != nil {
+		// Unreachable while Code comes from startup's canonical encoder; the
+		// three string fields always marshal.
+		oe.Code = nil
+		body, _ = json.Marshal(envelope{Error: oe})
+	}
+
+	h := w.Header()
+	for k, v := range upstream {
+		ck := textproto.CanonicalMIMEHeaderKey(k)
+		if copied[ck] || strings.HasPrefix(ck, "Access-Control-") {
+			h[ck] = append([]string(nil), v...)
+		}
+	}
+	h.Set("Content-Type", contentType)
+	w.WriteHeader(http.StatusTooManyRequests)
 	_, _ = w.Write(body)
 }
