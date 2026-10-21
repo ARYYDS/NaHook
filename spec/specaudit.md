@@ -601,6 +601,6 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 | T-F17（h3 关护栏） | 同上，h3 护栏关闭 | nahook 拦截 4 次、重试 3 次，mockrelay 4 次，客户端 35.9s 后拿到代 429；直连时 h3 回 200：`: PING` ×3、`data: {"error":…}`（没有 request id）、`data: [DONE]` | **不通过**，见 Q20。设计已改，待 T15 |
 | 阶段 2 预演 | h3 关护栏，经 nahook：`rate_limit, ok` 和一直 `rate_limit` | 前者 200（拦截、等待、重试后放行）；后者 4 次尝试后代 429 | 符合 P-2 的预期 |
 
-收尾：面板由用户改回（失败重试次数 3、心跳间隔 1）。3002 的 h3 对照实例没有用上，按 00 design §6.3 由用户删除（`docker rm -f nahook-h3-ref`，再删 `/root/container/nahook-h3-ref/data`）。
+收尾：面板（K4 期间设成失败重试次数 0、心跳打开）待用户改回原值。3002 的 h3 对照实例没有用上，按 00 design §6.3 由用户删除（`docker rm -f nahook-h3-ref`，再删 `/root/container/nahook-h3-ref/data`）。
 
 还没做：T15 实现、发布、在 LT 上替换 nahook 后用关护栏的 h3 复测 T-F17（切换方法同 K4，需要用户同意）；K9 的大首帧实测（待用户决定 D2）。
