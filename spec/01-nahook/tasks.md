@@ -179,7 +179,7 @@ L-DOC                                                                           
     - [x] 审计合并到 main 之后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
   - 冲突：只改 L-GO 车道的文件；LT 上的替换属于 T10（需要用户同意）
 
-- [ ] **T11 生产阶段 1：部署 nahook + Caddy 路由（护栏仍开着）**（L-OPS，在生产主机上，**需要用户同意**）
+- [ ] **T11 生产阶段 1：部署 nahook + Caddy 路由（护栏仍开着）**（**暂停**：用户 2026-10-22 决定先不上生产；K8 发现生产基线不同，T11–T13 的写法待 specaudit D3 重定）（L-OPS，在生产主机上，**需要用户同意**）
   - 前置：T10 全部通过；T15 已部署到 LT 并复测 T-F17；K8 已核对
   - 改动：从同一个 Release 安装 `nahook.service` 和 `/etc/nahook/config.json`（`retry.max=3`）；备份 Caddyfile 后加 nahook 路由（00 §6.1：不写 `flush_interval`、写 `fail_duration 10s`、不写 `lb_try_duration`）；主站点默认路由如果有 `flush_interval -1`、站点层如果有 `encode`，一并去掉（00 §6.1；用户告知生产没有，K8 核对）；reload
   - 依据：00 §1.2 阶段 1 ｜ audit P-1
