@@ -33,12 +33,12 @@ L-DOC                                                                           
 
 - [ ] **T0 Caddy 2.6.2 断开传播实验（开工第一步，风险验证）**（L-OPS）
   - 前置：无
-  - 改动：完整方案见 `docs/runbook/T0-caddy-disconnect.md`。在 LT 的 Caddyfile 里临时加一个只监听本机回环的站点 `http://127.0.0.1:19444`，下面四个路径分别对应"不回响应头 / 已开始流式输出"和"写 / 不写 `flush_interval -1`"的组合。后端是 `ops/t0/t0_backend.py`，监听 19082 和 19083。执行前要请示用户
+  - 改动：测试方案见 `docs/T0/测试方案.md`，执行要求、红线和回报模板见 `docs/T0/测试要求.md`。在 LT（2026-10-21 起只做测试）的 Caddyfile 末尾临时追加一个只监听本机回环的站点 `http://127.0.0.1:19444`，下面四个路径分别对应"不回响应头 / 已开始流式输出"和"写 / 不写 `flush_interval -1`"的组合。后端是 `ops/t0/t0_backend.py`，监听 19082 和 19083；脚本从 GitHub 按固定提交下载，并用 sha256 校验。由用户和执行子代理配合执行，架构侧审回报
   - 依据：audit K1、T-C1、T-C2
   - 完成判据：
-    - [ ] 四种组合各跑 3 次，`backend.log` 里都有每一次的 `peer_closed`、`timeout_still_open`、`write_failed` 或 `completed`
-    - [ ] 按 runbook §6 的判定表得出结论，写进 specaudit §3 的 Q1，并回写到 00 §6.1 和 audit K1
-    - [ ] 临时站点已删除，Caddyfile 的 sha256 和实验前一致，生产站点健康检查返回 200
+    - [ ] 四种组合各跑 3 次，`t0_report.py` 的 12 行明细都有结果（`hold` 行是 `peer_closed`、`peer_reset` 或 `timeout_still_open`；`stream` 行是 `write_failed` 或 `completed`）
+    - [ ] 按测试方案第 8 节的判定表得出结论；架构侧写进 specaudit §3 的 Q1，并回写到 00 §6.1 和 audit K1
+    - [ ] 临时站点已删除，Caddyfile 的 sha256 和实验前一致，`lt.xhub.chat` 的健康检查返回 200，后端进程已停止
   - 冲突：`/etc/caddy/Caddyfile`（见 §3）
 
 - [ ] **T1 仓库骨架和 config 包**（L-GO）

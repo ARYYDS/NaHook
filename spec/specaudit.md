@@ -41,7 +41,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
   - caddy#6666 记录了这个行为来自 #4952，2024 年 11 月回退；
   - LT 的生产站点配置了 `flush_interval -1`（2026-10-20 读过 Caddyfile）。
 - 影响：如果断开传不到 nahook，客户端走了以后 nahook 还会按上限继续重试。
-- 处理：T0 先按 `docs/runbook/T0-caddy-disconnect.md` 做最小实验（4 种组合各跑 3 次），T-C1/T-C2 再在完整链路上复测。
+- 处理：T0 先按 `docs/T0/测试方案.md` 做最小实验（4 种组合各跑 3 次），T-C1/T-C2 再在完整链路上复测。
 - 结论：待 T0 实测后回填到这里。
 
   > 推论：2.6.2 发布于 2022 年 10 月，#4952 在那之前合入，所以大概率受影响。
@@ -147,7 +147,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | 自动调度只以知识库形式记录 | `渠道监控/自动调度/` |
 | 仓库用 `github.com/ARYYDS/NaHook`；在 Win11 的 `O:\NaHook` 上开发和构建；L-GO 车道交给 Win11 上的 DSH | 01 design §7；01 tasks §0；`docs/任务书-DSH.md`、`docs/开工提示词.md` |
 | LT 上的每一次替换操作都先请示用户 | 01 tasks T0、T9、T11–T13；00 design §1.1 |
-| T0 需要一份完整方案 | `docs/runbook/T0-caddy-disconnect.md` |
+| T0 需要一份完整方案 | `docs/T0/测试方案.md` |
 | SPEC 从 `渠道监控/SPEC/` 迁到 NaHook 仓库的 `spec/`，以仓库为准 | `spec/README.md` |
 | 仓库改为公开；产物用 GitHub Release 分发 | 01 design §7；01 tasks T8、T9 |
 | 公开前去掉：上游 org 编号、LT 的 SSH 登录方式 | `docs/reference/渠道监控/4-4-tpm-retry.md`（快照已脱敏）；本文件 Q9 |
