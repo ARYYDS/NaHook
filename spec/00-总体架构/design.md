@@ -152,7 +152,7 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 
 | 资源 | 预算 / 现状 | 出处 |
 |---|---|---|
-| LT 端口 | 19080、18080 空闲 | 2026-10-21 `ss -ltn` |
+| LT 端口 | 19080 由 nahook、18080 由 mockrelay 占用（T9 部署） | 2026-10-21 T9 之后 `ss -ltnp` |
 | LT 临时端口 | 3002：h3 对照实例，只给 T-F1 用，测完就删 | `01-nahook/audit.md` §2 |
 | 生产主机端口 | 19080 是否空闲 | 待 K8 |
 | nahook 缓存的请求体 | 每个被拦截的请求最多 64MiB，最坏情况是 并发拦截数 × 64MiB | `01-nahook/design.md` §5；实际请求体大小和并发数**待实测**（LT 当天的请求约 19K token，远小于上限） |
@@ -165,12 +165,13 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 
 | 内容 | LT | 生产主机 |
 |---|---|---|
-| Caddyfile | `/etc/caddy/Caddyfile`；改之前先备份成 `Caddyfile.bak.<时间戳>` | 同左（K8 核对） |
+| Caddyfile | `/etc/caddy/Caddyfile`；改之前先备份成 `Caddyfile.bak.<时间戳>`；加 nahook 路由之前的版本是 `Caddyfile.bak.20261021192639` | 同左（K8 核对） |
 | NewAPI 编排 | `/root/container/luna-task/compose.yaml`；2026-10-21 已换成官方镜像，换之前的备份是 `compose.yaml.bak.20261021131926` | 同路径（K8 核对）；阶段 2 改环境变量，阶段 3 改镜像，改之前先备份成 `compose.yaml.bak.<时间戳>` |
 | nahook 配置 | `/etc/nahook/config.json` | 同左 |
 | systemd 单元 | `/etc/systemd/system/{nahook,mockrelay}.service` | `/etc/systemd/system/nahook.service` |
 | 二进制 | `/usr/local/bin/{nahook,nahookctl,mockrelay}` | `/usr/local/bin/{nahook,nahookctl}` |
 | 测试渠道、测试令牌 | 存在 LT 的 MySQL `luna` 里，由用户在面板里创建（§6.2） | 无 |
+| 测试令牌的副本（给 curl 读取） | `/root/.nahook-test-token`，0600，T10 结束后删除 | 无 |
 | h3 对照实例的数据 | `/root/container/nahook-h3-ref/data`（SQLite，测完由用户删除） | 无 |
 
 ## §6 模块细节

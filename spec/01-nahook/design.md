@@ -642,7 +642,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `Retries` | `retries` | 判为限流后还没到上限，进入 `Wait` |
 | `Released` | `released` | 拦截路径上放行 |
 | `GaveUp` | `gave_up` | 返回代 429 |
-| `Passthrough` | `passthrough` | 不拦截的请求转发成功；或拦截路径上 NewAPI 回了非 200 或非 SSE |
+| `Passthrough` | `passthrough` | 不拦截的请求转发成功；或拦截路径上 NewAPI 回了非 200 或非 SSE。Caddy 对 nahook 的健康检查（每 10s 一次 `/api/status`，00 §6.1）也计在这里，空闲时每分钟约加 6 |
 | `BadGateway` | `bad_gateway` | 连不上 NewAPI，回了 502 |
 | `ClientGone` | `client_gone` | `forward`、启动帧读取或 `Wait` 因为 `r.Context()` 取消而结束 |
 

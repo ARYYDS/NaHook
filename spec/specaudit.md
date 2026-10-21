@@ -20,7 +20,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q2 | R3 | 判定·真实帧形态 | 不明 | P1 | 01 | 待 K2（阶段 2 确认）；message 兜底规则已覆盖大多数情况 |
 | Q3 | R3 | 部署·生产主机的 3000 端口暴露在公网 | 脆弱 | P1 | 00 | 待 K5（生产主机） |
 | Q4 | R4 | 部署·换镜像后数据库回退 | 脆弱 | P1 | 00 | 正向已在 LT 上验证（2026-10-21）；回退方向待 T10 在 LT 上演练（K4） |
-| Q5 | R3 | 测试·LT 上测试分组的模型定价 | 未细分 | P2 | 00 | 待 K6 |
+| Q5 | R3 | 测试·LT 上测试分组的模型定价 | 未细分 | P2 | 00 | 部分关闭（T9）：请求没有因定价被拒；扣费在 T-F6、T-F9 核对 |
 | Q6 | R2 | 计费·被拦截的尝试是否为 $0 | 不明 | P2 | 01 | 待 T-F9 |
 | Q7 | — | 工程·源码放在哪、怎么构建 | 未细分 | P2 | 01 | 已关闭：仓库 `ARYYDS/NaHook`，在 Win11 的 `O:\NaHook` 上开发和构建 |
 | Q9 | — | 工程·产物怎么从 Win11 送到 LT | 未细分 | P2 | 01 | 已关闭：用 GitHub Release（仓库已公开） |
@@ -74,7 +74,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 ### Q5 LT 上测试分组的模型定价
 
 - 影响：测试令牌所在分组对 `gpt-6-astra` 没有定价的话，NewAPI 可能会拒绝请求；T-F6、T-F9 也要看计费。
-- 处理：K6，在 T9 里查清，缺的话先补上价格。
+- 处理：K6。T9 实测请求没有被拒；扣费是否符合预期在 T10 的 T-F6、T-F9 核对。
 
 ### Q16 生产主机未核实
 
@@ -129,7 +129,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | K3 | 官方镜像要固定的 digest | 01 audit §5 | 已定：rc.45 `sha256:6c63c7ee…87bc3f9` |
 | K4 | h3 与 rc.45 来回切换的数据库兼容性 | 01 audit §5 | 正向已验证；回退方向在 01:T10 演练 |
 | K5 | 生产主机的 3000 端口是否暴露在公网 | 01 audit §5 | 00:G3 |
-| K6 | LT 上测试分组的定价 | 01 audit §5 | 01:T9 |
+| K6 | LT 上测试分组的定价 | 01 audit §5 | 01:T9 已确认请求不被拒；扣费在 01:T10（T-F6、T-F9）核对 |
 | K7 | 生产主机的心跳设置 | 01 audit §5 | 01:T12 |
 | K8 | 生产主机是哪台、基线是否和 LT 改动前一致 | 01 audit §5 | 01:T11 之前 |
 | K9 | 站点层 `encode` 会不会憋住 SSE | 01 audit §5 | 01:T10 |
@@ -483,3 +483,31 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 - 从 GitHub 读回的 Release：tag `build-3a387b58` 指向 `3a387b58141c48d0f0095e7de89ca3067e306a80`，prerelease，非草稿；五个附件的 digest 和 `SHA256SUMS` 一致。
 
 过程说明：这次的 SPEC 提交落在合并提交 `c1c9b5b` 之后（以往是先提交 SPEC 再合并）。原因是第一次写 SPEC 的脚本报错退出，而合并命令在另一行照常执行了；合并内容是审计过的代码，不受影响。
+
+### 7.15 T9：在 LT 上搭测试环境（2026-10-21，用户逐步批准）
+
+| 步骤 | 做法 | 结果 |
+|---|---|---|
+| 测试渠道、测试令牌 | 用户在面板里创建 | 测试令牌的 `/v1/models` 只返回 `gpt-6-astra` |
+| 下载 | `build-3a387b58` 的五个附件下载到 `/root/nahook-dist/3a387b58/` | `sha256sum -c` 全部 OK；`SHA256SUMS` 本身是 `14644afb…`，和 GitHub 记录一致 |
+| 安装 | 三个二进制用 `install -m 0755` 装到 `/usr/local/bin`；两个 unit 和 `/etc/nahook/config.json` 取自 GitHub 上提交 `3a387b5` 的 `deploy/` 原文件 | 哈希和 Release、仓库一致；`systemctl enable --now` 后两个服务都是 active，nahook 监听 `127.0.0.1:19080`，mockrelay 监听 `172.17.0.1:18080`，控制口 `/run/nahook/ctl.sock` 是 0600 |
+| Caddy 路由 | 架构侧在旁边生成新文件（00 §6.1 的路由，原 `reverse_proxy` 原样放进 `handle {}`），`caddy validate` 通过；替换和 reload 由用户执行（架构侧执行时被本机的权限分类器拦下，没有执行任何部分） | 新 Caddyfile 的 sha256 是 `d293d3f617c2ca13181f2ef3c9d59c8497a3ce4fe9b3bc26a85d98b66e9e530f`；备份 `Caddyfile.bak.20261021192639` 和 `Caddyfile.bak.t0` 逐字节相同；caddy active |
+
+验收（T9 完成判据）：
+- `https://lt.xhub.chat/api/status` 走 HTTP/2 返回 200；`nahookctl retry get` 返回 `max=3`，`stats` 正常返回。
+- 用测试令牌经 `lt.xhub.chat`（HTTP/2）：
+  - `/v1/responses`，mockrelay 为 `ok`：200，完整收到 `response.completed`；
+  - `/v1/chat/completions`，`ok`：200，以 `data: [DONE]` 结束；
+  - `/v1/responses`，脚本 `rate_limit, ok`：nahook 拦截，冷却门等待 46ms 后第二次尝试放行，客户端拿到 200 的完整流；mockrelay `/__log` 记了两条；
+  - 三个请求前后，nahook 的 `intercepted` 从 3 变为 6，`released` 从 2 变为 5，说明这两条路径都经过了 nahook。
+- 隔离：测试令牌只看得到 `gpt-6-astra`；所有响应都是 mockrelay 的内容（`resp_mock`、`chatcmpl-mock`），mockrelay 记录的条数等于发出的尝试次数，所以测试令牌的请求没有落到其他渠道。渠道报错时 NewAPI 换渠道重试的情况（mockrelay `http429`）由 T10 的相关项覆盖。
+
+绕过 Caddy、直接请求 nahook 的冒烟（T10 之前的预检，不代替 T10）：
+- 脚本一直是 `rate_limit`：上游共尝试 4 次（`retry.max=3`），返回 429，用时 0.14s；`Content-Type: application/json`，带 `X-Oneapi-Request-Id` 和 `X-New-Api-Version: v1.0.0-rc.45`，正文是上游的限流 error。
+- 计数满足 01 design §6.7 的不变量：`rate_limited`(6) = `retries`(5) + `gave_up`(1)；`intercepted`(6) = `released`(5) + `gave_up`(1)。
+
+观察：
+- `passthrough` 计数包括 Caddy 每 10s 一次对 nahook 的 `/api/status` 健康检查，空闲 21s 加了 3。T10 读这个计数时要扣掉这部分；已写进 01 design §6.7 的计数表。
+- reload 时 Caddy 提示 "Caddyfile input is not formatted"。原文件本来就不符合 `caddy fmt`（参数对齐用的空格、站点块开头的空行），不是这次引入的，不影响加载。
+- 测试令牌的副本放在 LT 的 `/root/.nahook-test-token`（0600），供 T10 的 curl 读取，T10 结束后删除（00 design §5）。
+- 主站点原有的 `reverse_proxy` 原样保留在 `handle {}` 里，包括 `flush_interval -1`；它和站点层 `encode` 的去留仍待用户决定，K9 在 T10 实测。

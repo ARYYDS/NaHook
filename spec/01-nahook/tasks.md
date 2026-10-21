@@ -9,7 +9,7 @@
 | L-GO 车道由 Win11 上的 DSH 执行；任务书和开工提示词见 `docs/` | 已定 | — |
 | LT 上的每一次替换或安装 | 都要先请示用户 | 请示之前停在那一步 |
 | LT 只做测试（2026-10-21 起和生产隔离），上面的 NewAPI 已是官方 rc.45 | 已确认 | — |
-| 用户在 LT 面板里建好测试渠道和测试令牌，并放进独立分组（00 §6.2） | 待用户操作 | 能做到 T9 装好 nahook 和 mockrelay；T10 跑不了 |
+| 用户在 LT 面板里建好测试渠道和测试令牌，并放进独立分组（00 §6.2） | 已完成（2026-10-21，用户） | — |
 | K1（Caddy 是否吞掉客户端断开） | 由 T0 实测 | 不影响写代码；影响 T5（要不要总时限）和 nahook 路由的写法 |
 | K3（官方镜像 digest） | 已定（audit §5） | — |
 | K8（生产主机是哪台、基线是否和 LT 改动前一致） | 待用户 | LT 上的工作都能做；T11–T13 开不了工 |
@@ -138,7 +138,7 @@ L-DOC                                                                           
     - [ ] 产物不进 git
   - 冲突：无
 
-- [ ] **T9 在 LT 上搭测试环境**（L-OPS，**每一步在 LT 上的操作都要请示用户**）
+- [x] **T9 在 LT 上搭测试环境**（L-OPS，**每一步在 LT 上的操作都要请示用户**；2026-10-21 完成，specaudit §7.15）
   - 前置：T8 已发布 Release；00 G1（T0 的结论决定 nahook 路由写不写 `flush_interval -1`）；用户建好测试渠道和测试令牌（00 §6.2）
   - 改动：在 LT 上：
     - 从 Release `build-<8hex>` 下载到 `/root/nahook-dist/<8hex>/`，`sha256sum -c SHA256SUMS` 通过后，再用 `install -m 0755` 安装到 `/usr/local/bin`；
@@ -146,9 +146,9 @@ L-DOC                                                                           
     - 备份 Caddyfile 后，在 `lt.xhub.chat` 站点里加 nahook 路由（00 §6.1），`caddy validate` 通过后 reload
   - 依据：00 §2、§6 ｜ audit §2
   - 完成判据：
-    - [ ] `https://lt.xhub.chat/api/status` 返回 200；`nahookctl stats` 能返回
-    - [ ] mockrelay 设为 `ok` 时，用测试令牌经 `lt.xhub.chat` 能拿到完整的流；mockrelay 的 `/__log` 有记录
-    - [ ] 隔离：用测试令牌发请求后，LT 上其他渠道没有新的调用（00 §6.2）
+    - [x] `https://lt.xhub.chat/api/status` 返回 200；`nahookctl stats` 能返回
+    - [x] mockrelay 设为 `ok` 时，用测试令牌经 `lt.xhub.chat` 能拿到完整的流；mockrelay 的 `/__log` 有记录
+    - [x] 隔离：用测试令牌发请求后，LT 上其他渠道没有新的调用（00 §6.2）
   - 冲突：LT `/etc/caddy/Caddyfile`（见 §3）
 
 - [ ] **T10 在 LT 上跑审计清单**（L-OPS）
