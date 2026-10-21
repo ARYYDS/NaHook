@@ -20,7 +20,7 @@
 |---|---|---|---|
 | T-C1 | 00 §6.2 | 测试站点**保留** `flush_interval -1`；mockrelay 设为 `hold:30`；`curl --max-time 2` 经 19443 发请求 | 实测记录 nahook 的 `r.Context()` 是否在 2s 左右被取消（看 nahook 日志，以及 `ss -tn` 里到 3001 的连接是否关闭） |
 | T-C2 | 00 §6.2 | 同上，但去掉 `flush_interval -1` 后 reload | 约 2s 内被取消；nahook 不再重试；到 3001 的连接被关闭 |
-| T-C3 | 00 §3.3 | mockrelay 设为 `ok`，并把输出拉长到约 30s；进入流式阶段后断开 | 测试 NewAPI 日志里这次流的结束原因是 `client_gone` |
+| T-C3 | 00 §3.3 | mockrelay 设为 `slow:30`；进入流式阶段后断开 | 测试 NewAPI 日志里这次流的结束原因是 `client_gone` |
 | T-C4 | 00 §3.2 | `systemctl stop nahook-test` 后发请求 | 请求由 3001 正常完成；10s 内 Caddy 把 19081 标为不健康；启动 nahook-test 后流量自动回来 |
 | T-F1 | §1.4 | 同一条 `rate_limit` 脚本：先经 nahook-test（上限设为 0），再经 h3 测试实例 3002（护栏打开，`RetryTimes=0`），分别抓客户端拿到的完整响应 | 状态码、`Content-Type`、响应体逐字节一致（`X-Oneapi-Request-Id` 的值除外） |
 | T-F2 | §1.6 | 上限设为 2；脚本是 `rate_limit` × 10 | mockrelay 恰好收到 3 次请求；客户端拿到代 429 |
@@ -36,8 +36,9 @@
 | T-F12 | §1.3 | 脚本 `quota` | 不拦截，原样放行 |
 | T-F13 | §1.3 | 脚本 `chat_rate_limit`，走 `/v1/chat/completions` | 被拦截，按上限重试 |
 | T-F14 | §1.3 | 脚本 `rate_limit_failed_only` | 被拦截 |
-| T-F15 | §1.3、2.5 | 测试 NewAPI 打开保活、间隔设到最小；脚本 `hold:5` 之后 `rate_limit` | 能正确拦截；放行的流里保留了 `: PING` |
+| T-F15 | §1.3、2.5 | 测试 NewAPI 打开保活、间隔设到最小；脚本 `hold_rate_limit:5` 和 `stall_rate_limit:5` 各跑一次（PING 的两个来源：等上游响应头时，以及流式阶段） | 能正确拦截；放行的流里保留了 `: PING` |
 | T-F16 | §1.2 | 请求体大于 64MiB | 透传，不拦截，NewAPI 正常处理（或按它自己的限制拒绝） |
+| T-F17 | §1.6 | 测试 NewAPI 打开心跳、间隔 1s，`RetryTimes=0`；脚本 `hold_http429:3` | mockrelay 只收到 1 次请求；客户端拿到 200 SSE：`: PING` 之后是 NewAPI 写的 `{"error":…}`，消息末尾是本次的 request id；nahook 计数 `passthrough` 加 1，`rate_limited` 不变 |
 | P-1 | 00 §1.1 阶段 1 | 生产环境护栏还开着时上线 nahook；观察 30 分钟 | nahook 只有透传、没有拦截；`/v1/responses` 的 p50 延迟和上线前比较（实测记录）；停掉 nahook 后请求不中断 |
 | P-2 | 00 §1.1 阶段 2 | 关掉护栏，等下一次限流 | journal 里出现 intercept 并接着 release 或 give_up；客户端拿到的要么是成功的流，要么是 HTTP 429，不会是 SSE 错误 |
 | P-3 | 00 §1.1 阶段 3 | 换成官方镜像 | 同 P-2；面板登录、渠道列表、日志页正常 |
@@ -108,3 +109,4 @@ $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -tr
 | K4 | 从官方镜像回退到 h3 时，数据库兼不兼容 | 官方相比 h3 基线改了 `model/usedata.go`，有新增列（`git diff 32e587406..206e0fa5c -- model/`） | 在测试环境验证：先用官方镜像建好 SQLite 库，再换 h3 镜像启动，做一轮冒烟 |
 | K5 | 生产 3000 端口能不能从公网访问 | 容器监听 `0.0.0.0:3000`，安全组情况不明 | 如果能访问，直连的客户端会绕过 nahook。需要用户在云控制台确认，或者从外网测一次 |
 | K6 | 测试 NewAPI 的"自用模式"能不能免去模型定价 | 还没验证 | 不行的话，测试实例就要给 `gpt-6-astra` 配上价格 |
+| K7 | 生产 NewAPI 有没有打开心跳（`general_setting.ping_interval_enabled`），间隔是多少 | 官方默认是关的（`NEWAPI/setting/operation_setting/general_setting.go:28`），生产上的值不清楚；由用户在面板的系统设置里看 | 打开时，NewAPI 的终态错误可能以 200 SSE 的形式出现，靠 design §1.6 的 request id 规则放行。只影响这种情况出现的频率，不影响正确性；T11 之前查清即可 |

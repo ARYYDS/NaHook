@@ -29,6 +29,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q11 | R5 | 转发·失败路径（读请求体出错、ctx 取消）在 design 和 interface 里不一致 | 不明 | P2 | 01 | 已关闭：`classify` 增加 error 返回值；ctx 已取消时不写响应、计 `client_gone`（design §1.2、§1.6） |
 | Q12 | R5 | 转发·`forward` 没写 Host、URL 和请求体长度的规则 | 未细分 | P2 | 01 | 已关闭：design §6.1 |
 | Q13 | R5 | 排期·T6 漏了对 T5 的依赖；T5 要等 G1，但排在 T7 前面 | 耦合 | P2 | 01 | 已关闭：T6 前置加上 T5；T7 提到 T5 前面 |
+| Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
+| Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 已关闭：消息末尾是本次 request id 时原样放行（design §1.6、§8；T-F17）；生产上的心跳设置待 K7 |
 
 ## 3. 逐项说明
 
@@ -90,13 +92,15 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 - 影响：等待时间变长，但不会无限：只有 `retry.max` 次，并且受 Caddy 的 30m 限制。
 - 处理：T-F4 和 P-2 实测 base 的分布；如果需要上限，按实测值回写 design §5。
 
-### Q10–Q13 T5 开工前的 SPEC 补漏
+### Q10–Q15 T5、T7 开工前的 SPEC 补漏
 
 - 证据：
   - Q10：design §2 的模块表、interface 2.5 和 2.6 的签名都用了 `*obs.Stats`，但 tasks 里没有哪个任务负责 `internal/obs`，计数器也没有名字。
   - Q11：interface §3 写的是 `classify` 读请求体出错时回 502，但 design §1.2 的签名没有错误返回值；§1.6 不区分"连不上 NewAPI"和"客户端已断开"，客户端断开时也会回 502 并算作 NewAPI 故障。
   - Q12：Go 的客户端请求设了 `RequestURI` 会报错；不设 `Host` 的话，NewAPI 看到的 Host 会变成 `127.0.0.1:3000`，而 Caddy 默认原样转发 Host。
   - Q13：T6 要改 `cmd/nahook`，它会调用 `proxy.NewHandler`；`control.Serve` 也要用 `obs.Stats`。
+  - Q14：T-C3 要求"把输出拉长到约 30s"，T-F15 要求 PING 出现在限流帧之前，§6.6 里都没有对应的脚本项；原来 T-F15 写的 `hold:5` 之后接 `rate_limit` 是两个请求，测不到这个场景。
+  - Q15：官方 NewAPI 处理流式请求时，在调用上游之前就启动心跳（`NEWAPI/relay/channel/api_request.go:478-485`），第一次心跳就把 200 提交了。之后如果上游回了错误，NewAPI 照样按 `DecideRelayRetry` 换渠道重试（重试循环 `NEWAPI/controller/relay.go:176-226` 和 `NEWAPI/service/relay_error.go:20` 都不检查响应是否已提交）；全部失败后，`controller/relay.go:99-101` 用 `writeRelayStreamError`（`:242`）把错误写成 `data: {"error":…}`，消息已经在 `:96` 被加上 ` (request id: <id>)`，这个 id 和响应头 `X-Oneapi-Request-Id` 是同一个（`middleware/request-id.go:12-16`）。
 - 处理：见问题总表各行。`Accept-Encoding: identity` 保持不变：走到 nahook 的只有两条 relay 路由，NewAPI 只在 `/api`、dashboard 和前端静态文件上做 gzip（`NEWAPI/router/api-router.go:20`、`dashboard.go:13`、`web-router.go:23`）。
 
 ## 4. 待拍板
@@ -115,6 +119,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | K4 | 换镜像后能否回退数据库 | 01 audit §5 | 01:T10 |
 | K5 | 3000 端口是否暴露在公网 | 01 audit §5 | 00:G3 |
 | K6 | 自用模式能否免去定价 | 01 audit §5 | 01:T10 |
+| K7 | 生产 NewAPI 的心跳设置 | 01 audit §5 | 01:T11 |
 
 ## 6. 还没写 SPEC 的部分与写作顺序
 
@@ -254,7 +259,7 @@ DSH 交付回报里的风险点和自行决定，架构侧的裁决：
 
 修复提交 `ea75cf0`（`audit/T4`）。Win11 门禁：gofmt 无输出；vet 退出码 0；`go test -race ./...` 四个包全部 ok，顶层 55 个 PASS、0 个 FAIL；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF。
 
-### 7.8 T5 开工前的 SPEC 补漏（Q10–Q13）
+### 7.8 T5、T7 开工前的 SPEC 补漏（Q10–Q15）
 
 | 改动 | 落点 |
 |---|---|
@@ -263,3 +268,5 @@ DSH 交付回报里的风险点和自行决定，架构侧的裁决：
 | §1.6 伪代码补上计数器和日志事件的位置；`BaseFloorMS` 换算成 `time.Duration` | design §1.6 |
 | `forward`：URL 由 `newapi` 地址加路径和查询串拼成，不设 `RequestURI`；`Host = r.Host`；`*bytes.Reader` 请求体的 `ContentLength` 和 `GetBody` 由 `http.NewRequestWithContext` 自动设置（Go 源码 `net/http/request.go:942`），流式透传时手动设 `ContentLength = r.ContentLength` | design §6.1 |
 | T6 前置加上 T5；T7 提到 T5 前面，先填 T0 结论出来之前的空档 | tasks §1、T5、T6 |
+| mockrelay：`-listen`、`/__mode` 和 `/__log` 的格式、帧格式、固定内容；新增 `slow`、`hold_rate_limit`、`stall_rate_limit`、`hold_http429`；`http429`、`quota` 写明响应体；路径不匹配时回 400 | design §6.6；tasks T7；audit T-C3、T-F15 |
+| NewAPI 自己的终态错误（消息末尾是本次 request id）原样放行，不重试 | design §1.6、§8；interface §3；tasks T5；audit T-F17、K7 |

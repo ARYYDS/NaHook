@@ -124,7 +124,7 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 | `classify` | `r.Body` 没被读过 | 判定为不拦截时，转发给 NewAPI 的请求体和原始请求体逐字节一致 | 读请求体出错 → 返回 error；`ServeHTTP` 在 ctx 已取消时不写响应，否则回 502 |
 | `startup.Read` | 响应是 200 且为 `text/event-stream` | `Prefix` 是已读字节的完整前缀；`Prefix` 加 `Rest` 正好等于原始流 | 任何异常都放行，不会凭空造出错误 |
 | `IsRateLimit` | `e` 来自 `upstreamError` | 同一个输入，结果和 h3 的 429 分支一致（只除了 `insufficient_quota`） | — |
-| `serveIntercept` | `body` 是完整缓存下来的请求体 | 在 `release` 或 `proxy429.Write` 之前 `w` 没有被写过；每次尝试只发一次上游请求；`n ≤ RetryMax` | ctx 被取消 → 不写响应，计 `client_gone`，直接返回；其他转发错误 → 计 `bad_gateway`，回 502 |
+| `serveIntercept` | `body` 是完整缓存下来的请求体 | 在 `release` 或 `proxy429.Write` 之前 `w` 没有被写过；每次尝试只发一次上游请求；`n ≤ RetryMax`；NewAPI 自己的终态错误（消息末尾是本次的 request id）不重试 | ctx 被取消 → 不写响应，计 `client_gone`，直接返回；其他转发错误 → 计 `bad_gateway`，回 502 |
 | `(*Gate).Wait` | — | 等待时长 < `until - now`；只用自己的计时器 | ctx 被取消 → 返回 `ctx.Err()` |
 | `(*Gate).OnRateLimit` | `elapsed ≥ 0` | `until` 只增不减；存下来的 `streak` 始终 ≤ `streakCap`；`base ≤ maxBase`，所以 `base << (s-1)` 不会溢出 | — |
 | `(*Store).SetRetryMax` | `n ≥ 0`，scope 不为空 | 文件内容和内存快照一致；数据面读不到中间状态 | 校验失败，或 rename 之前写盘失败 → 快照不变，返回错误；rename 之后目录 fsync 失败 → 快照切换，返回 `ErrDirSync` |

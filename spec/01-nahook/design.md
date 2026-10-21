@@ -225,6 +225,11 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
     if resp.StatusCode != 200 || !isEventStream(resp):
         h.st.Inc(obs.Passthrough); passthrough(w, resp); return   # 包括 NewAPI 自己的 429：它已按 RetryTimes 重试过
     res := startup.Read(resp.Body)
+    if res.Verdict == startup.VerdictRateLimit && newAPIFinalError(res.Err.Message, rid):
+        # NewAPI 自己的终态错误：心跳先提交了 200，它按 RetryTimes 重试完以后把错误写进了流里，
+        # 消息末尾带着本次请求的 id（NEWAPI controller/relay.go:96、:99-101、:242；common/utils.go:269）。
+        # 和非 200 一样原样透传，不叠加重试（R2）
+        h.st.Inc(obs.Passthrough); release(w, resp, res.Prefix, res.Rest); return
     if res.Verdict == startup.VerdictRelease:
         h.gates.ResetModel(meta.Model)                   # 这个模型下所有 key 的 streak 清零（§6.3）
         h.st.Inc(obs.Released); log release{request_id: rid, attempt: n}
@@ -248,6 +253,8 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
     log wait{key, wait_ms: now - w0}
   }
 ```
+
+`newAPIFinalError(msg, rid) = rid != "" && strings.HasSuffix(strings.TrimSpace(msg), " (request id: "+rid+")")`。`rid` 必须和本次响应头里的 `X-Oneapi-Request-Id` 完全相同：上游原样转发的帧不会带这个 id；中转站自己如果也跑 NewAPI，它的 id 和本站的不同，所以不会误判。
 
 `ServeHTTP` 的不拦截分支处理 `forward` 错误的方式相同：ctx 已取消时只计 `ClientGone`，否则计 `BadGateway` 并回 502；成功时计 `Passthrough`。日志事件和字段见 §5，计数器见 §6.7。
 
@@ -574,18 +581,32 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 
 ### 6.6 `cmd/mockrelay`（只在测试环境用）
 
-- 监听 `172.17.0.1:18080`，对外表现为一个 OpenAI 兼容上游。
-- 用 `POST /__mode` 设置行为脚本，例如 `{"script":["rate_limit","rate_limit","ok"]}`：每来一个请求按顺序取一项，取完后一直重复最后一项。
+- 参数 `-listen`，默认 `172.17.0.1:18080`。对外表现为一个 OpenAI 兼容上游：只接受 `POST /v1/responses` 和 `POST /v1/chat/completions`，不校验鉴权，也不看请求里的模型。
+- `POST /__mode`，请求体形如 `{"script":["rate_limit","rate_limit","ok"]}`：替换脚本，同时清空计数和到达记录。之后每来一个业务请求就按顺序取一项，取完后一直重复最后一项。脚本为空、含有不认识的项或参数不合法时回 400，原脚本不变。
+- `GET /__log`：`{"count":N,"requests":[{"seq":1,"path":"/v1/responses","item":"rate_limit","at_unix_ms":1760000000123}, …]}`，按到达顺序排列；`at_unix_ms` 是收到请求头的时刻。
+- 取脚本项、加计数、记到达时间在同一把锁里完成。并发请求各拿一项，不重复也不遗漏（T-F4 用 16 个并发）。
+- 流式响应：`200`，`Content-Type: text/event-stream`，每写完一帧就 flush。
+  - Responses 的帧是 `event: <type>\ndata: <json>\n\n`。
+  - Chat Completions 的帧只有 `data: <json>\n\n`，最后一帧是 `data: [DONE]\n\n`。
+- 帧的内容全部固定，不带时间戳，也不带随机数：T-F5、T-F6 要逐字节对比两次请求的结果。`id` 固定为 `resp_mock` 或 `chatcmpl-mock`，`created` 固定为 `1760000000`，`model` 固定为 `gpt-6-astra`。
+- 限流文案 `<RL>` 固定为 `Rate limit reached for gpt-6-astra in organization org-mock on tokens per min (TPM): Limit 40000000, Used 40000000, Requested 19224. Please try again in 28ms.`，句式来自 `渠道监控/429-vs-quota.md` 第 12–14 行。`org-mock` 能被 `gate.Key` 认出来。
+- 错误对象 `<RLE>` 固定为 `{"type":"tokens","code":"rate_limit_exceeded","message":<RL>}`。
 
-| 脚本项 | 行为 |
-|---|---|
-| `ok` | 正常流式：created → output_text.delta × 3 → completed（带 usage） |
-| `rate_limit` | created → `{"type":"error","error":{"type":"tokens","code":"rate_limit_exceeded","message":"Rate limit reached for gpt-6-astra in organization org-mock on tokens per min (TPM): Limit 40000000, Used 40000000, Requested 19224. Please try again in 28ms. …"}}` → response.failed。文案来自 `渠道监控/429-vs-quota.md` |
-| `rate_limit_failed_only` | 只发 response.failed，`response.error` 里带同样的错误 |
-| `http429` | 直接回 HTTP 429 JSON |
-| `hold:<秒>` | 先不回响应头，等指定秒数再按 `ok` 回 |
-| `chat_rate_limit` | Chat Completions 格式：首个 chunk 就是 `{"error":{…}}` |
-| `quota` | `insufficient_quota`，不应该被拦截 |
+| 脚本项 | 适用路径 | 行为 |
+|---|---|---|
+| `ok` | 两条都适用 | Responses：`response.created` → `response.output_text.delta` × 3 → `response.completed`，后者带 `usage`（`input_tokens` 10、`output_tokens` 3、`total_tokens` 13）。Chat：3 个带 `delta.content` 的 chunk → 一个带 `finish_reason:"stop"` 和 `usage`（10/3/13）的 chunk → `[DONE]` |
+| `slow:<秒>` | 两条都适用 | 和 `ok` 一样，但 delta 改成每秒发一个，一共发 N 个（T-C3） |
+| `hold:<秒>` | 两条都适用 | 先不回响应头，等 N 秒后再按 `ok` 回（T-C1） |
+| `rate_limit` | Responses | `response.created` → `{"type":"error","error":<RLE>}` → `{"type":"response.failed","response":{"id":"resp_mock","status":"failed","error":<RLE>}}` |
+| `rate_limit_failed_only` | Responses | 只发上一行里那个 `response.failed` 帧（T-F14） |
+| `hold_rate_limit:<秒>` | Responses | 先不回响应头，等 N 秒后再按 `rate_limit` 回（T-F15：NewAPI 在等上游响应头期间发 `: PING`，见 `NEWAPI/relay/channel/api_request.go:482`） |
+| `stall_rate_limit:<秒>` | Responses | 先回 200 和响应头并 flush，N 秒内一帧都不发，然后按 `rate_limit` 发帧（T-F15：NewAPI 在流式阶段发 `: PING`，见 `NEWAPI/relay/helper/stream_scanner.go:126`） |
+| `chat_rate_limit` | Chat | 第一帧就是 `{"error":<RLE>}`，然后是 `[DONE]`（T-F13） |
+| `quota` | Responses | 和 `rate_limit` 一样，但错误对象换成 `{"type":"insufficient_quota","code":"insufficient_quota","message":"You exceeded your current quota, please check your plan and billing details."}`（`429-vs-quota.md` 第 33 行：这类文案里没有 `try again in`）；不应该被拦截（T-F12） |
+| `http429` | 两条都适用 | 直接回 HTTP 429，`Content-Type: application/json`，响应体为 `{"error":{"message":<RL>,"type":"tokens","param":"","code":"rate_limit_exceeded"}}`（T-F7） |
+| `hold_http429:<秒>` | 两条都适用 | 先不回响应头，等 N 秒后再按 `http429` 回（T-F17：NewAPI 的心跳先提交了 200，最终错误会以 SSE 帧的形式写出） |
+
+- 脚本项和请求路径不匹配时（比如 `rate_limit` 碰上 chat 路径），回 400 `{"error":{"message":"mockrelay: item <项> does not apply to <路径>"}}`。这次请求照样记进 `/__log`。
 
 ### 6.7 `internal/obs`
 
@@ -658,3 +679,4 @@ GitHub Release（公开）
 | 配置的临时文件写到 `/tmp` 再改名 | 跨文件系统时 rename 不是原子的 | 临时文件放在同一目录，并对文件和目录都做 fsync |
 | socket 文件残留 | 重启时 Listen 失败 | 启动时先删掉；或交给 `RuntimeDirectory` 管理 |
 | 一直不读完、不关闭被拦截的那次响应体 | 连接泄漏 | 被拦截后立即 `resp.Body.Close()` |
+| 只要 200 SSE 里出现限流帧就重试 | 打开心跳时，NewAPI 会先提交 200，按 RetryTimes 重试完以后再把自己的终态错误写进流里；nahook 再重试一轮，两层重试就叠加了 | 消息以 ` (request id: <本次的 X-Oneapi-Request-Id>)` 结尾时原样放行（§1.6；`NEWAPI/controller/relay.go:99-101`） |

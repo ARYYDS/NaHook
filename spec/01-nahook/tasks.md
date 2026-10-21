@@ -92,6 +92,7 @@ L-DOC                                                                           
     - [ ] 断言：逐跳头被去掉，XFF 和 X-Real-IP 原样转发；NewAPI 收到的 Host 等于客户端请求的 Host；每次重试的请求体和原始请求体逐字节一致
     - [ ] 断言：ctx 取消（在 `forward` 期间和 `Wait` 期间各一次）时不写响应，计 `client_gone`，不计 `bad_gateway`
     - [ ] 断言：代 429 带上了假 NewAPI 最后一次响应里的 `X-Oneapi-Request-Id` 和 `Access-Control-Allow-Origin`
+    - [ ] 断言：假 NewAPI 先发 `: PING`，再发消息以 ` (request id: <本次响应头的 id>)` 结尾的限流帧时，原样放行，只转发 1 次；id 不同时照常拦截
     - [ ] 断言：每个场景结束后的 `Snapshot` 与 design §6.7 一致，且 `rate_limited = retries + gave_up`
     - [ ] 断言：日志是 JSON，一行一条；`intercept`、`wait`、`release`、`give_up` 的字段与 design §5 一致
   - 冲突：无
@@ -107,10 +108,14 @@ L-DOC                                                                           
 
 - [ ] **T7 mockrelay**（L-GO）
   - 前置：T1
-  - 改动：`cmd/mockrelay`：`/__mode` 脚本，以及 design §6.6 里的所有脚本项；按请求计数，记录到达时间（`GET /__log`）
-  - 依据：design §6.6 ｜ audit 全部 T-F 项
+  - 改动：`cmd/mockrelay`：`-listen` 参数、`POST /__mode`、`GET /__log`，以及 design §6.6 里的全部 11 个脚本项
+  - 依据：design §6.6 ｜ audit T-C1、T-C3、全部 T-F 项
   - 完成判据：
-    - [ ] 每个脚本项都有单测；`rate_limit` 的文案和 `429-vs-quota.md` 的原文一致
+    - [ ] 每个脚本项在它适用的每条路径上都有单测，逐字节对比整个响应体（带秒数的项用 1 秒测）
+    - [ ] `rate_limit`、`rate_limit_failed_only`、`hold_rate_limit`、`stall_rate_limit`、`chat_rate_limit` 的输出交给 `startup.Read`，判定为 `VerdictRateLimit`，且 `gate.Key` 得到 `gpt-6-astra|org-mock`；`ok` 和 `quota` 判定为 `VerdictRelease`
+    - [ ] 脚本按顺序取，取完后重复最后一项；`/__mode` 收到非法脚本时回 400，原脚本不变；路径和脚本项不匹配时回 400，并且记进 `/__log`
+    - [ ] 16 个并发请求在 `-race` 下各拿到一项：`/__log` 的 `seq` 从 1 到 16 不重不漏
+    - [ ] 同一个脚本项连发两次，响应体逐字节相同
   - 冲突：无
 
 - [ ] **T8 构建、打包和第一次发布**（L-GO）
