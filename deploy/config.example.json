@@ -1,0 +1,9 @@
+{
+  "listen": "127.0.0.1:19080",
+  "control_socket": "/run/nahook/ctl.sock",
+  "newapi": "http://127.0.0.1:3000",
+  "body_limit": 67108864,
+  "match": { "paths": ["/v1/responses", "/v1/chat/completions"], "models": ["gpt-6-astra"] },
+  "retry": { "max": 3, "per_model": {} },
+  "gate":  { "base_floor_ms": 50, "streak_cap": 3 }
+}

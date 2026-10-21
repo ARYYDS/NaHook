@@ -1,0 +1,12 @@
+[Unit]
+Description=nahook
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/nahook -config /etc/nahook/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+UMask=0077
+RuntimeDirectory=nahook
+RuntimeDirectoryMode=0700
+[Install]
+WantedBy=multi-user.target

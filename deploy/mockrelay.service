@@ -1,0 +1,9 @@
+[Unit]
+Description=mockrelay (NaHook test upstream, LT only)
+After=docker.service
+Requires=docker.service
+[Service]
+ExecStart=/usr/local/bin/mockrelay -listen 172.17.0.1:18080
+Restart=always
+[Install]
+WantedBy=multi-user.target
