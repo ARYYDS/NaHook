@@ -19,7 +19,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q1 | R3 | 入口·Caddy 断开传递 | 不明 | P1 | 00、01 | 已关闭（T0，2026-10-21）：nahook 路由不写 `flush_interval -1`；T-C1、T-C2 用 HTTP/2 复测 |
 | Q2 | R3 | 判定·真实帧形态 | 不明 | P1 | 01 | 待 K2（阶段 2 确认）；message 兜底规则已覆盖大多数情况 |
 | Q3 | R3 | 部署·生产主机的 3000 端口暴露在公网 | 脆弱 | P1 | 00 | 待 K5（生产主机） |
-| Q4 | R4 | 部署·换镜像后数据库回退 | 脆弱 | P1 | 00 | 正向已在 LT 上验证（2026-10-21）；回退方向待 T10 在 LT 上演练（K4） |
+| Q4 | R4 | 部署·换镜像后数据库回退 | 脆弱 | P1 | 00 | 两个方向都已在 LT 上演练（2026-10-21，T10 K4）；生产阶段 3 之前仍要备份 MySQL |
 | Q5 | R3 | 测试·LT 上测试分组的模型定价 | 未细分 | P2 | 00 | 已关闭：T9 请求没有因定价被拒；T-F6 经 nahook 和直连扣费一致（quota 125） |
 | Q6 | R2 | 计费·被拦截的尝试是否为 $0 | 不明 | P2 | 01 | LT 已测（T-F9）：每次 $0、记 1 行日志；真实 failed 帧带 usage 的情况待 P-2 |
 | Q7 | — | 工程·源码放在哪、怎么构建 | 未细分 | P2 | 01 | 已关闭：仓库 `ARYYDS/NaHook`，在 Win11 的 `O:\NaHook` 上开发和构建 |
@@ -32,9 +32,9 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
 | Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 重新打开，见 Q20：request id 规则只认得 NewAPI 自己生成的错误；K7：LT 的心跳一直开着（间隔 1s），生产相同 |
 | Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 待 K8（用户告知主机并批准只读核查） |
-| Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 设计已改（00 §3.2、§6.1、§8：`fail_duration 10s`，不写 `lb_try_duration`）；LT 待用户装上 `Caddyfile.final2` 后复测 T-C4 |
+| Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 已关闭：`fail_duration 10s`、不写 `lb_try_duration`（00 §3.2、§6.1、§8）；T-C4 第三次通过 |
 | Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
-| Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 设计已改（01 design §1.3、§1.6、§8；interface 2.1、2.5）；待 T15 实现，并在 LT 上用关护栏的 h3 复测 T-F17 |
+| Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 已关闭：T15（`build-bd6fad86`）部署到 LT，关护栏的 h3 上复测 T-F17 通过（§7.17） |
 | Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 已关闭：用户拍板去掉站点层 `encode`（LT 在 T10 去掉；生产本来没有，K8 时确认） |
 
 ## 3. 逐项说明
@@ -647,3 +647,22 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 - 门禁：gofmt 无输出；vet 退出码 0；`go test -race -count=1 ./...` 十一个包全部 ok；linux/amd64 交叉编译和 vet 退出码 0；`go.mod` 没有 require；改动文件行尾全是 LF。
 - 反向检查：把 `internal/startup/startup.go` 换回 `f45d5a1` 的版本，新用例"单独的空行不算心跳"失败（`HeartbeatOnly = true, want false`）；换回审计版后通过。
 - 新增用例都在 `-v` 下跑到：`TestReadHeartbeatFlags` 八个子例、`TestReadRawJSONAfterHeartbeatIsReleased`。
+
+发布与 LT 复测（2026-10-22，用户批准）：
+- Release `build-bd6fad86`（`bd6fad861b99d568eb90f3a6c55af43e3429c985`，由 DSH 发布）。架构侧在 Win11 的一次性克隆里从这个提交重新编译，`nahook`（`4bfb5035…`）、`nahookctl`（`2b8c25ed…`）、`mockrelay`（`524608fb…`）三个二进制和附件逐字节一致。
+- LT：下载到 `/root/nahook-dist/bd6fad86/`，`sha256sum -c` 全部 OK；只用 `install -m 0755` 替换 `nahook` 和 `nahookctl`（mockrelay 代码没变，不动），`systemctl restart nahook`。旧版在 `/root/nahook-dist/3a387b58/`，可以用来回退。
+- 面板保持 LT 平时的设置（心跳开、间隔 1s，失败重试次数 3），不再临时改动。同一套检查分别在 rc.45 和关护栏的 h3 上跑：
+
+| 项 | rc.45 | h3（关护栏） |
+|---|---|---|
+| `ok` / `rate_limit, ok` / 一直 `rate_limit` | 200 / 200（重试 1 次）/ 4 次尝试后代 429 | 同左 |
+| T-F15a `hold_rate_limit:5, hold:3` | 拦截、重试后放行，流里 3 行 `: PING` | 同左 |
+| T-F15b `stall_rate_limit:5, hold:3` | 拦截、重试后放行 | 同左 |
+| Chat 快速限流 `chat_rate_limit, ok` | 拦截、重试后放行 | 同左 |
+| T-F17 `hold_http429:3` | 200（12.0s）：12 行 `: PING`，然后是裸 JSON 错误；mockrelay 4 次（NewAPI 自己的 1 + RetryTimes 3）；nahook `released` +1，`rate_limited` 不变 | 200（12.0s）：11 行 `: PING`、`data: {"error":…}`、`data: [DONE]`；mockrelay 4 次，全部来自 NewAPI；nahook 按 §1.6 第 2 条透传，`rate_limited`、`retries` 不变 |
+
+  修复前同一场景（h3 关护栏，当时 `RetryTimes=0`）：nahook 又重试 3 轮，客户端 35.9s 后拿到代 429。
+- h3 的切换方法同 K4：先备份 rc.45 的编排（`compose.yaml.bak.20261022000435.rc45`），换成 `/root/nahook-t10/compose.h3-noguard.yaml`（密钥 6 行的哈希和当前一致），30s healthy；测完恢复 rc.45 的编排（哈希 `8d3b40f3…`），31s healthy，ERR、panic、迁移报错都是 0，冒烟三项正常。
+- 收尾时计数不变量成立：`rate_limited`(21) = `retries`(18) + `gave_up`(3)。
+
+T10 到此全部完成（00 G2 收口）。LT 现状：NewAPI rc.45；nahook `build-bd6fad86`；mockrelay `build-3a387b58`；Caddyfile `Caddyfile.final3`。

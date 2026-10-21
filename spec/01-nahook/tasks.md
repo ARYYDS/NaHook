@@ -152,17 +152,17 @@ L-DOC                                                                           
     - [x] 隔离：用测试令牌发请求后，LT 上其他渠道没有新的调用（00 §6.2）
   - 冲突：LT `/etc/caddy/Caddyfile`（见 §3）
 
-- [ ] **T10 在 LT 上跑审计清单**（L-OPS）
+- [x] **T10 在 LT 上跑审计清单**（L-OPS；2026-10-22 完成，specaudit §7.16、§7.17）
   - 前置：T9
   - 改动：不改代码；只记录结果。临时改动的 LT 面板设置（`RetryTimes`、心跳），测完改回原值
   - 依据：audit §2 的 T-C1–T-C4、T-F1–T-F17；audit K4、K6
   - 完成判据：
-    - [ ] 每一项都有实测记录（命令、输出摘要、结论），写进 specaudit §7.16；发现的问题登记到 §2、§3
-    - [ ] T-C1/T-C2 的结论回写到 00 §6.1，确认 nahook 路由要不要 `flush_interval -1`
-    - [ ] K4 的回退方向在 LT 上演练过一次：rc.45 → h3 → rc.45（各需用户同意）
+    - [x] 每一项都有实测记录（命令、输出摘要、结论），写进 specaudit §7.16；发现的问题登记到 §2、§3
+    - [x] T-C1/T-C2 的结论回写到 00 §6.1，确认 nahook 路由要不要 `flush_interval -1`（不要）
+    - [x] K4 的回退方向在 LT 上演练过一次：rc.45 → h3 → rc.45（各需用户同意）
   - 冲突：LT `/etc/caddy/Caddyfile`（切换 T-C1/T-C2 时）
 
-- [ ] **T15 识别心跳之后的 NewAPI 终态错误**（L-GO）
+- [x] **T15 识别心跳之后的 NewAPI 终态错误**（L-GO；2026-10-22 完成，Release `build-bd6fad86`，specaudit §7.17）
   - 前置：T8；specaudit Q20 的设计已写进 design §1.3、§1.6
   - 改动：
     - `internal/startup/startup.go`：`Result` 增加 `HeartbeatOnly`、`Untyped`；`Read` 记录当前事件是否只有注释行、之前的纯注释事件数、之前是否出现过别的事件；`inspect` 增加第三个返回值 `typed`（design §1.3）
@@ -176,7 +176,7 @@ L-DOC                                                                           
     - [x] proxy 单测（假 NewAPI）：心跳 + 不带 type 的限流错误 + `[DONE]` → 客户端拿到 200 和逐字节相同的流，上游只被请求 1 次，`passthrough` +1、`rate_limited` 不变
     - [x] proxy 单测：心跳 + `response.created` + 限流 → 照常拦截并重试；没有心跳的 Chat 限流帧 → 照常拦截并重试；request id 后缀规则的原有测试仍然通过
     - [x] audit §3 的门禁全部通过（DSH `f45d5a1`；审计 `f88c073`，specaudit §7.17）
-    - [ ] 审计合并到 main 之后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
+    - [x] 审计合并到 main 之后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
   - 冲突：只改 L-GO 车道的文件；LT 上的替换属于 T10（需要用户同意）
 
 - [ ] **T11 生产阶段 1：部署 nahook + Caddy 路由（护栏仍开着）**（L-OPS，在生产主机上，**需要用户同意**）
