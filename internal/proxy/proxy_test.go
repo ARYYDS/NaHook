@@ -18,6 +18,7 @@ import (
 	"github.com/ARYYDS/NaHook/internal/config"
 	"github.com/ARYYDS/NaHook/internal/gate"
 	"github.com/ARYYDS/NaHook/internal/obs"
+	"github.com/ARYYDS/NaHook/internal/startup"
 )
 
 // rateLimitMessage is <RL> verbatim (渠道监控/429-vs-quota.md:12-14), the text
@@ -53,6 +54,14 @@ func rateLimitFrames(message string) string {
 }
 
 const http429Body = `{"error":{"message":"` + rateLimitMessage + `","type":"tokens","param":"","code":"rate_limit_exceeded"}}`
+
+// untypedRateLimitFrames is what h3's writeRelayStreamError puts on the wire for
+// a forwarded upstream error after a heartbeat: a data line with no type at all,
+// then [DONE] (design §1.6).
+func untypedRateLimitFrames(message string) string {
+	return `data: {"error":{"type":"tokens","code":"rate_limit_exceeded","message":"` + message + `"}}` + "\n\n" +
+		"data: [DONE]\n\n"
+}
 
 // upstreamRecord is one request the fake NewAPI received.
 type upstreamRecord struct {
@@ -116,6 +125,16 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		h.Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, http429Body)
+	case "ping_untyped_rate_limit", "chat_rate_limit":
+		h.Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if item == "ping_untyped_rate_limit" {
+			_, _ = io.WriteString(w, ": PING\n\n: PING\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		_, _ = io.WriteString(w, untypedRateLimitFrames(rateLimitMessage))
 	case "ping_ok", "ping_final", "rate_limit", "final", "final_other", "ping_rate_limit":
 		h.Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -751,4 +770,110 @@ func TestMissingUserAgentStaysMissing(t *testing.T) {
 	if got, ok := up.record(0).header["User-Agent"]; ok {
 		t.Fatalf("NewAPI received User-Agent %q for a client that sent none", got)
 	}
+}
+
+// TestNewAPIFinalErrorRules pins the two rules of design §1.6 on their own.
+func TestNewAPIFinalErrorRules(t *testing.T) {
+	withSuffix := func(id string) startup.UpstreamError {
+		return startup.UpstreamError{Message: rateLimitMessage + " (request id: " + id + ")"}
+	}
+	tests := []struct {
+		name string
+		res  startup.Result
+		rid  string
+		want bool
+	}{
+		{name: "message carries this request id", res: startup.Result{Err: withSuffix("req-7")}, rid: "req-7", want: true},
+		{name: "message carries another request id", res: startup.Result{Err: withSuffix("req-7")}, rid: "req-8"},
+		{name: "no request id on the response", res: startup.Result{Err: withSuffix("req-7")}, rid: ""},
+		{name: "heartbeat only and untyped", res: startup.Result{HeartbeatOnly: true, Untyped: true}, rid: "req-1", want: true},
+		{name: "heartbeat only but typed", res: startup.Result{HeartbeatOnly: true}, rid: "req-1"},
+		{name: "untyped but data came first", res: startup.Result{Untyped: true}, rid: "req-1"},
+		{name: "neither rule", res: startup.Result{}, rid: "req-1"},
+	}
+
+	for _, tt := range tests {
+		if got := newAPIFinalError(tt.res, tt.rid); got != tt.want {
+			t.Fatalf("%s: newAPIFinalError = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestHeartbeatUntypedFinalErrorIsPassedThrough is the T15 case of Q20: NewAPI
+// committed 200 with its heartbeat and then wrote a forwarded upstream error
+// with no type. Retrying would stack a second retry loop on top of RetryTimes,
+// so the stream must reach the client unchanged after one upstream call.
+func TestHeartbeatUntypedFinalErrorIsPassedThrough(t *testing.T) {
+	up := newFakeUpstream(t, "ping_untyped_rate_limit")
+	c := testConfig(t, up.server.URL, 3)
+	h, stats, _, _ := newTestHandler(t, c)
+
+	spy := &spyWriter{rec: httptest.NewRecorder(), forwards: up.count}
+	h.ServeHTTP(spy, postRequest(context.Background(), streamBody("gpt-6-astra", true)))
+
+	if up.count() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (the forwarded final error must not be retried)", up.count())
+	}
+	if spy.rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", spy.rec.Code)
+	}
+	wantBody := ": PING\n\n: PING\n\n" + untypedRateLimitFrames(rateLimitMessage)
+	if got := spy.rec.Body.String(); got != wantBody {
+		t.Fatalf("body = %q, want %q", got, wantBody)
+	}
+	if got := spy.rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	}
+	if len(spy.headerAt) != 1 || spy.headerAt[0] != 1 {
+		t.Errorf("WriteHeader calls at %v, want exactly one after the only upstream call", spy.headerAt)
+	}
+	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "passthrough": 1})
+}
+
+// TestHeartbeatThenCreatedIsStillIntercepted: once a real startup event arrived,
+// an untyped-looking frame is no longer NewAPI's terminal error (design §1.6
+// rule 2 requires heartbeats only), so the rate limit is intercepted and retried.
+func TestHeartbeatThenCreatedIsStillIntercepted(t *testing.T) {
+	up := newFakeUpstream(t, "ping_rate_limit", "ok")
+	c := testConfig(t, up.server.URL, 1)
+	h, stats, _, _ := newTestHandler(t, c)
+
+	spy := &spyWriter{rec: httptest.NewRecorder(), forwards: up.count}
+	h.ServeHTTP(spy, postRequest(context.Background(), streamBody("gpt-6-astra", true)))
+
+	if up.count() != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (a real startup event came before the limit)", up.count())
+	}
+	if spy.rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the released retry", spy.rec.Code)
+	}
+	assertCounters(t, stats.Snapshot(), map[string]int64{
+		"intercepted": 1, "rate_limited": 1, "retries": 1, "released": 1,
+	})
+}
+
+// TestChatRateLimitWithoutHeartbeatIsStillIntercepted: the Chat shape has no type
+// either, but nothing committed the response, so it is a plain upstream limit.
+func TestChatRateLimitWithoutHeartbeatIsStillIntercepted(t *testing.T) {
+	up := newFakeUpstream(t, "chat_rate_limit", "ok")
+	c := testConfig(t, up.server.URL, 1)
+	c.Match.Paths = []string{"/v1/responses", "/v1/chat/completions"}
+	h, stats, _, _ := newTestHandler(t, c)
+
+	r := httptest.NewRequest(http.MethodPost, "http://client.example/v1/chat/completions",
+		strings.NewReader(streamBody("gpt-6-astra", true)))
+	r.Host = "client.example"
+
+	spy := &spyWriter{rec: httptest.NewRecorder(), forwards: up.count}
+	h.ServeHTTP(spy, r)
+
+	if up.count() != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (no heartbeat, so this is a real rate limit)", up.count())
+	}
+	if spy.rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the released retry", spy.rec.Code)
+	}
+	assertCounters(t, stats.Snapshot(), map[string]int64{
+		"intercepted": 1, "rate_limited": 1, "retries": 1, "released": 1,
+	})
 }

@@ -301,3 +301,80 @@ func TestReadMultiLineData(t *testing.T) {
 		t.Fatalf("Err.Message = %q, want split", res.Err.Message)
 	}
 }
+
+// TestReadHeartbeatFlags covers the two fields that let the proxy recognise
+// NewAPI's terminal error after a heartbeat (design §1.3, §1.6).
+func TestReadHeartbeatFlags(t *testing.T) {
+	ping := ": PING\n\n"
+	untyped := sse("", `{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"`+ltMessage+`"}}`)
+	typedByEvent := sse("error", `{"type":"error","error":{"type":"tokens","code":"rate_limit_exceeded","message":"`+ltMessage+`"}}`)
+	typedByField := sse("", `{"type":"error","code":"rate_limit_exceeded","message":"`+ltMessage+`"}`)
+	done := sse("", "[DONE]")
+	created := sse("response.created", `{"type":"response.created"}`)
+	eventOnly := "event: ping\n\n"
+
+	tests := []struct {
+		name          string
+		stream        string
+		heartbeatOnly bool
+		untyped       bool
+		checkRest     bool
+		wantRest      string
+	}{
+		{
+			name:          "two heartbeats then an untyped rate limit then [DONE]",
+			stream:        ping + ping + untyped + done,
+			heartbeatOnly: true,
+			untyped:       true,
+			checkRest:     true,
+			wantRest:      done,
+		},
+		{
+			name:    "no heartbeat, the first frame is already the untyped rate limit",
+			stream:  untyped + done,
+			untyped: true,
+		},
+		{
+			name:   "heartbeat then response.created then a typed rate limit",
+			stream: ping + created + typedByEvent,
+		},
+		{
+			name:          "heartbeat then a typed error frame",
+			stream:        ping + typedByEvent,
+			heartbeatOnly: true,
+		},
+		{
+			name:          "heartbeat then a frame that carries a type field",
+			stream:        ping + typedByField,
+			heartbeatOnly: true,
+		},
+		{
+			name:    "an event with only an event: line is not a heartbeat",
+			stream:  ping + eventOnly + untyped + done,
+			untyped: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := Read(strings.NewReader(tt.stream))
+			rest := drain(res.Rest)
+
+			if got := string(res.Prefix) + string(rest); got != tt.stream {
+				t.Fatalf("Prefix+Rest != original stream:\n got %q\nwant %q", got, tt.stream)
+			}
+			if res.Verdict != VerdictRateLimit {
+				t.Fatalf("Verdict = %d, want rate limit", res.Verdict)
+			}
+			if res.HeartbeatOnly != tt.heartbeatOnly {
+				t.Fatalf("HeartbeatOnly = %v, want %v", res.HeartbeatOnly, tt.heartbeatOnly)
+			}
+			if res.Untyped != tt.untyped {
+				t.Fatalf("Untyped = %v, want %v", res.Untyped, tt.untyped)
+			}
+			if tt.checkRest && string(rest) != tt.wantRest {
+				t.Fatalf("Rest = %q, want %q", rest, tt.wantRest)
+			}
+		})
+	}
+}

@@ -46,7 +46,7 @@ func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []
 		}
 
 		res := startup.Read(resp.Body)
-		if res.Verdict == startup.VerdictRateLimit && newAPIFinalError(res.Err.Message, rid) {
+		if res.Verdict == startup.VerdictRateLimit && newAPIFinalError(res, rid) {
 			// NewAPI's own terminal error: it committed 200 with its heartbeat,
 			// exhausted RetryTimes and wrote the error into the stream with this
 			// request's id at the end. Retrying here would stack two retry loops.
@@ -107,11 +107,26 @@ func isEventStream(resp *http.Response) bool {
 	return err == nil && mediaType == "text/event-stream"
 }
 
-// newAPIFinalError reports whether a rate-limit message is NewAPI's own final
-// error rather than an upstream frame: it ends with " (request id: <rid>)",
-// where rid is the X-Oneapi-Request-Id of this very response (design §1.6).
-// An upstream frame forwarded verbatim cannot carry this request's id, and a
-// relay running its own NewAPI would carry a different one.
-func newAPIFinalError(message, requestID string) bool {
-	return requestID != "" && strings.HasSuffix(strings.TrimSpace(message), " (request id: "+requestID+")")
+// newAPIFinalError reports whether a rate-limit verdict is NewAPI's own terminal
+// error rather than an upstream frame; retrying it here would stack a second
+// retry loop on top of NewAPI's RetryTimes (design §1.6). Either rule is enough:
+//
+//  1. the message ends with " (request id: <rid>)", the suffix Relay's defer adds
+//     with MessageWithRequestId for the errors NewAPI generates itself. rid must
+//     be the X-Oneapi-Request-Id of this very response: a frame forwarded
+//     verbatim cannot carry it, and a relay that runs its own NewAPI carries a
+//     different one.
+//  2. the deciding frame was preceded by heartbeats only and carried no type.
+//     NewAPI committed 200 with its heartbeat, exhausted RetryTimes and wrote the
+//     forwarded upstream error with writeRelayStreamError. That error keeps the
+//     upstream object unchanged, so rule 1 cannot see it.
+//
+// Rule 2 can only misjudge towards passing the stream through (a slow upstream
+// whose first frame is an untyped rate limit, e.g. the Chat shape); the client
+// then sees exactly what the official behaviour would deliver (design §8).
+func newAPIFinalError(res startup.Result, requestID string) bool {
+	if requestID != "" && strings.HasSuffix(strings.TrimSpace(res.Err.Message), " (request id: "+requestID+")") {
+		return true
+	}
+	return res.HeartbeatOnly && res.Untyped
 }
