@@ -31,10 +31,11 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q13 | R5 | 排期·T6 漏了对 T5 的依赖；T5 要等 G1，但排在 T7 前面 | 耦合 | P2 | 01 | 已关闭：`obs` 放进 T6，`cmd/nahook` 放进 T5；顺序改为 T7 → T6 → T5，T6 不依赖 T0（§7.9） |
 | Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
 | Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 重新打开，见 Q20：request id 规则只认得 NewAPI 自己生成的错误；K7：LT 的心跳一直开着（间隔 1s），生产相同 |
-| Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 待 K8（用户告知主机并批准只读核查） |
+| Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 已查清（K8）：主机是 `api21/19`，基线不一致，转为 Q21 |
 | Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 已关闭：`fail_duration 10s`、不写 `lb_try_duration`（00 §3.2、§6.1、§8）；T-C4 第三次通过 |
 | Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
 | Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 已关闭：T15（`build-bd6fad86`）部署到 LT，关护栏的 h3 上复测 T-F17 通过（§7.17） |
+| Q21 | R3 | 部署·生产是官方 rc.44 没有护栏，Caddy 是 2.11.4 并带 `encode`；LT 的 Caddy 是 2.6.2 | 不明 | P1 | 00、01 | 待用户拍板（§4 D3、D4） |
 | Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 已关闭：用户拍板去掉站点层 `encode`（LT 在 T10 去掉；生产本来没有，K8 时确认） |
 
 ## 3. 逐项说明
@@ -111,6 +112,12 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 - 影响：生产阶段 2（h3 关护栏）和阶段 3（如果换成带 `#7857` 的官方版本）上，只要心跳打开、上游的 HTTP 错误回得比心跳间隔慢（或者 NewAPI 的几次重试加起来比心跳间隔长），每个这样的请求对上游的调用会放大到 (1 + `retry.max`) × (1 + RetryTimes) 倍，客户端还要多等几轮冷却。护栏开着时（阶段 1）心跳在启动阶段不发出，h3 直接回 HTTP 429，不受影响（T10 实测）。
 - 处理：01 design §1.6 增加第 2 条规则：判定帧之前只有心跳（至少一个纯注释事件，没有别的事件），并且判定帧不带 type，就认定是 NewAPI 的终态错误，原样透传。只会往放行的方向误判（上游很慢、心跳已发出、上游第一帧就是不带 type 的限流错误时，客户端看到的和官方一样）。由 T15 实现，部署到 LT 后用关护栏的 h3 复测 T-F17；T11 之前完成。K7：LT 的心跳一直开着、间隔 1s，生产和 LT 一样（用户告知），所以生产上一定会走到这条路径，T15 必须在 T12 之前部署到生产。
 
+### Q21 生产基线和 LT 不一致
+
+- 证据：K8 只读核查（01 audit §5 K8）。生产 NewAPI 是官方 rc.44（digest `67bf2716…`），没有护栏；Caddy 是官方构建 v2.11.4，站点层有 `encode zstd gzip`，没有 `flush_interval -1`。LT 的 Caddy 是 Debian 包 2.6.2。rc.44 到 rc.45 的 31 个提交里，`relay/channel/openai/relay_responses.go`、`relay/helper/stream_scanner.go` 没有改动，`controller/relay.go` 只多了上游地址脱敏，rc.44 没有 `writeRelayStreamError`。
+- 影响：00 design §1.2 的三阶段计划失去前提：阶段 2（关 h3 护栏）和阶段 3（换官方镜像）不存在，部署 nahook 就立刻开始拦截。T0、T-C1–T-C4、Q17、Q18 的结论是在 Caddy 2.6.2 上得出的，2.11.4 上需要重测（`ignoreClientGoneContext` 在 v2.8.0 删除，`encode` 的 Flush 在 v2.9.0 修复）。`relayscope-agent` 读取 NewAPI 的日志，nahook 每次重试在 NewAPI 里都是一个独立请求，会多出 quota 为 0 的日志行（T-F9）。
+- 处理：待用户拍板 D3、D4（00 design §1.2 末尾）。
+
 ### Q6 被拦截那几次尝试的计费
 
 - 证据：`NEWAPI/service/responses_usage.go:107` 的逻辑是：流失败且没有输出时，不估算输入 token。
@@ -147,7 +154,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 | 编号 | 内容 | 位置 |
 |---|---|---|
-| — | 目前没有待拍板项（D1、D2 已于 2026-10-21 拍板，见 §7.16） | — |
+| D3 | 生产上线路径：在 rc.44 上一个阶段部署 nahook 和路由（不换镜像） | 00 design §1.2 末尾"待拍板" |
+| D4 | 上线前先把 LT 的 Caddy 换成 2.11.4、加回 `encode`，重跑 T-C1–T-C4 和压缩下的逐帧测试；生产 `encode` 的去留按结果定 | 00 design §1.2 末尾"待拍板" |
 
 ## 5. 开工前待查索引
 
@@ -157,10 +165,10 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | K2 | 真实中转站的限流帧形态 | 01 audit §5 | 01:T12 |
 | K3 | 官方镜像要固定的 digest | 01 audit §5 | 已定：rc.45 `sha256:6c63c7ee…87bc3f9` |
 | K4 | h3 与 rc.45 来回切换的数据库兼容性 | 01 audit §5 | 正向已验证；回退方向在 01:T10 演练 |
-| K5 | 生产主机的 3000 端口是否暴露在公网 | 01 audit §5 | 00:G3 |
+| K5 | 生产主机的 3000 端口是否暴露在公网 | 01 audit §5 | 已查清：没有暴露（安全组挡住） |
 | K6 | LT 上测试分组的定价 | 01 audit §5 | 已查清（01:T9、T10） |
 | K7 | 生产主机的心跳设置 | 01 audit §5 | LT 已查清（心跳开着、间隔 1s）；生产在 K8 时确认 |
-| K8 | 生产主机是哪台、基线是否和 LT 改动前一致 | 01 audit §5 | 01:T11 之前 |
+| K8 | 生产主机是哪台、基线是否和 LT 改动前一致 | 01 audit §5 | 已查清：`api21/19`，基线不一致（Q21） |
 | K9 | 站点层 `encode` 会不会憋住 SSE | 01 audit §5 | 已处理：去掉 `encode`（D1） |
 
 ## 6. 还没写 SPEC 的部分与写作顺序
@@ -666,3 +674,20 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 - 收尾时计数不变量成立：`rate_limited`(21) = `retries`(18) + `gave_up`(3)。
 
 T10 到此全部完成（00 G2 收口）。LT 现状：NewAPI rc.45；nahook `build-bd6fad86`；mockrelay `build-3a387b58`；Caddyfile `Caddyfile.final3`。
+
+### 7.18 K8：生产主机只读核查（2026-10-22）
+
+用户告知生产是 `api21/19`（USGL 里 `api21/19` 和 `api19` 两条记录都是 43.160.222.91），测试遗留（LT 上的令牌副本和 `/root/nahook-t10/`）保留到生产测完再处理。核查只读：没有重启、没有写文件；编排里的密钥没有打印；没有导出日志。
+
+| 项 | 结果 |
+|---|---|
+| 主机 | Debian 13，4 核，内存 7.9G（可用 6.5G），根分区 118G 用了 6% |
+| 容器 | `api19`（`calciumion/new-api:latest`，digest `67bf2716…`，rc.44，源码 `633b4c5b`，healthy）、`redis_api19`、`relayscope-agent-api19`、`beszel-agent` |
+| NewAPI 配置 | 编排 `/root/container/api19/compose.yaml`，服务名 `new-api`；环境变量里没有 `RESPONSES_STREAM_STARTUP_GUARD_ENABLED`；`ERROR_LOG_ENABLED=true`、`BATCH_UPDATE_ENABLED=true`（间隔 300）；数据库 `172.22.0.5:3306/new-api-api19`、Redis 在容器网络里 |
+| 端口 | 3000 由 docker-proxy 监听 `0.0.0.0`；80、443 是 Caddy；19080、18080 空闲 |
+| K5 | 从 LT 经公网请求 `http://43.160.222.91:3000/api/status`，6s 超时 |
+| Caddy | 官方构建 v2.11.4（dpkg 2.11.4），active；Caddyfile 53 行，sha256 `6ded83def1f40ff715396032f6bf98331d6f57db015130a3f58bdd5b976ccf2d`；站点 `api19.xhub.chat`：`reverse_proxy localhost:3000`（`least_conn`、`lb_try_duration 5s`、健康检查、`response_header_timeout 30m`、`X-Real-IP`），`encode zstd gzip`，`request_body` 512MB；没有 `flush_interval` |
+| 监控代理 | `relayscope-agent-api19`：挂载 NewAPI 日志目录、`agent.yaml`、spool 目录和 docker.sock；`beszel-agent`：主机网络，挂载 docker.sock，环境变量有 `HUB_URL` |
+| nahook | 主机上没有 nahook 的二进制和 unit |
+
+K7（生产的心跳设置）读不到（不读数据库），需要用户在 `api19` 的面板里看。

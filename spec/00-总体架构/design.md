@@ -72,6 +72,22 @@ T10 跑完审计清单（T-C、T-F）
 
 每个生产阶段在执行前都要用户明确同意。
 
+**待拍板：K8 发现生产主机和上面的前提不一致，上线路径要重定（specaudit §4 D3、D4）**
+
+K8 只读核查（2026-10-22，生产主机 `api21/19`，43.160.222.91）：NewAPI 是官方 `calciumion/new-api@sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84`（`v1.0.0-rc.44`，源码 `633b4c5b`），**没有护栏**；Caddy 是官方构建 **v2.11.4**，站点 `api19.xhub.chat` 没有 `flush_interval -1`，但有 `encode zstd gzip`；编排在 `/root/container/api19/compose.yaml`，数据库 `172.22.0.5:3306/new-api-api19`（和 LT 不是同一个库）；另有 `relayscope-agent`（读 NewAPI 的日志目录）和 `beszel-agent` 两个监控代理（01 audit K8）。
+
+```text
+现在的生产                                   上线 nahook 之后
+客户端 ─► Caddy 2.11.4（encode）─► NewAPI rc.44      客户端 ─► Caddy 2.11.4 ─┬ POST /v1/responses、/v1/chat/completions ─► nahook ─► NewAPI rc.44
+          限流以 200 SSE 错误直接给到客户端                                   └ 其他路径 ─► NewAPI rc.44
+                                                    限流在 nahook 里冷却、重试，用完上限才回代 429
+```
+
+- D3 场景：生产上的客户端现在就会收到流里的限流错误（这正是 nahook 要解决的问题）。原计划的阶段 2（关 h3 护栏）和阶段 3（换官方镜像）都不存在了，部署 nahook 并加上路由就立刻开始拦截。rc.44 和 LT 的 rc.45 在 nahook 依赖的代码上没有差别：`relay/channel/openai/relay_responses.go`、`relay/helper/stream_scanner.go` 两者相同，rc.44 也没有 `writeRelayStreamError`，`controller/relay.go` 只多了上游地址脱敏。
+- D3 建议：生产只有一个阶段，在现有的 rc.44 上部署 nahook（`build-bd6fad86`）和 Caddy 路由，不换镜像；验证同 P-2（journal 出现 intercept 后接 release 或 give_up，客户端拿到成功的流或 HTTP 429）；回退是去掉路由再 reload。部署前先完成 D4。
+- D4 场景：LT 的 Caddy 是 Debian 包 2.6.2，T0、T-C1–T-C4、Q17、Q18 的结论都是在 2.6.2 上得出的；生产是 2.11.4，`flush_interval -1` 的 `ignoreClientGoneContext` 在 v2.8.0 已删除，`encode` 的 Flush 在 v2.9.0 已修，重试时请求体的处理也可能不同。直接上生产，等于在生产上第一次验证 nahook 路由。
+- D4 建议：先把 LT 的 Caddy 换成和生产相同的 2.11.4（官方构建），站点层按生产的样子加回 `encode zstd gzip`，在 LT 上重跑 T-C1–T-C4，再测一次带压缩的逐帧到达（`curl --compressed -N`）。都通过以后，生产的 `encode` 保留不动；如果压缩会攒住事件，生产也去掉 `encode`。LT 的 NewAPI 保持 rc.45，不跟着降到 rc.44（上面的代码对比说明两者在 nahook 依赖的部分相同）。
+
 ### 1.3 端到端请求（两台主机的稳态）
 
 ```text
