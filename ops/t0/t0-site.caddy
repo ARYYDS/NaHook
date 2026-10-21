@@ -1,0 +1,48 @@
+
+# --- nahook T0 (temporary; remove after the experiment) ---
+http://127.0.0.1:19444 {
+	bind 127.0.0.1
+	handle /hold-neg1/* {
+		reverse_proxy 127.0.0.1:19082 {
+			flush_interval -1
+			transport http {
+				keepalive               10m
+				keepalive_idle_conns    2000
+				response_header_timeout 30m
+				dial_timeout            5s
+			}
+		}
+	}
+	handle /hold-default/* {
+		reverse_proxy 127.0.0.1:19082 {
+			transport http {
+				keepalive               10m
+				keepalive_idle_conns    2000
+				response_header_timeout 30m
+				dial_timeout            5s
+			}
+		}
+	}
+	handle /stream-neg1/* {
+		reverse_proxy 127.0.0.1:19083 {
+			flush_interval -1
+			transport http {
+				keepalive               10m
+				keepalive_idle_conns    2000
+				response_header_timeout 30m
+				dial_timeout            5s
+			}
+		}
+	}
+	handle /stream-default/* {
+		reverse_proxy 127.0.0.1:19083 {
+			transport http {
+				keepalive               10m
+				keepalive_idle_conns    2000
+				response_header_timeout 30m
+				dial_timeout            5s
+			}
+		}
+	}
+}
+# --- end nahook T0 ---
