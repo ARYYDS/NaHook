@@ -62,12 +62,18 @@ func NewHandler(s *config.Store, g *gate.Registry, st *obs.Stats, log *slog.Logg
 		st:    st,
 		log:   log,
 		base:  base,
-		client: &http.Client{Transport: &http.Transport{
-			DisableCompression:  true,
-			MaxIdleConns:        2000,
-			MaxIdleConnsPerHost: 2000,
-			IdleConnTimeout:     10 * time.Minute,
-		}},
+		client: &http.Client{
+			// A proxy hands a 3xx to the client as it is. net/http would follow it
+			// and turn a POST into a GET on 301/302; NewAPI's own relay turns
+			// that off the same way (keepUpstreamRedirectResponse).
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			Transport: &http.Transport{
+				DisableCompression:  true,
+				MaxIdleConns:        2000,
+				MaxIdleConnsPerHost: 2000,
+				IdleConnTimeout:     10 * time.Minute,
+			},
+		},
 	}
 }
 
@@ -223,6 +229,12 @@ func (h *Handler) forward(ctx context.Context, r *http.Request, body io.Reader) 
 		}
 	}
 	req.Header.Set("Accept-Encoding", "identity")
+	if _, ok := r.Header["User-Agent"]; !ok {
+		// Without this net/http sends its own "Go-http-client/1.1" for a client
+		// that sent no User-Agent; an empty value suppresses it, as
+		// httputil.ReverseProxy does.
+		req.Header.Set("User-Agent", "")
+	}
 
 	return h.client.Do(req)
 }

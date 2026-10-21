@@ -55,6 +55,14 @@ func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []
 			return
 		}
 		if res.Verdict == startup.VerdictRelease {
+			if r.Context().Err() != nil {
+				// The read ended because the client went away: there is nobody to
+				// release to, and a release that never happened must not reset
+				// the gates of this model (design §1.6).
+				_ = resp.Body.Close()
+				h.st.Inc(obs.ClientGone)
+				return
+			}
 			h.gates.ResetModel(meta.Model)
 			h.st.Inc(obs.Released)
 			h.log.Info("release", "request_id", rid, "attempt", n)

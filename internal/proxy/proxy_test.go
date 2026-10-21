@@ -661,3 +661,94 @@ func TestLogsFollowDesign(t *testing.T) {
 		}
 	}
 }
+
+// failAfterFirst returns the first chunk, then cancels the client and fails the
+// next read the way a transport does when the request context ends.
+type failAfterFirst struct {
+	first  string
+	sent   bool
+	cancel context.CancelFunc
+}
+
+func (f *failAfterFirst) Read(p []byte) (int, error) {
+	if !f.sent {
+		f.sent = true
+		return copy(p, f.first), nil
+	}
+	f.cancel()
+	return 0, context.Canceled
+}
+
+// A client that leaves while the startup frames are being read ends the request
+// as client_gone: nothing is written and the gates of the model keep their state.
+func TestClientGoneDuringStartupRead(t *testing.T) {
+	c := testConfig(t, "http://newapi.invalid", 3)
+	h, stats, gates, _ := newTestHandler(t, c)
+	gates.Get("gpt-6-astra|org-mock").OnRateLimit(time.Second, 50*time.Millisecond, 3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int32
+	h.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "X-Oneapi-Request-Id": []string{"req-x"}},
+			Body:       io.NopCloser(&failAfterFirst{first: createdFrame, cancel: cancel}),
+		}, nil
+	})}
+
+	spy := &spyWriter{rec: httptest.NewRecorder(), forwards: func() int { return int(calls.Load()) }}
+	h.ServeHTTP(spy, postRequest(ctx, streamBody("gpt-6-astra", true)))
+
+	if len(spy.headerAt) != 0 || spy.writes != 0 || spy.flushes != 0 {
+		t.Errorf("handler touched the response after the client left: headers=%v writes=%d flushes=%d", spy.headerAt, spy.writes, spy.flushes)
+	}
+	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "client_gone": 1})
+	for _, g := range gates.Snapshot() {
+		if g.Key == "gpt-6-astra|org-mock" && g.Streak != 1 {
+			t.Errorf("streak = %d, want 1: a release that never happened reset the gate", g.Streak)
+		}
+	}
+}
+
+// A 3xx from NewAPI reaches the client unchanged; the proxy does not follow it.
+func TestRedirectIsPassedThrough(t *testing.T) {
+	var followed atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/elsewhere" {
+			followed.Add(1)
+			return
+		}
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	}))
+	t.Cleanup(up.Close)
+	c := testConfig(t, up.URL, 3)
+	h, stats, _, _ := newTestHandler(t, c)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, postRequest(context.Background(), streamBody("gpt-6-astra", false)))
+
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/elsewhere" {
+		t.Fatalf("got %d Location=%q, want 302 to /elsewhere", rec.Code, rec.Header().Get("Location"))
+	}
+	if followed.Load() != 0 {
+		t.Fatalf("the proxy followed the redirect %d time(s)", followed.Load())
+	}
+	assertCounters(t, stats.Snapshot(), map[string]int64{"passthrough": 1})
+}
+
+// A client without User-Agent reaches NewAPI without one, not with Go's default.
+func TestMissingUserAgentStaysMissing(t *testing.T) {
+	up := newFakeUpstream(t, "ok")
+	c := testConfig(t, up.server.URL, 3)
+	h, _, _, _ := newTestHandler(t, c)
+
+	r := postRequest(context.Background(), streamBody("gpt-6-astra", false))
+	r.Header.Del("User-Agent")
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	if got, ok := up.record(0).header["User-Agent"]; ok {
+		t.Fatalf("NewAPI received User-Agent %q for a client that sent none", got)
+	}
+}
