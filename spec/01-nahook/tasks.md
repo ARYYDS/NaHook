@@ -19,12 +19,14 @@
           阶段 A：风险验证     阶段 B：开发                       阶段 C：测试环境     阶段 D：生产
 L-OPS  │ T0 Caddy 断开实验 │                                  │ T9 搭测试环境      │ T11 → T12 → T13
        │                  │                                  │ T10 跑审计清单      │
-L-GO   │                  │ T1 → T2 → T3 → T4 → T5 → T6 → T7 → T8 │                  │
+L-GO   │                  │ T1 → T2 → T3 → T4 → T7 → T5 → T6 → T8 │                  │
+                            （T5 开工前要等 00 G1，也就是 T0 的结论）
                             （Win11 上的 DSH 串行执行；每个任务交付后，由开发机另派审计）
 L-DOC                                                                               │ T14 运维手册
 ```
 
 - L-OPS 只改 LT 上的配置和 Caddyfile，不碰 Go 代码；L-GO 只改 nahook 仓库。两条车道可以并行。
+- T7 只依赖 T1，排在 T5 前面，用来填 T0 结论出来之前的空档；T5 要等 G1，T6 依赖 T5。
 - T9 依赖 T8 的产物；T11 依赖 T10 全部通过。
 
 ## 2. 任务
@@ -78,18 +80,24 @@ L-DOC                                                                           
     - [ ] 响应头只按白名单从上一次尝试复制（design §1.4），SSE 专用的头不会被带过来
   - 冲突：无
 
-- [ ] **T5 proxy 包（分类、转发、放行、透传、拦截主循环）**（L-GO）
-  - 前置：T2、T3、T4
-  - 改动：`internal/proxy`：`NewHandler`、`ServeHTTP`、`classify`、`forward`、`serveIntercept`、`release`、`passthrough`、`copyFlush`、`writeBadGateway`
-  - 依据：design §1.2、§1.6、§1.8、§6.1；interface 2.5 ｜ audit T-F2、T-F5、T-F6、T-F7、T-F10、T-F16
+- [ ] **T5 obs 包和 proxy 包（分类、转发、放行、透传、拦截主循环）**（L-GO）
+  - 前置：T2、T3、T4；00 G1（T0 的结论。需要单请求总时限时，先改 design §4 和 §1.6，再开工）
+  - 改动：
+    - `internal/obs`：`NewLogger`、`Counter` 及其常量、`NewStats`、`(*Stats).Inc`、`(*Stats).Snapshot`
+    - `internal/proxy`：`NewHandler`、`ServeHTTP`、`classify`、`forward`、`serveIntercept`、`release`、`passthrough`、`copyFlush`、`writeBadGateway`
+  - 依据：design §1.2、§1.6、§1.8、§5（日志）、§6.1、§6.7；interface 2.5、2.7 ｜ audit T-F2、T-F5、T-F6、T-F7、T-F10、T-F16
   - 完成判据：
     - [ ] 用 httptest 起一个假 NewAPI，覆盖：重试到上限后返回代 429、重试中途成功、HTTP 429 透传、非流式透传、超大请求体透传、ctx 取消
     - [ ] 断言：判定之前对 `w` 没有任何写入
-    - [ ] 断言：逐跳头被去掉，XFF 和 X-Real-IP 原样转发
+    - [ ] 断言：逐跳头被去掉，XFF 和 X-Real-IP 原样转发；NewAPI 收到的 Host 等于客户端请求的 Host；每次重试的请求体和原始请求体逐字节一致
+    - [ ] 断言：ctx 取消（在 `forward` 期间和 `Wait` 期间各一次）时不写响应，计 `client_gone`，不计 `bad_gateway`
+    - [ ] 断言：代 429 带上了假 NewAPI 最后一次响应里的 `X-Oneapi-Request-Id` 和 `Access-Control-Allow-Origin`
+    - [ ] 断言：每个场景结束后的 `Snapshot` 与 design §6.7 一致，且 `rate_limited = retries + gave_up`
+    - [ ] 断言：日志是 JSON，一行一条；`intercept`、`wait`、`release`、`give_up` 的字段与 design §5 一致
   - 冲突：无
 
 - [ ] **T6 control 包和 nahookctl**（L-GO）
-  - 前置：T1、T3
+  - 前置：T1、T3、T5（`control.Serve` 要用 `obs.Stats`；`cmd/nahook` 要调用 `proxy.NewHandler`）
   - 改动：`internal/control.Serve`；`cmd/nahookctl`；`cmd/nahook`（main、信号处理）
   - 依据：design §5、§6.4、§6.5；interface 2.6 ｜ audit T-F3、T-F8、T-F11
   - 完成判据：

@@ -55,18 +55,19 @@ nahook 是一个独立的常驻进程，部署在 LT 宿主机上，串在 Caddy
 ### 1.2 请求分类 `proxy.classify`
 
 ```text
-func classify(r *http.Request, cfg *config.Config) (body []byte, meta reqMeta, intercept bool, rest io.Reader)
+func classify(r *http.Request, cfg *config.Config) (body []byte, meta reqMeta, intercept bool, rest io.Reader, err error)
   if r.Method != POST || !slices.Contains(cfg.Match.Paths, r.URL.Path):
-      return nil, _, false, r.Body                        # 透传
-  buf := 最多读 cfg.BodyLimit+1 字节
+      return nil, _, false, r.Body, nil                   # 透传
+  buf, err := io.ReadAll(io.LimitReader(r.Body, cfg.BodyLimit+1))
+  if err != nil: return nil, _, false, nil, err        # ServeHTTP：ctx 已取消 → 计 ClientGone、不写；否则计 BadGateway、回 502
   if len(buf) > cfg.BodyLimit:
-      return nil, _, false, io.MultiReader(bytes.NewReader(buf), r.Body)   # 太大：透传，不拦截
+      return nil, _, false, io.MultiReader(bytes.NewReader(buf), r.Body), nil   # 太大：透传，不拦截
   var head struct { Stream *bool `json:"stream"`; Model string `json:"model"` }
   if json.Unmarshal(buf, &head) != nil || head.Stream == nil || !*head.Stream:
-      return buf, _, false, nil                           # 坏 JSON 或非流式：透传
+      return buf, _, false, nil, nil                      # 坏 JSON 或非流式：透传
   if len(cfg.Match.Models) > 0 && !slices.Contains(cfg.Match.Models, head.Model):
-      return buf, _, false, nil
-  return buf, reqMeta{Model: head.Model}, true, nil
+      return buf, _, false, nil, nil
+  return buf, reqMeta{Model: head.Model}, true, nil, nil
 ```
 
 ### 1.3 启动帧读取与判定 `startup.Read` / `startup.inspect` / `startup.IsRateLimit`
@@ -213,28 +214,42 @@ func (g *Gate) Wait(ctx context.Context) error
 ```text
 func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
   n := 0                                              # 本请求已被拦截的次数
+  h.st.Inc(obs.Intercepted)
   for {
     t0 := now
     resp, err := h.forward(r.Context(), r, bytes.NewReader(body))
-    if err != nil: writeBadGateway(w); return            # 连不上 NewAPI：和现在 NewAPI 挂掉一样
+    if err != nil:
+        if r.Context().Err() != nil: h.st.Inc(obs.ClientGone); return   # 客户端已断开：不写、不算作 NewAPI 故障
+        h.st.Inc(obs.BadGateway); writeBadGateway(w); return            # 连不上 NewAPI：和现在 NewAPI 挂掉一样
+    rid := resp.Header.Get("X-Oneapi-Request-Id")       # 只用于日志
     if resp.StatusCode != 200 || !isEventStream(resp):
-        passthrough(w, resp); return                     # 包括 NewAPI 自己的 429：它已按 RetryTimes 重试过
+        h.st.Inc(obs.Passthrough); passthrough(w, resp); return   # 包括 NewAPI 自己的 429：它已按 RetryTimes 重试过
     res := startup.Read(resp.Body)
     if res.Verdict == startup.VerdictRelease:
         h.gates.ResetModel(meta.Model)                   # 这个模型下所有 key 的 streak 清零（§6.3）
+        h.st.Inc(obs.Released); log release{request_id: rid, attempt: n}
         release(w, resp, res.Prefix, res.Rest); return
     resp.Body.Close()
+    h.st.Inc(obs.RateLimited)
     cfg := h.store.Current()                             # 每次都读当前快照：热修改马上生效
     key := gate.Key(meta.Model, res.Err.Message)
     g := h.gates.Get(key)
-    g.OnRateLimit(now - t0, cfg.Gate.BaseFloor, cfg.Gate.StreakCap)
+    elapsed := now - t0
+    g.OnRateLimit(elapsed, time.Duration(cfg.Gate.BaseFloorMS)*time.Millisecond, cfg.Gate.StreakCap)
     max := h.store.RetryMax(meta.Model)
+    log intercept{request_id: rid, key, attempt: n, elapsed_ms: elapsed, max}
     if n >= max:
+        h.st.Inc(obs.GaveUp); log give_up{request_id: rid, key, attempts: n+1}
         proxy429.Write(w, resp.Header, res.Err); return
     n++
-    if g.Wait(r.Context()) != nil: return                # 客户端已断开
+    h.st.Inc(obs.Retries)
+    w0 := now
+    if g.Wait(r.Context()) != nil: h.st.Inc(obs.ClientGone); return   # 客户端已断开
+    log wait{key, wait_ms: now - w0}
   }
 ```
+
+`ServeHTTP` 的不拦截分支处理 `forward` 错误的方式相同：ctx 已取消时只计 `ClientGone`，否则计 `BadGateway` 并回 502；成功时计 `Passthrough`。日志事件和字段见 §5，计数器见 §6.7。
 
 在 `release` 或 `proxy429.Write` 之前，**不会**对 `w` 做任何写入（包括 Header 以外的写入和 Flush）。
 
@@ -489,7 +504,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 |---|---|
 | `NewHandler(store *config.Store, gates *gate.Registry, st *obs.Stats, log *slog.Logger) *Handler` | 用 `newapi` 地址构造 `http.Transport{DisableCompression: true, MaxIdleConns: 2000, MaxIdleConnsPerHost: 2000, IdleConnTimeout: 10m}` |
 | `(*Handler).ServeHTTP` | 调 `classify`；拦截走 `serveIntercept`，否则走 `forward` + `passthrough` |
-| `forward(ctx, r, body)` | 新建请求：方法、`RequestURI`、请求头（去掉逐跳头）原样复制，`Accept-Encoding: identity`；设好 `ContentLength` 和 `GetBody`。**不改动** `X-Forwarded-For`、`X-Real-IP`、`Authorization` |
+| `forward(ctx, r, body)` | 用 `http.NewRequestWithContext` 新建请求：方法照抄；URL 是 `newapi` 地址加上 `r.URL` 的路径（含 `RawPath`）和 `RawQuery`，不设 `RequestURI`（客户端请求设了会报错）；`Host = r.Host`（Caddy 默认原样转发 Host，NewAPI 现在看到的就是它）；请求头去掉逐跳头后原样复制，再设 `Accept-Encoding: identity`（`startup.Read` 要读明文；走到 nahook 的只有 relay 路由，NewAPI 在 relay 路由上不压缩，gzip 只挂在 `NEWAPI/router/api-router.go:20`、`dashboard.go:13`、`web-router.go:23`）。请求体：`body` 是 `*bytes.Reader` 时，`ContentLength` 和 `GetBody` 由 `http.NewRequestWithContext` 自动设好（Go net/http 对 `*bytes.Reader` 的特殊处理）；否则（流式透传）手动设 `ContentLength = r.ContentLength`，不设 `GetBody`。**不改动** `X-Forwarded-For`、`X-Real-IP`、`Authorization` |
 | 逐跳头 | `Connection`、`Keep-Alive`、`Proxy-Connection`、`Proxy-Authenticate`、`Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`，以及 `Connection` 头里点名的字段（RFC 9110 §7.6.1） |
 | `writeBadGateway` | 回 502 `{"error":{"message":"nahook: upstream unavailable","type":"nahook_error","param":"","code":"upstream_unavailable"}}` |
 
@@ -571,6 +586,29 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `hold:<秒>` | 先不回响应头，等指定秒数再按 `ok` 回 |
 | `chat_rate_limit` | Chat Completions 格式：首个 chunk 就是 `{"error":{…}}` |
 | `quota` | `insufficient_quota`，不应该被拦截 |
+
+### 6.7 `internal/obs`
+
+| 函数 / 类型 | 说明 |
+|---|---|
+| `NewLogger(w io.Writer) *slog.Logger` | `slog.New(slog.NewJSONHandler(w, nil))`；`cmd/nahook` 传 `os.Stdout`，由 journald 收集 |
+| `type Counter int` | 计数器编号；下表每一行一个常量 |
+| `NewStats() *Stats` | 每个计数器一个 `atomic.Int64`，全部从 0 开始；进程重启即清零 |
+| `(*Stats).Inc(c Counter)` | 原子加 1；数据面调用，不拿锁 |
+| `(*Stats).Snapshot() map[string]int64` | 逐个 `Load`，键用下表的名字，所有计数器都在（值为 0 也列出）；给 `GET /v1/stats` 的 `counters` 用 |
+
+| 常量 | 键名 | 什么时候加 1 |
+|---|---|---|
+| `Intercepted` | `intercepted` | `classify` 判为拦截，进入 `serveIntercept` |
+| `RateLimited` | `rate_limited` | 一次尝试的启动帧被判为限流 |
+| `Retries` | `retries` | 判为限流后还没到上限，进入 `Wait` |
+| `Released` | `released` | 拦截路径上放行 |
+| `GaveUp` | `gave_up` | 返回代 429 |
+| `Passthrough` | `passthrough` | 不拦截的请求转发成功；或拦截路径上 NewAPI 回了非 200 或非 SSE |
+| `BadGateway` | `bad_gateway` | 连不上 NewAPI，回了 502 |
+| `ClientGone` | `client_gone` | `forward` 或 `Wait` 因为 `r.Context()` 取消而返回 |
+
+不变量：`rate_limited = retries + gave_up`（每次判为限流后，恰好走这两条路中的一条）；每个被拦截的请求恰好以 `released`、`gave_up`、`passthrough`、`bad_gateway`、`client_gone` 之一结束。
 
 ## §7 技术栈与依赖
 

@@ -28,7 +28,7 @@ proxy.(*Handler).ServeHTTP
         │        ├─ config.(*Store).RetryMax
         │        ├─ n ≥ max ─► proxy429.Write
         │        └─ 否则 ─► (*Gate).Wait ─► 回到 forward
-        └─ obs.(*Stats).Inc*
+        └─ obs.(*Stats).Inc
 
 control.Serve ─► 处理 /v1/retry、/v1/stats、/v1/reload
   ├─ config.(*Store).RetryMax / SetRetryMax / UnsetRetryMax / Reload
@@ -93,8 +93,8 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 |---|---|---|---|
 | `NewHandler` | `func NewHandler(s *config.Store, g *gate.Registry, st *obs.Stats, log *slog.Logger) *Handler` | — | Transport 参数见 design §6.1 |
 | `(*Handler).ServeHTTP` | `func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request)` | — | — |
-| `classify` | `func (h *Handler) classify(r *http.Request, cfg *config.Config) ([]byte, reqMeta, bool, io.Reader)` | — | design §1.2 |
-| `forward` | `func (h *Handler) forward(ctx context.Context, r *http.Request, body io.Reader) (*http.Response, error)` | 对照 NewAPI 的接收端：`NEWAPI/relay/responses_handler.go:18` `ResponsesHelper`，它只认 `:66` 的状态码判断 | 不改 XFF；设置 `Accept-Encoding: identity` |
+| `classify` | `func (h *Handler) classify(r *http.Request, cfg *config.Config) ([]byte, reqMeta, bool, io.Reader, error)` | — | design §1.2；只有读请求体出错时返回 error |
+| `forward` | `func (h *Handler) forward(ctx context.Context, r *http.Request, body io.Reader) (*http.Response, error)` | 对照 NewAPI 的接收端：`NEWAPI/relay/responses_handler.go:18` `ResponsesHelper`，它只认 `:66` 的状态码判断 | 不改 XFF；`Host = r.Host`；设置 `Accept-Encoding: identity`；URL、请求体长度和 `GetBody` 的规则见 design §6.1 |
 | `serveIntercept` | `func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []byte, meta reqMeta)` | 对照的是这个循环要弥补的行为：`NEWAPI/relay/channel/openai/relay_responses.go:70` `OaiResponsesStreamHandler`（`:92` 逐帧转发，`:98` 返回 nil）；`NEWAPI/controller/relay.go:72` `Relay`（`:172`/`:177` 每个请求重新计数） | design §1.6 |
 | `release` / `passthrough` / `copyFlush` | `release(w, resp, prefix []byte, rest io.Reader)`；`passthrough(w, resp)`；`copyFlush(w, src io.Reader)` | flush 写法参照 `NEWAPI/relay/helper/common.go:138` `FlushWriter`；`http.NewResponseController` 的用法参照 `NEWAPI/relay/helper/stream_scanner.go:80` | — |
 | 注释帧 | 透传 `: PING` | `NEWAPI/relay/helper/common.go:231` `PingData` 写出的是 `": PING\n\n"` | 启动阶段把它当注释事件，留在前缀里 |
@@ -107,19 +107,30 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 | 路由 | `GET/PUT/DELETE /v1/retry`、`GET /v1/stats`、`POST /v1/reload` | design §5 |
 | nahookctl 子命令 | `retry get|set|unset`、`stats`、`reload`，全局参数 `--socket` | design §6.5 |
 
+### 2.7 `internal/obs`
+
+| nahook 接口 | 签名 | 对照 | 说明 |
+|---|---|---|---|
+| `NewLogger` | `func NewLogger(w io.Writer) *slog.Logger` | Go 标准库 `log/slog` 的 `slog.NewJSONHandler` | 事件和字段见 design §5 |
+| `Counter` 与常量 | `type Counter int`；`Intercepted`、`RateLimited`、`Retries`、`Released`、`GaveUp`、`Passthrough`、`BadGateway`、`ClientGone` | — | 键名见 design §6.7 |
+| `NewStats` | `func NewStats() *Stats` | — | — |
+| `(*Stats).Inc` | `func (s *Stats) Inc(c Counter)` | — | 原子加 1 |
+| `(*Stats).Snapshot` | `func (s *Stats) Snapshot() map[string]int64` | — | 所有计数器都列出 |
+
 ## 3. 每个接口的逻辑验证
 
 | 接口 | 前置条件 | 不变量 | 失败路径 |
 |---|---|---|---|
-| `classify` | `r.Body` 没被读过 | 判定为不拦截时，转发给 NewAPI 的请求体和原始请求体逐字节一致 | 读请求体出错 → 回 502 |
+| `classify` | `r.Body` 没被读过 | 判定为不拦截时，转发给 NewAPI 的请求体和原始请求体逐字节一致 | 读请求体出错 → 返回 error；`ServeHTTP` 在 ctx 已取消时不写响应，否则回 502 |
 | `startup.Read` | 响应是 200 且为 `text/event-stream` | `Prefix` 是已读字节的完整前缀；`Prefix` 加 `Rest` 正好等于原始流 | 任何异常都放行，不会凭空造出错误 |
 | `IsRateLimit` | `e` 来自 `upstreamError` | 同一个输入，结果和 h3 的 429 分支一致（只除了 `insufficient_quota`） | — |
-| `serveIntercept` | `body` 是完整缓存下来的请求体 | 在 `release` 或 `proxy429.Write` 之前 `w` 没有被写过；每次尝试只发一次上游请求；`n ≤ RetryMax` | ctx 被取消 → 不写响应，直接返回；连不上 NewAPI → 502 |
+| `serveIntercept` | `body` 是完整缓存下来的请求体 | 在 `release` 或 `proxy429.Write` 之前 `w` 没有被写过；每次尝试只发一次上游请求；`n ≤ RetryMax` | ctx 被取消 → 不写响应，计 `client_gone`，直接返回；其他转发错误 → 计 `bad_gateway`，回 502 |
 | `(*Gate).Wait` | — | 等待时长 < `until - now`；只用自己的计时器 | ctx 被取消 → 返回 `ctx.Err()` |
 | `(*Gate).OnRateLimit` | `elapsed ≥ 0` | `until` 只增不减；存下来的 `streak` 始终 ≤ `streakCap`；`base ≤ maxBase`，所以 `base << (s-1)` 不会溢出 | — |
 | `(*Store).SetRetryMax` | `n ≥ 0`，scope 不为空 | 文件内容和内存快照一致；数据面读不到中间状态 | 校验失败，或 rename 之前写盘失败 → 快照不变，返回错误；rename 之后目录 fsync 失败 → 快照切换，返回 `ErrDirSync` |
 | `proxy429.Write` | `w` 没被写过 | 状态码 429；`Content-Type` 和响应体格式与 NewAPI 一致 | — |
 | `control.Serve` | 由 systemd 创建好 `RuntimeDirectory` | socket 权限 0600 | Listen 失败 → 进程退出，systemd 自动重启 |
+| `obs.(*Stats)` | — | 只用原子操作，不拿锁；`rate_limited = retries + gave_up` | — |
 
 ## 4. 和 design.md 的一致性核对
 
@@ -133,3 +144,4 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 | §1.7 Store | 2.4 | 一致 |
 | §1.8 release / passthrough / copyFlush | 2.5 | 一致 |
 | §5 控制口 API | 2.6 | 一致 |
+| §6.7 obs | 2.7 | 一致 |
