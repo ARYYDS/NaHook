@@ -132,6 +132,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | K6 | LT 上测试分组的定价 | 01 audit §5 | 01:T9 |
 | K7 | 生产主机的心跳设置 | 01 audit §5 | 01:T12 |
 | K8 | 生产主机是哪台、基线是否和 LT 改动前一致 | 01 audit §5 | 01:T11 之前 |
+| K9 | 站点层 `encode` 会不会憋住 SSE | 01 audit §5 | 01:T10 |
 
 ## 6. 还没写 SPEC 的部分与写作顺序
 
@@ -449,3 +450,36 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 | N-c | P3 | 读启动帧时客户端断开：`startup.Read` 因读错误返回放行，代码计 `released`、调 `ResetModel` 清零这个模型的冷却门，并往已断开的连接里写 | 放行分支先看 `r.Context()`：已取消就计 `client_gone`，不写，也不 `ResetModel` |
 
 修复提交 `c6464a2`。Win11 门禁：gofmt 无输出；vet 退出码 0；`go test -race ./...` 十个包全部 ok，顶层 127 个 PASS、0 个 FAIL、1 个 SKIP（`TestSocketMode`，只在 Linux 上做）；`internal/proxy`、`cmd/nahook` 连跑 5 轮稳定；反证：把 `proxy.go`、`intercept.go` 换回 `e84039e` 的版本，三个新测试全部失败（写出了响应并把 streak 从 1 清成 0；客户端拿到 200 而不是 302；NewAPI 收到 `Go-http-client/1.1`）；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF。
+
+### 7.14 T8 审计（提交 `3a387b5`，由架构侧直接审计、直接修复）
+
+DSH 交付回报里的自行决定和风险点，架构侧的裁决：
+
+| 事项 | 裁决 | 回写位置 |
+|---|---|---|
+| `BUILDINFO.txt`、`SHA256SUMS` 用 `[IO.File]::WriteAllText` 加 ASCII 编码写入，LF、不带 BOM | 采纳。架构侧从 GitHub 读回 `SHA256SUMS`，确认以 `\n` 结尾、没有 `\r` | — |
+| `-o` 用正斜杠加结尾斜杠 | 采纳 | — |
+| 构建失败时删除本次新建的 dist 目录 | 采纳这个意图，但实现有缺陷，见 O-a | — |
+| 两个脚本都检查 HEAD 已推送；`release.ps1` 先用 `gh api` 探测仓库可达 | 采纳 | — |
+| 样例的单测放在只有测试文件的 `deploy` 包里 | 接受 | — |
+| 两个 unit 逐字照 00 §6.4 | 已核对，一致 | — |
+| Release 附件不带可执行位 | 安装时用 `install -m 0755` | 01 design §7；tasks T9 |
+| 没有签名，只有 sha256 | 接受：GitHub 记录的附件 digest 是第二个来源；另外 Release 可以复现，见下 | 01 design §7 |
+| 脚本把路径写死 | 改为按脚本所在位置推导仓库，产物根目录通过参数传入（默认仍是 Win11 的布局） | — |
+
+审计发现的问题，在 `audit/T8` 分支上修复：
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| O-a | P2 | `build.ps1` 先把 `$script:dist` 设成目标目录（第 60 行），再检查它是否已存在（第 61–62 行）；而 `Stop-Build` 会删除 `$script:dist`（第 37–38 行）。所以对已经构建过的提交再跑一次，结果是把那个提交的 dist 目录删掉，而不是拒绝覆盖。附件在 GitHub 上还有一份，所以不会丢产物，但违背了"已存在就拒绝覆盖"的承诺 | 新增 `$script:created`，只在本次运行自己建了目录以后才赋值；`Stop-Build` 只删它 |
+| O-b | P3 | `release.ps1` 上传前不核对产物：dist 目录被改动过，也会被原样发布 | 上传前核对 `BUILDINFO.txt` 的 commit 等于 HEAD，并按 `SHA256SUMS` 重算四个文件的哈希 |
+
+修复提交 `22fcb96`，合并提交 `c1c9b5b`。只改了脚本，二进制不受影响，不需要重新发布，`build-3a387b58` 仍然是要部署的版本。
+
+核验（Win11）：
+- 门禁：gofmt 无输出；vet 退出码 0；`go test -race ./...` 十一个包全部 ok，顶层 128 个 PASS、0 个 FAIL、1 个 SKIP；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF；两个脚本用 PowerShell 解析器检查，没有语法错误。
+- 复现：在一次性克隆里检出 `3a387b5`，执行 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/...`，`nahook`、`nahookctl`、`mockrelay` 三个二进制的 sha256 和 Release 附件逐字节一致。
+- 修复后的 `build.ps1` 在临时 `-DistRoot` 下连跑两次：第一次退出码 0，产出五个文件；第二次退出码 1，输出 "refusing to overwrite"，第一次的目录和 `SHA256SUMS` 原样保留。原版因为路径写死在 `O:\NaHook` 和正式 dist 目录上，没有实际运行它来复现，缺陷证据是上面引用的代码行。
+- 从 GitHub 读回的 Release：tag `build-3a387b58` 指向 `3a387b58141c48d0f0095e7de89ca3067e306a80`，prerelease，非草稿；五个附件的 digest 和 `SHA256SUMS` 一致。
+
+过程说明：这次的 SPEC 提交落在合并提交 `c1c9b5b` 之后（以往是先提交 SPEC 再合并）。原因是第一次写 SPEC 的脚本报错退出，而合并命令在另一行照常执行了；合并内容是审计过的代码，不受影响。

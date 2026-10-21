@@ -685,12 +685,13 @@ Win11 O:\NaHook（dev 分支已推送，工作区干净）
   └─ gh release create build-<8hex> --target <完整提交号> --prerelease --title "build <8hex>" --notes-file BUILDINFO.txt <五个文件>
 GitHub Release（公开）
   └─ 先 LT，T10 通过后生产主机：curl -fL 下载到 /root/nahook-dist/<8hex>/ ─► sha256sum -c SHA256SUMS
-        ─►（请示用户）install 到 /usr/local/bin ─►（请示用户）systemctl restart
+        ─►（请示用户）install -m 0755 到 /usr/local/bin（Release 附件不带可执行位）─►（请示用户）systemctl restart
 ```
 
 - 只有收到明确指令时才发 Release（T8 交付时发第一次）。
 - 每次往 LT 或生产主机上下载、安装、重启，都要先请示用户。同一个版本先在 LT 上跑过 T10 的相关审计项，才能装到生产主机上。
-- 发布出去的 Release 不覆盖，也不删除：一个提交只对应一个 tag。
+- 发布出去的 Release 不覆盖，也不删除：一个提交只对应一个 tag。`build.ps1` 拒绝覆盖已有的 dist 目录，失败时只删除本次新建的目录；`release.ps1` 上传前核对 `BUILDINFO.txt` 的提交号和 `SHA256SUMS`。
+- Release 可以复现：在同一工具链（go1.27.2）下，对同一提交执行 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/...`，得到的二进制和附件逐字节相同。审计时用这个办法确认附件来自那个提交（`specaudit.md` §7.14）。
 
 ## §8 易错点
 

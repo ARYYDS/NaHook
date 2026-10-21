@@ -127,7 +127,7 @@ L-DOC                                                                           
     - [ ] 同一个脚本项连发两次，响应体逐字节相同
   - 冲突：无
 
-- [ ] **T8 构建、打包和第一次发布**（L-GO）
+- [x] **T8 构建、打包和第一次发布**（L-GO；2026-10-21 完成，Release `build-3a387b58`，specaudit §7.14）
   - 前置：T5、T6、T7；Win11 上的 `gh auth login` 已完成
   - 改动：构建脚本 `scripts/build.ps1`（构建 → 写 `BUILDINFO.txt` 和 `SHA256SUMS`）；`scripts/release.ps1`（`gh release create`）；`deploy/nahook.service`（设 `UMask=0077`，design §6.4）、`deploy/mockrelay.service`（只装在 LT 上）、`deploy/config.example.json`；单元内容见 00 §6.4
   - 依据：design §7（构建、产物、发布与分发流程）；00 §6.4 ｜ audit §3
@@ -141,7 +141,7 @@ L-DOC                                                                           
 - [ ] **T9 在 LT 上搭测试环境**（L-OPS，**每一步在 LT 上的操作都要请示用户**）
   - 前置：T8 已发布 Release；00 G1（T0 的结论决定 nahook 路由写不写 `flush_interval -1`）；用户建好测试渠道和测试令牌（00 §6.2）
   - 改动：在 LT 上：
-    - 从 Release `build-<8hex>` 下载到 `/root/nahook-dist/<8hex>/`，`sha256sum -c SHA256SUMS` 通过后，再安装到 `/usr/local/bin`；
+    - 从 Release `build-<8hex>` 下载到 `/root/nahook-dist/<8hex>/`，`sha256sum -c SHA256SUMS` 通过后，再用 `install -m 0755` 安装到 `/usr/local/bin`；
     - 安装 `nahook.service`、`mockrelay.service`（00 §6.4）和 `/etc/nahook/config.json`（`retry.max=3`，`match.models` 包含 `gpt-6-astra`）；
     - 备份 Caddyfile 后，在 `lt.xhub.chat` 站点里加 nahook 路由（00 §6.1），`caddy validate` 通过后 reload
   - 依据：00 §2、§6 ｜ audit §2
