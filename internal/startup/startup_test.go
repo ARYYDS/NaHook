@@ -109,14 +109,27 @@ func TestReadSamples(t *testing.T) {
 			},
 		},
 		{
-			name:    "top-level error frame uses its own code and message",
-			stream:  sse("error", `{"type":"error","code":"rate_limit_exceeded","message":"top-level rate limit"}`),
+			name:    "top-level error frame uses only its own code and message, like H3",
+			stream:  sse("error", `{"type":"error","code":"rate_limit_exceeded","message":"top-level rate limit","param":"x"}`),
 			verdict: VerdictRateLimit,
 			wantErr: &UpstreamError{
 				Message: "top-level rate limit",
-				Type:    "error",
 				Code:    []byte(`"rate_limit_exceeded"`),
 			},
+		},
+		{
+			name:    "response.failed with only top-level fields falls back like H3",
+			stream:  created + sse("response.failed", `{"type":"response.failed","code":"rate_limit_exceeded","message":"`+"Rate limit reached for gpt-6-astra"+`"}`),
+			verdict: VerdictRateLimit,
+			wantErr: &UpstreamError{
+				Message: "Rate limit reached for gpt-6-astra",
+				Code:    []byte(`"rate_limit_exceeded"`),
+			},
+		},
+		{
+			name:    "a non-string response.status does not break the frame",
+			stream:  sse("response.created", `{"type":"response.created","response":{"status":1}}`) + sse("response.output_text.delta", `{"type":"response.output_text.delta","delta":"hi"}`),
+			verdict: VerdictRelease,
 		},
 		{
 			name:    "comment frames and delta stay in the prefix",
@@ -229,6 +242,46 @@ func TestReadHandlesReadErrorAfterCompleteEvent(t *testing.T) {
 	}
 	if got := string(res.Prefix); got != first {
 		t.Fatalf("Prefix = %q, want %q", got, first)
+	}
+}
+
+// endlessLine yields n bytes of 'x' and never a newline, then EOF. It counts
+// how much Read pulled from it.
+type endlessLine struct {
+	n, served int
+}
+
+func (r *endlessLine) Read(p []byte) (int, error) {
+	if r.served >= r.n {
+		return 0, io.EOF
+	}
+	k := min(len(p), r.n-r.served)
+	for i := range k {
+		p[i] = 'x'
+	}
+	r.served += k
+	return k, nil
+}
+
+// A huge line without a newline must be cut at the byte budget instead of being
+// buffered whole (design §1.3: readLine), and nothing read may be lost.
+func TestReadBoundsAnOverlongLine(t *testing.T) {
+	src := &endlessLine{n: 64 << 20}
+	res := Read(src)
+
+	if res.Verdict != VerdictRelease {
+		t.Fatalf("Verdict = %d, want release", res.Verdict)
+	}
+	// One bufio.Reader fill (4096 bytes by default) may overshoot the budget.
+	if len(res.Prefix) > MaxBytes+4096 {
+		t.Fatalf("Prefix holds %d bytes, want at most MaxBytes plus one buffer", len(res.Prefix))
+	}
+	if src.served > MaxBytes+2*4096 {
+		t.Fatalf("Read pulled %d bytes from the upstream before giving up", src.served)
+	}
+	rest := drain(res.Rest)
+	if len(res.Prefix)+len(rest) != src.n {
+		t.Fatalf("Prefix+Rest = %d bytes, want %d", len(res.Prefix)+len(rest), src.n)
 	}
 }
 

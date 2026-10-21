@@ -45,25 +45,67 @@ func TestUpstreamErrorOrder(t *testing.T) {
 			want:      UpstreamError{Message: "boom", Type: "error"},
 		},
 		{
-			name:      "top-level error event uses code and message",
+			name:      "top-level error event uses only code and message, like H3",
 			eventName: "",
 			frame:     `{"type":"error","code":"rate_limit_exceeded","message":"m3"}`,
 			ok:        true,
-			want:      UpstreamError{Message: "m3", Type: "error", Code: json.RawMessage(`"rate_limit_exceeded"`)},
+			want:      UpstreamError{Message: "m3", Code: json.RawMessage(`"rate_limit_exceeded"`)},
 		},
 		{
 			name:      "event name supplies the type when the frame has none",
 			eventName: "error",
 			frame:     `{"code":"rate_limit_exceeded","message":"m4"}`,
 			ok:        true,
-			want:      UpstreamError{Message: "m4", Type: "error", Code: json.RawMessage(`"rate_limit_exceeded"`)},
+			want:      UpstreamError{Message: "m4", Code: json.RawMessage(`"rate_limit_exceeded"`)},
 		},
 		{
-			name:      "top-level param is carried when it is a string",
+			name:      "top-level param is not carried, like H3",
 			eventName: "error",
 			frame:     `{"code":"invalid_request_error","message":"m5","param":"temperature"}`,
 			ok:        true,
-			want:      UpstreamError{Message: "m5", Type: "error", Param: "temperature", Code: json.RawMessage(`"invalid_request_error"`)},
+			want:      UpstreamError{Message: "m5", Code: json.RawMessage(`"invalid_request_error"`)},
+		},
+		{
+			name:      "response.failed without an error object falls back to its own fields",
+			eventName: "",
+			frame:     `{"type":"response.failed","code":"rate_limit_exceeded","message":"m6"}`,
+			ok:        true,
+			want:      UpstreamError{Message: "m6", Code: json.RawMessage(`"rate_limit_exceeded"`)},
+		},
+		{
+			name:      "response.error event falls back too",
+			eventName: "response.error",
+			frame:     `{"code":429}`,
+			ok:        true,
+			want:      UpstreamError{Message: failureMessage, Code: json.RawMessage(`429`)},
+		},
+		{
+			name:      "status failed on any event falls back",
+			eventName: "",
+			frame:     `{"type":"response.completed","response":{"status":"FAILED"}}`,
+			ok:        true,
+			want:      UpstreamError{Message: failureMessage},
+		},
+		{
+			name:      "failed event keeps its error object and fills an empty message",
+			eventName: "",
+			frame:     `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}`,
+			ok:        true,
+			want:      UpstreamError{Message: failureMessage, Code: json.RawMessage(`"rate_limit_exceeded"`)},
+		},
+		{
+			name:      "non-string fields of the error object are dropped, the object still counts",
+			eventName: "",
+			frame:     `{"error":{"type":5,"message":"m7","param":{"a":1},"code":"rate_limit_exceeded"}}`,
+			ok:        true,
+			want:      UpstreamError{Message: "m7", Code: json.RawMessage(`"rate_limit_exceeded"`)},
+		},
+		{
+			name:      "a decimal code is written the way H3 writes it",
+			eventName: "",
+			frame:     `{"error":{"code":429.0,"message":"m8"}}`,
+			ok:        true,
+			want:      UpstreamError{Message: "m8", Code: json.RawMessage(`429`)},
 		},
 		{
 			name:      "frame.error as a string",
@@ -99,9 +141,16 @@ func TestUpstreamErrorOrder(t *testing.T) {
 			ok:        false,
 		},
 		{
-			name:      "null response error",
+			name:      "null response error on a failed event uses the H3 fallback message",
 			eventName: "",
 			frame:     `{"type":"response.failed","response":{"status":"failed","error":null}}`,
+			ok:        true,
+			want:      UpstreamError{Message: failureMessage},
+		},
+		{
+			name:      "null response error on a startup event is no error",
+			eventName: "",
+			frame:     `{"type":"response.in_progress","response":{"status":"in_progress","error":null}}`,
 			ok:        false,
 		},
 	}
@@ -246,13 +295,37 @@ func TestCodeText(t *testing.T) {
 	}{
 		{raw: `"rate_limit_exceeded"`, want: "rate_limit_exceeded"},
 		{raw: `429`, want: "429"},
+		{raw: `429.0`, want: "429"},
 		{raw: `null`, want: ""},
 		{raw: ``, want: ""},
-		{raw: `{"nested":true}`, want: `{"nested":true}`},
+		// fmt.Sprint of the decoded value, as H3 renders it before matching.
+		{raw: `{"nested":true}`, want: `map[nested:true]`},
 	}
 	for _, tt := range tests {
 		if got := codeText(json.RawMessage(tt.raw)); got != tt.want {
 			t.Fatalf("codeText(%s) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+// canonical is the byte form H3 answers with: the value decoded and encoded
+// again by encoding/json.
+func TestCanonical(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{raw: `"rate_limit_exceeded"`, want: `"rate_limit_exceeded"`},
+		{raw: `429.0`, want: `429`},
+		{raw: ` 429 `, want: `429`},
+		{raw: `"<b>"`, want: `"<b>"`},
+		{raw: `{"b":1,"a":2}`, want: `{"a":2,"b":1}`},
+		{raw: `null`, want: ``},
+		{raw: ``, want: ``},
+	}
+	for _, tt := range tests {
+		if got := string(canonical(json.RawMessage(tt.raw))); got != tt.want {
+			t.Fatalf("canonical(%s) = %s, want %s", tt.raw, got, tt.want)
 		}
 	}
 }

@@ -74,14 +74,15 @@ type frame struct {
 	Message string          `json:"message"`
 	Param   json.RawMessage `json:"param"`
 	Error   json.RawMessage `json:"error"`
-	// Response keeps the name and shape H3 inspects. Status is parsed so the
-	// frame shape matches design §1.3; the decision never reads it, because
-	// H3's "response.failed implies an error" fallback is not part of §1.3.
+	// Response keeps the name and shape H3 inspects. Status stays raw like
+	// H3's OpenAIResponsesResponse.Status, so a non-string status cannot make
+	// the whole frame unparseable; upstreamError reads it for the failed
+	// fallback (design §1.3).
 	Response *frameResponse `json:"response"`
 }
 
 type frameResponse struct {
-	Status string          `json:"status"`
+	Status json.RawMessage `json:"status"`
 	Error  json.RawMessage `json:"error"`
 }
 
@@ -97,15 +98,16 @@ func Read(body io.Reader) Result {
 	events := 0
 
 	for {
-		line, readErr := reader.ReadString('\n')
-		if len(line) > 0 {
-			if prefix.Len()+event.Len()+len(line) > MaxBytes {
-				return Result{
-					Verdict: VerdictRelease,
-					Prefix:  concat(&prefix, &event, line),
-					Rest:    reader,
-				}
+		raw, overflow, readErr := readLine(reader, MaxBytes-prefix.Len()-event.Len())
+		if overflow {
+			return Result{
+				Verdict: VerdictRelease,
+				Prefix:  concat(&prefix, &event, string(raw)),
+				Rest:    reader,
 			}
+		}
+		line := string(raw)
+		if len(line) > 0 {
 			event.WriteString(line)
 
 			trimmed := strings.TrimSpace(line)
@@ -195,6 +197,24 @@ func isStartupEvent(eventType string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// readLine reads one line, the trailing '\n' included, but stops as soon as it
+// holds more than limit bytes (overflow). Unlike bufio.Reader.ReadString it
+// never buffers an unbounded line, so an upstream that sends a huge line
+// without a newline cannot exhaust memory before MaxBytes is enforced (design
+// §1.3). Every byte it consumed is in line.
+func readLine(r *bufio.Reader, limit int) (line []byte, overflow bool, err error) {
+	for {
+		frag, e := r.ReadSlice('\n')
+		line = append(line, frag...)
+		if len(line) > limit {
+			return line, true, nil
+		}
+		if e != bufio.ErrBufferFull {
+			return line, false, e
+		}
 	}
 }
 

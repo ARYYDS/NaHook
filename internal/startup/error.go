@@ -7,71 +7,75 @@ import (
 	"strings"
 )
 
-// upstreamError extracts the error fields from one frame, in the order
-// responsesStartupFrameError uses (responses_startup_error.go:205,
-// interface 2.1): frame.error → frame.response.error → the frame's own
-// code/message when the event type is "error".
+// failureMessage is what H3 puts into an otherwise empty error of a failed
+// startup event (responses_startup_error.go:232).
+const failureMessage = "Responses startup event reported failure"
+
+// upstreamError extracts the error fields from one frame exactly the way H3
+// responsesStartupFrameError does (responses_startup_error.go:205-245,
+// interface 2.1):
 //
-// The fields are returned as they are: no status mapping, no message rewrite.
+//  1. frame.error → frame.response.error → the frame's own code/message when the
+//     event type is "error" (that last branch carries no Type and no Param,
+//     like H3, so the 429 body stays byte-identical to H3's);
+//  2. when the event is response.failed or response.error, or response.status
+//     is "failed", a frame without an error falls back to its own code/message,
+//     and an empty message becomes failureMessage (H3 :220-232).
+//
+// A JSON null counts as absent. The fields are returned as they are: no status
+// mapping, no message rewrite beyond the H3 fallback.
 func upstreamError(eventType string, f *frame) (UpstreamError, bool) {
+	var e UpstreamError
+	ok := true
 	switch {
 	case hasJSON(f.Error):
-		return parseErrorValue(f.Error)
+		e = errorValue(f.Error)
 	case f.Response != nil && hasJSON(f.Response.Error):
-		return parseErrorValue(f.Response.Error)
+		e = errorValue(f.Response.Error)
 	case strings.EqualFold(eventType, "error"):
-		// The Chat Completions shape: {"type":"error","code":…,"message":…}.
-		// H3 keeps only code and message here; Param is carried too because
-		// UpstreamError echoes it into the 429 body (design §1.4).
-		return UpstreamError{
-			Message: f.Message,
-			Type:    eventType,
-			Param:   stringValue(f.Param),
-			Code:    cloneRaw(f.Code),
-		}, true
+		e = UpstreamError{Message: f.Message, Code: canonical(f.Code)}
+	default:
+		ok = false
 	}
-	return UpstreamError{}, false
+
+	failed := strings.EqualFold(eventType, "response.failed") ||
+		strings.EqualFold(eventType, "response.error") ||
+		(f.Response != nil && strings.EqualFold(stringValue(f.Response.Status), "failed"))
+	if failed {
+		if !ok {
+			e, ok = UpstreamError{Message: f.Message, Code: canonical(f.Code)}, true
+		}
+		if strings.TrimSpace(e.Message) == "" {
+			e.Message = failureMessage
+		}
+	}
+	return e, ok
 }
 
-// parseErrorValue maps one JSON error value the way dto.GetOpenAIError does
-// (NEWAPI/relaykit/dto/openai_response.go:605): an object contributes
-// message/type/param/code, a bare string becomes Type "error", and any other
-// JSON value becomes Type "unknown_error".
-func parseErrorValue(raw json.RawMessage) (UpstreamError, bool) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 {
-		return UpstreamError{}, false
+// errorValue maps one JSON error value the way dto.GetOpenAIError does
+// (NEWAPI/relaykit/dto/openai_response.go:605): an object contributes type,
+// message and param only when they are strings, and code whatever it is; a bare
+// string becomes Type "error"; any other JSON value becomes Type
+// "unknown_error". The caller has already checked that raw is not null.
+func errorValue(raw json.RawMessage) UpstreamError {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return UpstreamError{Message: string(bytes.TrimSpace(raw)), Type: "unknown_error"}
 	}
-
-	switch trimmed[0] {
-	case '{':
-		var obj struct {
-			Message string          `json:"message"`
-			Type    string          `json:"type"`
-			Param   json.RawMessage `json:"param"`
-			Code    json.RawMessage `json:"code"`
+	switch val := v.(type) {
+	case map[string]any:
+		var e UpstreamError
+		e.Type, _ = val["type"].(string)
+		e.Message, _ = val["message"].(string)
+		e.Param, _ = val["param"].(string)
+		if code, present := val["code"]; present && code != nil {
+			e.Code, _ = json.Marshal(code)
 		}
-		if err := json.Unmarshal(trimmed, &obj); err != nil {
-			return UpstreamError{}, false
-		}
-		return UpstreamError{
-			Message: obj.Message,
-			Type:    obj.Type,
-			Param:   stringValue(obj.Param),
-			Code:    cloneRaw(obj.Code),
-		}, true
-	case '"':
-		var s string
-		if err := json.Unmarshal(trimmed, &s); err != nil {
-			return UpstreamError{}, false
-		}
-		return UpstreamError{Message: s, Type: "error"}, true
+		return e
+	case string:
+		return UpstreamError{Message: val, Type: "error"}
 	default:
-		var v any
-		if err := json.Unmarshal(trimmed, &v); err != nil {
-			return UpstreamError{}, false
-		}
-		return UpstreamError{Message: fmt.Sprint(v), Type: "unknown_error"}, true
+		return UpstreamError{Message: fmt.Sprintf("%v", val), Type: "unknown_error"}
 	}
 }
 
@@ -100,22 +104,44 @@ func containsAny(text string, values ...string) bool {
 	return false
 }
 
-// codeText renders a code for matching: a JSON string loses its quotes and
-// escapes, any other JSON value keeps its textual form ("429", "429.5").
+// codeText renders a code the way H3 does before matching:
+// fmt.Sprint(upstreamErr.Code) on the decoded JSON value, so a string keeps its
+// text and 429.0 reads as "429".
 func codeText(raw json.RawMessage) string {
 	if !hasJSON(raw) {
 		return ""
 	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
 		return s
 	}
-	return string(bytes.TrimSpace(raw))
+	return fmt.Sprint(v)
+}
+
+// canonical decodes a JSON value and encodes it again with encoding/json. H3
+// keeps OpenAIError.Code as any and gin encodes it on the way out, so this is
+// the byte form H3 would answer with (429.0 → 429, "<" and "<" both →
+// "<"). It returns nil for null or invalid input.
+func canonical(raw json.RawMessage) json.RawMessage {
+	if !hasJSON(raw) {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // stringValue is the value of a JSON string, or "" for anything else (null, a
-// number, an object). It mirrors GetOpenAIError, which only fills Param from a
-// string field.
+// number, an object).
 func stringValue(raw json.RawMessage) string {
 	if !hasJSON(raw) {
 		return ""
@@ -131,13 +157,4 @@ func stringValue(raw json.RawMessage) string {
 func hasJSON(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
-}
-
-// cloneRaw returns a copy of raw that does not alias the decoder buffer, and
-// nil when there is no value to keep.
-func cloneRaw(raw json.RawMessage) json.RawMessage {
-	if !hasJSON(raw) {
-		return nil
-	}
-	return append(json.RawMessage(nil), bytes.TrimSpace(raw)...)
 }
