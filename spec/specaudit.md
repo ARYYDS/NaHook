@@ -28,7 +28,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q10 | R5 | 观测·`internal/obs` 没有任务、接口和计数器定义 | 未细分 | P1 | 01 | 已关闭：design §6.7、interface 2.7，并入 T5 |
 | Q11 | R5 | 转发·失败路径（读请求体出错、ctx 取消）在 design 和 interface 里不一致 | 不明 | P2 | 01 | 已关闭：`classify` 增加 error 返回值；ctx 已取消时不写响应、计 `client_gone`（design §1.2、§1.6） |
 | Q12 | R5 | 转发·`forward` 没写 Host、URL 和请求体长度的规则 | 未细分 | P2 | 01 | 已关闭：design §6.1 |
-| Q13 | R5 | 排期·T6 漏了对 T5 的依赖；T5 要等 G1，但排在 T7 前面 | 耦合 | P2 | 01 | 已关闭：T6 前置加上 T5；T7 提到 T5 前面 |
+| Q13 | R5 | 排期·T6 漏了对 T5 的依赖；T5 要等 G1，但排在 T7 前面 | 耦合 | P2 | 01 | 已关闭：`obs` 放进 T6，`cmd/nahook` 放进 T5；顺序改为 T7 → T6 → T5，T6 不依赖 T0（§7.9） |
 | Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
 | Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 已关闭：消息末尾是本次 request id 时原样放行（design §1.6、§8；T-F17）；生产上的心跳设置待 K7 |
 
@@ -292,3 +292,5 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 | L-a | P2 | 业务请求的处理函数不读请求体。请求带请求体时，net/http 要等请求体读完才启动检测断开的后台读，而 NewAPI 发出的请求一定带请求体，所以 NewAPI 断开后 `hold`、`slow`、`stall` 仍会等满。原测试只传入已经取消的 ctx，测不到这条路径 | 等待之前先读完请求体；新增 `TestClosedConnectionStopsHold`，用真实 TCP 连接加请求体来测 |
 
 修复提交 `5cc175c`。Win11 门禁：gofmt 无输出；vet 退出码 0；`go test -race ./...` 五个包全部 ok，顶层 80 个 PASS、0 个 FAIL；新测试连跑 3 次稳定；反证：把 `server.go` 换回 `91bf3aa` 的版本，新测试在 5.00s 时失败（"hold:5 kept waiting after the client closed its connection"）；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF。
+
+排期调整：T5 要等 T0，原来的 T6 又依赖 T5，T7 合入后 DSH 就没有能开工的任务了。所以把 `obs` 从 T5 移到 T6，把 `cmd/nahook`（它要调用 `proxy.NewHandler`）从 T6 移到 T5。顺序改为 T7 → T6 → T5 → T8；T6 只依赖 T1、T3（01 tasks §1、T5、T6；`docs/任务书-DSH.md` §6）。
