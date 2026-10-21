@@ -193,6 +193,16 @@ func (s *server) serveBusiness(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read the request body to the end before any wait. net/http starts the
+	// background read that notices a closed client connection only after the
+	// body has been consumed (net/http/server.go: "When the request has a body,
+	// we start the background read only after the entire body has been
+	// consumed"); NewAPI always sends one, so without this r.Context() would
+	// never be cancelled while hold, slow or stall is waiting.
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		return
+	}
+
 	ctx := r.Context()
 	sw := newStreamWriter(w)
 	delay := time.Duration(item.seconds) * time.Second

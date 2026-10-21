@@ -422,6 +422,52 @@ func TestCancelledClientStopsDelays(t *testing.T) {
 	}
 }
 
+// TestClosedConnectionStopsHold uses a real TCP connection and a request body,
+// as NewAPI sends: net/http notices a closed client only after the handler has
+// read the body, so a hold must still end soon after the connection is gone.
+// A cancelled context alone (above) does not exercise that path.
+func TestClosedConnectionStopsHold(t *testing.T) {
+	h := newTestHandler(t)
+	mustSetScript(t, h, "hold:5")
+
+	arrived := make(chan struct{})
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		close(arrived)
+		h.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+pathResponses,
+		strings.NewReader(`{"model":"gpt-6-astra","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	errc := make(chan error, 1)
+	go func() {
+		resp, err := srv.Client().Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		errc <- err
+	}()
+
+	<-arrived
+	cancel() // the client transport closes the connection
+	if err := <-errc; err == nil {
+		t.Fatal("request finished although the client was cancelled during hold:5")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hold:5 kept waiting after the client closed its connection")
+	}
+}
+
 // --- /__mode and /__log ----------------------------------------------------
 
 func TestModeEchoesAcceptedScript(t *testing.T) {
