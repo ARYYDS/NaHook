@@ -9,6 +9,7 @@ package gate
 
 import (
 	"context"
+	"math"
 	"math/rand/v2"
 	"sync/atomic"
 	"time"
@@ -29,24 +30,49 @@ type GateStat struct {
 	BaseMS  int64  `json:"base_ms"`
 }
 
+// maxBase bounds base for the overflow argument of design §6.4.1: Caddy's
+// response_header_timeout (30m) is the longest an attempt can take, and
+// now + 30m<<21 still fits int64 UnixNano. config.Validate bounds
+// gate.base_floor_ms to the same value and gate.streak_cap to 22.
+const maxBase = 30 * time.Minute
+
 // OnRateLimit records one intercepted attempt and pushes the deadline forward.
 //
 // elapsed is how long that attempt took; floor is the configured lower bound
-// (gate.base_floor_ms). streakCap is the configured ceiling for the streak; the
-// shift below cannot overflow because config.Validate keeps it within 1..23
-// (design §6.4.1), so the gate does not impose a ceiling of its own.
+// (gate.base_floor_ms). streakCap is the configured ceiling for the streak,
+// which config.Validate keeps within 1..23. The stored streak never exceeds
+// streakCap, and the window is computed from this call's own base, not from
+// whatever a concurrent writer stored meanwhile (design §1.5).
 func (g *Gate) OnRateLimit(elapsed, floor time.Duration, streakCap int32) {
-	g.base.Store(int64(max(elapsed, floor)))
+	base := min(max(elapsed, floor), maxBase)
+	g.base.Store(int64(base))
 
-	s := min(g.streak.Add(1), streakCap)
+	var s int32
+	for {
+		cur := g.streak.Load()
+		s = min(cur+1, streakCap)
+		if g.streak.CompareAndSwap(cur, s) {
+			break
+		}
+	}
 	if s < 1 {
 		// Only reachable for a caller that skips config.Validate: a
 		// non-positive streak would make the shift negative and panic.
 		s = 1
 	}
 
-	window := time.Duration(g.base.Load()) << (s - 1)
-	deadline := time.Now().Add(window).UnixNano()
+	// Saturate instead of wrapping: config.Validate keeps base<<(s-1) plus the
+	// current UnixNano inside int64 (design §6.4.1), and this guards a caller
+	// that bypasses it.
+	window := time.Duration(math.MaxInt64)
+	if shift := s - 1; base <= time.Duration(math.MaxInt64>>shift) {
+		window = base << shift
+	}
+	now := time.Now().UnixNano()
+	deadline := now + int64(window)
+	if deadline < now {
+		deadline = math.MaxInt64
+	}
 	for cur := g.until.Load(); deadline > cur && !g.until.CompareAndSwap(cur, deadline); cur = g.until.Load() {
 	}
 }

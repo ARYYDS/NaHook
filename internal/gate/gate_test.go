@@ -48,14 +48,70 @@ func TestOnRateLimitWindowDoublesAndCaps(t *testing.T) {
 	const base = 100 * time.Millisecond
 	windows := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 400 * time.Millisecond}
 
-	for _, want := range windows {
+	for i, want := range windows {
 		g.OnRateLimit(base, base, 3)
 
-		// The window is what the cap applies to. The stored streak keeps
-		// counting past the cap because design §1.5 caps only the value used
-		// for the shift (`s := min(streak.Add(1), streakCap)`), so it is not
-		// asserted here.
 		approx(t, "remaining", time.Duration(g.until.Load()-time.Now().UnixNano()), want, 50*time.Millisecond)
+		// The stored streak is capped too, so /v1/stats never shows more
+		// than streak_cap (design §1.5).
+		if got, wantStreak := g.streak.Load(), min(int32(i+1), 3); got != wantStreak {
+			t.Fatalf("after %d interceptions streak = %d, want %d", i+1, got, wantStreak)
+		}
+	}
+}
+
+// The stored streak stays at the cap under concurrent interceptions.
+func TestStreakStaysCappedUnderConcurrency(t *testing.T) {
+	g := &Gate{}
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			for range 500 {
+				g.OnRateLimit(time.Millisecond, time.Millisecond, 3)
+				if s := g.streak.Load(); s < 1 || s > 3 {
+					t.Errorf("streak = %d, want within 1..3", s)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if got := g.streak.Load(); got != 3 {
+		t.Fatalf("streak = %d, want the cap 3", got)
+	}
+}
+
+// base is bounded by maxBase, so an absurd elapsed time with the largest valid
+// streak cap (22, config.Validate) still gives a deadline in the future that is
+// exactly now + maxBase<<21 (design §1.5, §6.4.1).
+func TestOnRateLimitBoundsBase(t *testing.T) {
+	g := &Gate{}
+	const streakCap = 22
+	before := time.Now().UnixNano()
+	for range streakCap {
+		g.OnRateLimit(100*365*24*time.Hour, 0, streakCap)
+	}
+	after := time.Now().UnixNano()
+	if got := time.Duration(g.base.Load()); got != maxBase {
+		t.Fatalf("base = %v, want maxBase %v", got, maxBase)
+	}
+	window := int64(maxBase << (streakCap - 1))
+	if until := g.until.Load(); until < before+window || until > after+window {
+		t.Fatalf("until = %d, want within [%d, %d]", until, before+window, after+window)
+	}
+}
+
+// A caller that bypasses config.Validate with a huge streak cap gets a
+// saturated deadline, never a wrapped-around one in the past.
+func TestOnRateLimitSaturatesInsteadOfWrapping(t *testing.T) {
+	for _, streakCap := range []int32{23, 40, 63, 64, 100} {
+		g := &Gate{}
+		for range streakCap {
+			g.OnRateLimit(maxBase, 0, streakCap)
+		}
+		if until := g.until.Load(); until <= time.Now().UnixNano() {
+			t.Fatalf("streakCap %d: until = %d is not in the future: the deadline wrapped", streakCap, until)
+		}
 	}
 }
 

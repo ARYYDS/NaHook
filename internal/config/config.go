@@ -30,10 +30,16 @@ var (
 	ErrDirSync         = errors.New("config: renamed into place but directory fsync failed")
 )
 
-// maxStreakCap bounds gate.streak_cap so that base << (streak_cap-1) cannot
-// overflow int64 nanoseconds: base is at most Caddy's response_header_timeout
-// (30m = 1.8e12ns) and 1.8e12 << 22 ≈ 7.5e18 < 2^63 (design §6.4.1).
-const maxStreakCap = 23
+// maxStreakCap bounds gate.streak_cap so that the deadline
+// now + base<<(streak_cap-1) cannot overflow int64 UnixNano: base is at most
+// Caddy's response_header_timeout (30m = 1.8e12ns), 1.8e12<<21 ≈ 3.8e18, and
+// UnixNano is ≈ 1.8e18 today, so the sum stays below 2^63 ≈ 9.2e18; with <<22
+// (≈ 7.5e18) the sum would overflow (design §6.4.1).
+const maxStreakCap = 22
+
+// maxBaseFloorMS is the same 30m bound as gate.maxBase: the overflow argument
+// above only holds while base stays within it (design §6.4.1).
+const maxBaseFloorMS = 30 * 60 * 1000
 
 // syncDirFn is the directory fsync step of writeFileAtomic. Tests replace it to
 // exercise the ErrDirSync path, which a real filesystem rarely produces.
@@ -93,8 +99,8 @@ func (c *Config) Validate() error {
 	if c.BodyLimit <= 0 {
 		return fmt.Errorf("%w: body_limit %d must be positive", ErrInvalidConfig, c.BodyLimit)
 	}
-	if c.Gate.BaseFloorMS < 0 {
-		return fmt.Errorf("%w: gate.base_floor_ms %d must not be negative", ErrInvalidConfig, c.Gate.BaseFloorMS)
+	if c.Gate.BaseFloorMS < 0 || c.Gate.BaseFloorMS > maxBaseFloorMS {
+		return fmt.Errorf("%w: gate.base_floor_ms %d must be within 0..%d", ErrInvalidConfig, c.Gate.BaseFloorMS, maxBaseFloorMS)
 	}
 	if c.Gate.StreakCap < 1 || c.Gate.StreakCap > maxStreakCap {
 		return fmt.Errorf("%w: gate.streak_cap %d must be within 1..%d", ErrInvalidConfig, c.Gate.StreakCap, maxStreakCap)
