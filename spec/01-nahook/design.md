@@ -211,17 +211,22 @@ func (s *Store) RetryMax(model string) int
   return c.Retry.Max
 
 func (s *Store) SetRetryMax(scope string, n int) (old int, err error)   # scope = "*" 或模型名
-  if n < 0: return 0, ErrInvalidRetry
+  if n < 0 || scope == "": return 0, ErrInvalidRetry
   s.wmu.Lock(); defer s.wmu.Unlock()        # 只把控制面的写入串行化；数据面只读 atomic，不经过这把锁
-  next := clone(s.p.Load())
-  old = 旧值; 写入 next.Retry.Max 或 next.Retry.PerModel[scope]
+  cur := s.p.Load(); next := clone(cur)     # clone 深拷贝 Match.Paths、Match.Models、Retry.PerModel：已发布的快照绝不就地修改
+  old = 修改前这个 scope 的生效值            # scope=="*" 取 cur.Retry.Max；模型名取 retryMaxFor(cur, scope)
+  写入 next.Retry.Max 或 next.Retry.PerModel[scope]
   if err := next.Validate(); err != nil: return
-  if err := Persist(s.path, next); err != nil: return    # 先落盘，失败就不切换：文件和内存始终一致
-  s.p.Store(next)
-  log.Info("config.retry_max_changed", scope, old, n, uid)
+  err = Persist(s.path, next)
+  if err != nil && !errors.Is(err, ErrDirSync): return 0, err   # rename 之前失败：文件和内存都不变
+  s.p.Store(next)                           # rename 已经完成：磁盘上已是新内容，内存必须跟上
+  return old, err                           # err 为 ErrDirSync 时表示"已生效，但目录 fsync 失败，掉电后不保证持久"
+  # Store 不打日志：uid 是控制口请求才有的信息，日志由 control 打（§6.4）
 
-func (s *Store) UnsetRetryMax(model string) error         # 删除模型级配置，回到全局值；流程同上
-func (s *Store) Reload() error                            # 由 SIGHUP 和 POST /v1/reload 触发：Load → Validate → Store；失败就保留旧快照
+func (s *Store) UnsetRetryMax(model string) error         # 删除模型级配置，回到全局值。没有该模型的配置时返回 ErrRetryNotSet，不写盘；落盘的规则同上
+func (s *Store) Reload() error                            # 由 SIGHUP 和 POST /v1/reload 触发：持 wmu，Load → Validate → 检查只能重启才生效的字段 → Store
+  # listen、control_socket、newapi 只在启动时生效（§6.1 的 Transport 在构造时就固定了）。
+  # 这三项和当前快照不一样时，返回 ErrRestartRequired，快照不变
 ```
 
 ### 1.8 放行与透传 `proxy.release` / `proxy.passthrough` / `proxy.copyFlush`
@@ -469,9 +474,38 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 
 - 启动时先删掉残留的 socket 文件，再 `net.Listen("unix")`，然后 `os.Chmod(path, 0600)`。
 - 错误码：
-  - 400：`n < 0` 或 JSON 不合法；
-  - 404：`DELETE` 的模型本来就没有模型级配置；
-  - 500：写配置文件失败（这时内存里的配置不变）。
+  - 400：`ErrInvalidRetry`、`ErrInvalidConfig`，或者请求 JSON 不合法；
+  - 404：`ErrRetryNotSet`，也就是 `DELETE` 的模型本来就没有模型级配置；
+  - 409：`ErrRestartRequired`，也就是 reload 改了 `listen`、`control_socket` 或 `newapi`（这时快照不变）；
+  - 500：其他写盘错误（这时文件和内存都不变）。
+- `ErrDirSync` 回 200，响应体里加 `"warning":"applied; directory fsync failed, not durable across power loss"`。这时修改已经生效。
+- 日志：`PUT`、`DELETE`、`reload` 成功后，由 control 打 `config.retry_max_changed` 或 `config.reloaded`，字段包括 `scope`、`old`、`new`、`uid`。
+  - `uid` 在 Linux 上通过 SO_PEERCRED 取（`syscall.GetsockoptUcred`，放在只在 linux 下编译的文件里）；其他平台记成 `-`。
+
+### 6.4.1 `internal/config` 的校验和读写规则
+
+`Load`：
+
+- 用 `json.Decoder` 并调用 `DisallowUnknownFields`。不认识的键直接报错，防止键名写错后被静默当成 0。
+- 一个完整的 JSON 对象之后如果还有别的内容，也报错。
+
+`Persist`：
+
+- 落盘时把空的 `per_model` 写成 `{}`，空的 `paths`、`models` 写成 `[]`，和 §5 的样例一致。
+- 目录 fsync 失败时返回包装了 `ErrDirSync` 的错误。这时 rename 已经完成。
+
+`(*Config).Validate`：
+
+| 字段 | 规则 | 理由 |
+|---|---|---|
+| `listen` | 非空 | 数据面要监听 |
+| `control_socket` | 非空 | 控制面要监听 |
+| `newapi` | 绝对的 http 或 https URL | `forward` 要拼请求地址 |
+| `body_limit` | > 0 | `classify` 最多读 `body_limit+1` 字节 |
+| `gate.base_floor_ms` | ≥ 0 | 0 表示不设下限 |
+| `gate.streak_cap` | 1–23 | 窗口是 `base << (s-1)`，s 至少为 1。base 最大约为 Caddy 的 `response_header_timeout` 30m（1.8e12 ns），1.8e12 × 2²² ≈ 7.5e18，还在 int64 范围内，2²³ 就溢出了 |
+| `retry.max` | ≥ 0 | 0 表示不重试，直接返回代 429 |
+| `retry.per_model` | 值 ≥ 0；键不能为空，也不能是 `*`（`*` 留给全局） | 和 `SetRetryMax` 的 scope 规则一致 |
 
 ### 6.5 `cmd/nahookctl`
 

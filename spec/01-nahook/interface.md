@@ -77,11 +77,12 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 |---|---|---|---|
 | `Store` | `type Store struct{ p atomic.Pointer[Config]; wmu sync.Mutex; path string }` | `NEWAPI/model/request_policy.go:36` `var requestPolicySnapshot atomic.Pointer[RequestPolicySnapshot]` | 同样是"原子指针快照"的做法：读的一方不加锁 |
 | `(*Store).Current` | `func (s *Store) Current() *Config` | `NEWAPI/model/request_policy.go:78` `func CurrentRequestPolicy() *RequestPolicySnapshot` | — |
-| `(*Store).Reload` | `func (s *Store) Reload() error` | `NEWAPI/model/request_policy.go:205` `func refreshRequestPolicySnapshot() error`（先构建、校验成功才 Store） | 失败时保留旧快照 |
+| `(*Store).Reload` | `func (s *Store) Reload() error` | `NEWAPI/model/request_policy.go:205` `func refreshRequestPolicySnapshot() error`（先构建、校验成功才 Store） | 失败时保留旧快照；`listen`、`control_socket`、`newapi` 有变化时返回 `ErrRestartRequired`（design §1.7） |
 | `(*Store).RetryMax` | `func (s *Store) RetryMax(model string) int` | — | design §1.7 |
-| `(*Store).SetRetryMax` | `func (s *Store) SetRetryMax(scope string, n int) (old int, err error)` | — | 顺序：校验 → 写盘 → 切换快照 |
+| `(*Store).SetRetryMax` | `func (s *Store) SetRetryMax(scope string, n int) (old int, err error)` | — | 顺序：校验 → 写盘 → 切换快照；`old` 是修改前这个 scope 的生效值；返回 `ErrDirSync` 时修改已经生效 |
 | `(*Store).UnsetRetryMax` | `func (s *Store) UnsetRetryMax(model string) error` | — | — |
-| `Load` / `Validate` / `Persist` | `Load(path) (*Config, error)`；`(*Config) Validate() error`；`Persist(path string, c *Config) error` | — | `Persist`：同目录临时文件 → fsync 文件 → rename → fsync 目录 |
+| `Load` / `Validate` / `Persist` | `Load(path) (*Config, error)`；`(*Config) Validate() error`；`Persist(path string, c *Config) error` | — | `Load` 拒绝不认识的键和多余的内容；`Validate` 的规则见 design §6.4.1；`Persist`：同目录临时文件 → fsync 文件 → rename → fsync 目录（这一步失败返回 `ErrDirSync`） |
+| 哨兵错误 | `ErrInvalidConfig`、`ErrInvalidRetry`、`ErrRetryNotSet`、`ErrRestartRequired`、`ErrDirSync` | — | 和控制口状态码的对应关系见 design §6.4 |
 
 ### 2.5 `internal/proxy`
 
@@ -113,7 +114,7 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 | `serveIntercept` | `body` 是完整缓存下来的请求体 | 在 `release` 或 `proxy429.Write` 之前 `w` 没有被写过；每次尝试只发一次上游请求；`n ≤ RetryMax` | ctx 被取消 → 不写响应，直接返回；连不上 NewAPI → 502 |
 | `(*Gate).Wait` | — | 等待时长 < `until - now`；只用自己的计时器 | ctx 被取消 → 返回 `ctx.Err()` |
 | `(*Gate).OnRateLimit` | `elapsed ≥ 0` | `until` 只增不减；`streak ≤ streakCap` | — |
-| `(*Store).SetRetryMax` | `n ≥ 0` | 文件内容和内存快照一致；数据面读不到中间状态 | 校验失败或写盘失败 → 快照不变，返回错误 |
+| `(*Store).SetRetryMax` | `n ≥ 0`，scope 不为空 | 文件内容和内存快照一致；数据面读不到中间状态 | 校验失败，或 rename 之前写盘失败 → 快照不变，返回错误；rename 之后目录 fsync 失败 → 快照切换，返回 `ErrDirSync` |
 | `proxy429.Write` | `w` 没被写过 | 状态码 429；`Content-Type` 和响应体格式与 NewAPI 一致 | — |
 | `control.Serve` | 由 systemd 创建好 `RuntimeDirectory` | socket 权限 0600 | Listen 失败 → 进程退出，systemd 自动重启 |
 

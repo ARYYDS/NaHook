@@ -148,3 +148,26 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 - 2026-10-20：在对话里展示了 v1 架构，用户确认了三项：上限初始 3、测试环境用甲、按推荐的时机上线。之后开始写本 SPEC。
 - 写之前读过本专题目录里的 `architecture.md`、`hook-without-fork.md`、`compare-h3-vs-official.md`、`4-4-tpm-retry.md`、`429-vs-quota.md`，以及 `自动调度/` 全部文件。
 - 行号核对基准：`NEWAPI` 是 `206e0fa5c`，`H3` 是 `38e69e300`。
+
+### 7.4 T1 审计（提交 `79b71fe`，由架构侧直接审计、直接修复）
+
+DSH 报上来的拍板项，架构侧的裁决：
+
+| 拍板项 | 裁决 | 回写位置 |
+|---|---|---|
+| 门禁 ④ 在 T1–T5 没法执行 | 还没有 `cmd/` 时用 `go build -trimpath ./...` 交叉编译；从 T6 起必须用 `./cmd/...` | 01 audit §3 |
+| Validate 的规则清单 | 采纳 DSH 的 7 条，再加 `streak_cap ≤ 23`，以及 `per_model` 的键不能为空、不能是 `*` | 01 design §6.4.1 |
+| `SetRetryMax` 返回的 `old` | 修改前这个 scope 的生效值 | 01 design §1.7；interface 2.4 |
+| `config.retry_max_changed` 日志放在哪 | 由 control 打，uid 用 SO_PEERCRED 取；Store 不打日志 | 01 design §1.7、§6.4 |
+| 任务书 §1.4 第 7 项和 §4 第 1 步的先后顺序 | 改写措辞；每个任务开工前把 `origin/main` 合进 `dev` | 任务书 §1.4、§4；开工提示词第 2 段 |
+
+审计发现的问题，都在 `audit/T1` 分支上修复：
+
+| 编号 | 级别 | 问题 | 依据 | 修复 |
+|---|---|---|---|---|
+| F1 | P1 | `Load` 会静默忽略不认识的键，键名写错时上限会悄悄变成 0 | 社区同类问题：go-health-checker#3、sigillum#42；Go 文档里 `Decoder.DisallowUnknownFields` 的说明 | `DisallowUnknownFields`，并拒绝对象后面多余的内容 |
+| F2 | P1 | rename 之后目录 fsync 失败时，磁盘已经是新内容，但内存快照没有切换 | cplieger/atomicfile 的 PhaseDirSync 说明 | 新增 `ErrDirSync`；rename 已完成就切换快照，同时把这个错误返回给调用方 |
+| F3 | P2 | 空的 scope 会写进 `per_model`；`*` 当键和全局写法冲突 | — | `SetRetryMax` 拒绝空 scope；`Validate` 拒绝空键和 `*` 键 |
+| F4 | P2 | `streak_cap` 没有上限，T3 的左移会溢出 | design §6.4.1 的推导 | 加上 `≤ 23` 的校验 |
+| F5 | P2 | `Reload` 能改只在启动时生效的三个字段，改了也不起作用 | design §6.1 | 新增 `ErrRestartRequired`，快照不变 |
+| F6 | P3 | 空集合落盘成 `null`，和 SPEC 样例不一致 | design §5 | `Persist` 统一写成 `{}` 和 `[]` |

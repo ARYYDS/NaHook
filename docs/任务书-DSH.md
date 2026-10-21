@@ -67,7 +67,7 @@ Set-Location O:\NaHook; $env:PATH = 'O:\WinCache\tools\go\bin;O:\WinCache\tools\
 | `gcc --version` | 第一行能看到版本号 |
 | `git -C O:\NaHook remote -v` | `https://github.com/ARYYDS/NaHook.git` |
 | `gh auth status` | 显示已登录 `ARYYDS`，没有 `token ... is invalid` |
-| `git -C O:\NaHook status -sb` | 当前在 `dev` 分支，工作区干净 |
+| `git -C O:\NaHook status -sb` | 当前在 `dev` 分支，工作区干净。第一次开工时这里还是 `main`：先按 §4 第 1 步建好 `dev`，再复查这一项 |
 
 有任何一项不符合，就停下来报告，不要自己去改系统环境。
 
@@ -101,6 +101,7 @@ Set-Location O:\NaHook; $env:PATH = 'O:\WinCache\tools\go\bin;O:\WinCache\tools\
 ## 4. 工作循环（每个任务都一样）
 
 1. `git -C O:\NaHook fetch origin`，然后 `git switch dev` 并 `git pull --ff-only origin dev`。第一次开工时 `dev` 还不存在，从 `origin/main` 新建：`git switch -c dev origin/main`。
+   之后每个任务开工前，再执行 `git merge --no-edit origin/main`，把架构侧在 `main` 上的 SPEC 更新和审计修复合进 `dev`。你不改 `spec/` 和 `docs/`，所以这一步不会冲突；如果真的冲突了，停下来报告。
 2. 只做当前这一个任务（Tn），不提前做后面的任务。
 3. 写代码和单测。表驱动；断言用标准库 `testing`，不引入 testify，原因是不允许第三方依赖。
 4. 按 `spec/01-nahook/audit.md` §3 的顺序，**原样**执行门禁命令。全部通过才能提交。

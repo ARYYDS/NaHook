@@ -68,6 +68,14 @@ $env:CGO_ENABLED = '1'; go test -race -count=1 ./...
 $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -trimpath -o "O:\WinCache\nahook\dist\$(git rev-parse --short=8 HEAD)\" ./cmd/...; Remove-Item Env:GOOS, Env:GOARCH
 ```
 
+这一条的适用范围：仓库里还没有 `cmd/` 时（T1–T5），改成执行下面这条，用同样的环境变量交叉编译全部库包，不产出二进制：
+
+```powershell
+$env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -trimpath ./...; Remove-Item Env:GOOS, Env:GOARCH
+```
+
+从 T6（开始有 `cmd/`）起，必须执行 `./cmd/...` 那一条。
+
 另外两条要求：
 
 - 不引入任何第三方模块：`go.mod` 里不能出现 `require`。
