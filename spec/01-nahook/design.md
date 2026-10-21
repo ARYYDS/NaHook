@@ -154,14 +154,22 @@ func IsRateLimit(e UpstreamError) bool
 ### 1.4 代 429 `proxy429.Write`
 
 ```text
-func Write(w http.ResponseWriter, requestID string, e startup.UpstreamError)
-  w.Header().Set("Content-Type", "application/json; charset=utf-8")     # NEWAPI controller/relay.go:105
-  if requestID != "": w.Header().Set("X-Oneapi-Request-Id", requestID)  # NEWAPI middleware/request-id.go:16
-  w.WriteHeader(429)
+func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError)
+  # upstream 是 NewAPI 最后一次尝试的响应头。h3 的 429 和这次尝试出自同一个 NewAPI 请求，
+  # 中间件加的头它都有，所以按白名单把这些头抄过来：
+  #   X-Oneapi-Request-Id（NEWAPI middleware/request-id.go:16）
+  #   X-New-Api-Version（NEWAPI middleware/cors.go:20，main.go:198 全局挂载）
+  #   Vary，以及所有 Access-Control-* 头（NEWAPI router/relay-router.go:16 挂的 CORS；
+  #     少了它们，浏览器端客户端会因为跨域校验失败而读不到 429 的内容）
+  # 其他头一律不抄：SSE 专用的 Cache-Control、X-Accel-Buffering、逐跳头、Content-*、Date，
+  # 以及 NewAPI 从上游转发过来的头——h3 在这条错误路径上都不会带这些
   body := json.Marshal(envelope{Error: openAIError{
-            Message: e.Message, Type: e.Type, Param: e.Param, Code: e.Code /* 原样保留上游的 JSON 值 */ }})
+            Message: e.Message, Type: e.Type, Param: e.Param, Code: e.Code /* startup 已做过 canonical 处理 */ }})
+  if 序列化失败: 把 Code 换成 nil 再序列化一次      # 生产上走不到；先序列化再提交状态码，保证响应体一定是合法 JSON
   # 字段顺序 message, type, param, code，和 NEWAPI relaykit/types/error.go:13-19 一致
   # 用 json.Marshal（会转义 HTML、不加换行），和 gin 的 c.JSON 一致
+  复制白名单里的头; w.Header().Set("Content-Type", "application/json; charset=utf-8")   # NEWAPI controller/relay.go:105
+  w.WriteHeader(429)
   w.Write(body)
 ```
 
@@ -222,7 +230,7 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
     g.OnRateLimit(now - t0, cfg.Gate.BaseFloor, cfg.Gate.StreakCap)
     max := h.store.RetryMax(meta.Model)
     if n >= max:
-        proxy429.Write(w, resp.Header.Get("X-Oneapi-Request-Id"), res.Err); return
+        proxy429.Write(w, resp.Header, res.Err); return
     n++
     if g.Wait(r.Context()) != nil: return                # 客户端已断开
   }

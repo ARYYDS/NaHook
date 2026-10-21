@@ -74,7 +74,8 @@ L-DOC                                                                           
   - 改动：`internal/proxy429.Write`
   - 依据：design §1.4；interface 2.2 ｜ audit T-F1
   - 完成判据：
-    - [ ] 黄金样例：`code` 分别是字符串和数字，`param` 分别是 null 和字符串；字段顺序正确，末尾没有换行，HTML 字符按 encoding/json 默认规则转义
+    - [ ] 黄金样例：`code` 分别是字符串、数字和 null；`param` 分别是空串和字符串（两边的类型都是 string，线上不会出现 null）；字段顺序正确，末尾没有换行，HTML 字符按 encoding/json 默认规则转义
+    - [ ] 响应头只按白名单从上一次尝试复制（design §1.4），SSE 专用的头不会被带过来
   - 冲突：无
 
 - [ ] **T5 proxy 包（分类、转发、放行、透传、拦截主循环）**（L-GO）

@@ -60,9 +60,9 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 
 | nahook 接口 | 签名 | 对照的现有函数 | 说明 |
 |---|---|---|---|
-| `Write` | `func Write(w http.ResponseWriter, requestID string, e startup.UpstreamError)` | `NEWAPI/controller/relay.go:93` 起的 defer 块（`:105` 设置 `Content-Type`，`:116` 执行 `c.JSON`）；`NEWAPI/relaykit/types/error.go:184` `func (e *NewAPIError) ToOpenAIError(upstreamURLs ...string) OpenAIError` | 对上游的 OpenAI 错误，ToOpenAIError 直接返回原对象，message 不带 request id（`:178` 的 `SetMessage` 只改 `Err`） |
+| `Write` | `func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError)` | `NEWAPI/controller/relay.go:93` 起的 defer 块（`:105` 设置 `Content-Type`，`:116` 执行 `c.JSON`）；`NEWAPI/relaykit/types/error.go:184` `func (e *NewAPIError) ToOpenAIError(upstreamURLs ...string) OpenAIError` | 对上游的 OpenAI 错误，ToOpenAIError 直接返回原对象，message 不带 request id（`:178` 的 `SetMessage` 只改 `Err`） |
 | 响应体结构 | `struct{ Error openAIError "json:\"error\"" }` | `NEWAPI/relaykit/types/error.go:13-19` `type OpenAIError struct{ Message, Type, Param string; Code any; Metadata json.RawMessage }` | 字段顺序一致；`metadata` 本来就带 omitempty，nahook 不输出它 |
-| 请求 ID | 响应头 `X-Oneapi-Request-Id` | `NEWAPI/middleware/request-id.go:10` `func RequestId() func(c *gin.Context)`（在 `:16` 设置这个响应头） | 从 NewAPI 最后一次尝试的响应头里复制 |
+| 响应头 | 白名单：`X-Oneapi-Request-Id`、`X-New-Api-Version`、`Vary`、`Access-Control-*` | `NEWAPI/middleware/request-id.go:16`；`NEWAPI/middleware/cors.go:20`（`main.go:198` 全局挂载）；`NEWAPI/router/relay-router.go:16`（CORS） | 从 NewAPI 最后一次尝试的响应头里复制；其他头不复制（design §1.4） |
 
 ### 2.3 `internal/gate`
 
