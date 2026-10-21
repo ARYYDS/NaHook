@@ -186,7 +186,8 @@ func (g *Gate) OnRateLimit(elapsed, floor time.Duration, streakCap int32)
   s := 用 CAS 把 g.streak 加 1，但不超过 streakCap  # 存下来的计数也封顶：/v1/stats 看到的 streak ≤ streak_cap，
                                                  # 也不会因为一直累加而溢出 int32
   if s < 1: s = 1                                # 只有绕过 config.Validate（streakCap < 1）才会走到，防止 << 负数
-  t := now + base << (s-1)                       # 窗口 1×、2×、4× base；base ≤ 30m 且 s ≤ 23 时不会溢出
+  t := now + base << (s-1)                       # 窗口 1×、2×、4× base；base ≤ 30m 且 s ≤ 22 时不会溢出（§6.4.1）
+                                                 # 实现里窗口和截止时间都做饱和处理：万一溢出，取 math.MaxInt64，不会翻成负数
   for cur := g.until.Load(); t > cur && !g.until.CompareAndSwap(cur, t); cur = g.until.Load() {}
 
 func (g *Gate) OnReleased()
@@ -530,7 +531,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `newapi` | 绝对的 http 或 https URL | `forward` 要拼请求地址 |
 | `body_limit` | > 0 | `classify` 最多读 `body_limit+1` 字节 |
 | `gate.base_floor_ms` | 0–1800000 | 0 表示不设下限；上限 30 分钟和 `gate.maxBase` 相同，是下一行溢出推导的前提 |
-| `gate.streak_cap` | 1–23 | 窗口是 `base << (s-1)`，s 至少为 1。base 最大约为 Caddy 的 `response_header_timeout` 30m（1.8e12 ns），1.8e12 × 2²² ≈ 7.5e18，还在 int64 范围内，2²³ 就溢出了 |
+| `gate.streak_cap` | 1–22 | 截止时间是 `now + base << (s-1)`（UnixNano），s 至少为 1。base 最大是 30m（1.8e12 ns），1.8e12 × 2²¹ ≈ 3.8e18；当前 UnixNano 约 1.8e18，两者相加约 5.6e18，小于 2⁶³ ≈ 9.2e18。换成 2²²（≈ 7.5e18）的话，相加后就溢出了 |
 | `retry.max` | ≥ 0 | 0 表示不重试，直接返回代 429 |
 | `retry.per_model` | 值 ≥ 0；键不能为空，也不能是 `*`（`*` 留给全局） | 和 `SetRetryMax` 的 scope 规则一致 |
 
