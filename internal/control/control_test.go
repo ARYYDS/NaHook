@@ -62,8 +62,15 @@ func shortSocket(t *testing.T) string {
 	return filepath.Join(dir, "s")
 }
 
-// startControl runs Serve in the background and returns the socket path.
+// startControl runs Serve in the background with a logger that discards its
+// output and returns the socket path.
 func startControl(t *testing.T, store *config.Store) (string, *gate.Registry, *obs.Stats) {
+	t.Helper()
+	return startControlLogged(t, store, obs.NewLogger(io.Discard))
+}
+
+// startControlLogged is startControl with the logger Serve writes to.
+func startControlLogged(t *testing.T, store *config.Store, log *slog.Logger) (string, *gate.Registry, *obs.Stats) {
 	t.Helper()
 	socket := shortSocket(t)
 	gates := gate.NewRegistry()
@@ -71,7 +78,7 @@ func startControl(t *testing.T, store *config.Store) (string, *gate.Registry, *o
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
-	go func() { errc <- Serve(ctx, socket, store, gates, stats) }()
+	go func() { errc <- Serve(ctx, socket, store, gates, stats, log) }()
 
 	t.Cleanup(func() {
 		cancel()
@@ -135,15 +142,6 @@ func request(t *testing.T, client *http.Client, method, path, body string) (int,
 		t.Fatalf("read body: %v", err)
 	}
 	return resp.StatusCode, string(b)
-}
-
-func captureLogs(t *testing.T) *bytes.Buffer {
-	t.Helper()
-	buf := new(bytes.Buffer)
-	previous := slog.Default()
-	slog.SetDefault(obs.NewLogger(buf))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-	return buf
 }
 
 func newRecorder() *httptest.ResponseRecorder {
@@ -462,9 +460,9 @@ func TestErrorMapping(t *testing.T) {
 }
 
 func TestLogLines(t *testing.T) {
-	logs := captureLogs(t)
+	logs := new(bytes.Buffer)
 	store, _ := newStore(t)
-	socket, _, _ := startControl(t, store)
+	socket, _, _ := startControlLogged(t, store, obs.NewLogger(logs))
 	client := newClient(socket)
 
 	wantUID := "-"
@@ -512,9 +510,9 @@ func TestLogLines(t *testing.T) {
 }
 
 func TestReloadFailureIsLogged(t *testing.T) {
-	logs := captureLogs(t)
+	logs := new(bytes.Buffer)
 	store, path := newStore(t)
-	socket, _, _ := startControl(t, store)
+	socket, _, _ := startControlLogged(t, store, obs.NewLogger(logs))
 	client := newClient(socket)
 
 	if err := os.Remove(path); err != nil {
@@ -538,7 +536,9 @@ func TestStaleSocketFileIsReplaced(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
-	go func() { errc <- Serve(ctx, socket, store, gate.NewRegistry(), obs.NewStats()) }()
+	go func() {
+		errc <- Serve(ctx, socket, store, gate.NewRegistry(), obs.NewStats(), obs.NewLogger(io.Discard))
+	}()
 	t.Cleanup(func() {
 		cancel()
 		<-errc

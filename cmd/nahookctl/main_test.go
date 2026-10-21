@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -38,11 +37,6 @@ func testConfig() *config.Config {
 func startControl(t *testing.T) string {
 	t.Helper()
 
-	// The control plane logs through slog.Default; keep the test output clean.
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-
 	dir, err := os.MkdirTemp("", "nctl")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
@@ -59,7 +53,9 @@ func startControl(t *testing.T) string {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
-	go func() { errc <- control.Serve(ctx, socket, store, gate.NewRegistry(), obs.NewStats()) }()
+	go func() {
+		errc <- control.Serve(ctx, socket, store, gate.NewRegistry(), obs.NewStats(), obs.NewLogger(io.Discard))
+	}()
 	t.Cleanup(func() {
 		cancel()
 		select {

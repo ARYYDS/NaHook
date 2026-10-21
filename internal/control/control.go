@@ -1,8 +1,8 @@
 // Package control serves the control socket (design §5, §6.4, interface 2.6).
 //
-// Serve keeps the signature interface 2.6 fixes: no logger is passed in. The
-// log lines of design §6.4 are written through slog.Default, which cmd/nahook
-// installs with obs.NewLogger(os.Stdout).
+// Serve writes the log lines of design §6.4 to the logger it is given;
+// cmd/nahook passes the same obs.NewLogger(os.Stdout) logger it hands to
+// proxy.NewHandler, so no package depends on slog.Default.
 package control
 
 import (
@@ -33,8 +33,9 @@ const (
 )
 
 // Serve listens on the control socket and answers until ctx is done. It removes
-// a stale socket file first, then chmods the new one to 0600.
-func Serve(ctx context.Context, socket string, store *config.Store, gates *gate.Registry, stats *obs.Stats) error {
+// a stale socket file first, then chmods the new one to 0600. log must not be
+// nil.
+func Serve(ctx context.Context, socket string, store *config.Store, gates *gate.Registry, stats *obs.Stats, log *slog.Logger) error {
 	if err := os.Remove(socket); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("control: remove stale socket %s: %w", socket, err)
 	}
@@ -48,7 +49,7 @@ func Serve(ctx context.Context, socket string, store *config.Store, gates *gate.
 		return fmt.Errorf("control: chmod %s: %w", socket, err)
 	}
 
-	h := &handler{store: store, gates: gates, stats: stats}
+	h := &handler{store: store, gates: gates, stats: stats, log: log}
 	srv := &http.Server{
 		Handler: h.mux(),
 		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
@@ -78,6 +79,7 @@ type handler struct {
 	store *config.Store
 	gates *gate.Registry
 	stats *obs.Stats
+	log   *slog.Logger
 }
 
 func (h *handler) mux() http.Handler {
@@ -163,11 +165,11 @@ func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {
 // POST /v1/reload → {"ok":true}; failures keep the old snapshot (design §6.4).
 func (h *handler) reload(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.Reload(); err != nil {
-		slog.Default().Error("config.reload_failed", "error", err.Error())
+		h.log.Error("config.reload_failed", "error", err.Error())
 		writeStoreError(w, err)
 		return
 	}
-	slog.Default().Info("config.reloaded", "uid", uidFrom(r.Context()))
+	h.log.Info("config.reloaded", "uid", uidFrom(r.Context()))
 	writeJSON(w, http.StatusOK, struct {
 		OK bool `json:"ok"`
 	}{OK: true})
@@ -179,7 +181,7 @@ func (h *handler) logRetryChange(ctx context.Context, scope string, old, newValu
 	if err != nil && !errors.Is(err, config.ErrDirSync) {
 		return
 	}
-	slog.Default().Info("config.retry_max_changed",
+	h.log.Info("config.retry_max_changed",
 		"scope", scope, "old", old, "new", newValue, "uid", uidFrom(ctx))
 }
 
