@@ -83,8 +83,10 @@ func Read(body io.Reader) Result
   reader := bufio.NewReader(body); prefix, event := bytes.Buffer{}
   eventName := ""; dataLines := nil; events := 0
   loop:
-    line, readErr := reader.ReadString('\n')
-    if prefix.Len()+event.Len()+len(line) > MaxBytes:
+    line, overflow, readErr := readLine(reader, MaxBytes - prefix.Len() - event.Len())
+        # readLine 用 ReadSlice 逐块拼一行，一旦超过给定上限就立即返回，
+        # 防止上游发一个超长、又没有换行的行时把内存吃光（h3 的 ReadString 没有这个上限）
+    if overflow:
         return release(prefix+event+line, reader)          # 超限：原样放行（h3 在这里回 502）
     event.Write(line)
     switch trim(line):
@@ -103,24 +105,44 @@ func Read(body io.Reader) Result
           decisionRateLimit → return Result{VerdictRateLimit, prefix, reader, e}
       event.Reset(); dataLines = nil; eventName = ""
     if readErr != nil:
-      return Result{VerdictRelease, prefix, reader}         # EOF 或读错：原样放行，由调用方写出已读的部分
+      return Result{VerdictRelease, prefix+event, reader}   # EOF 或读错：原样放行；没收尾的最后一个事件也并进 Prefix，
+                                                            # 保证 Prefix+Rest == 原始字节
 
 func inspect(eventName, data string) (decision, UpstreamError)
   if data == "": return decisionContinue                    # 纯注释事件
-  var f struct { Type string; Code json.RawMessage; Message string; Param any
-                 Error json.RawMessage; Response *struct{ Status string; Error json.RawMessage } }
+  var f struct { Type string; Code json.RawMessage; Message string; Param json.RawMessage
+                 Error json.RawMessage; Response *struct{ Status json.RawMessage; Error json.RawMessage } }
   if json.Unmarshal(data, &f) != nil: return decisionRelease # 例如 "[DONE]"：放行（h3 在这里回 502）
   typ := f.Type; if typ == "" { typ = eventName }
-  e, ok := upstreamError(typ, &f)    # 和 h3 responsesStartupFrameError 取错误的顺序一样：
-                                     #   f.Error（对象或字符串）→ f.Response.Error → typ=="error" 时用顶层 code/message
+  e, ok := upstreamError(typ, &f)
   if ok:
       if IsRateLimit(e): return decisionRateLimit, e
       return decisionRelease                               # 其他错误：原样放行
   if typ ∈ {"response.created", "response.in_progress", "response.queued"}: return decisionContinue
   return decisionRelease                                   # 第一个非启动事件（Chat 的首个 chunk 没有 type，也走这里）
 
+func upstreamError(typ string, f *frame) (UpstreamError, bool)   # 逐行对照 H3 responses_startup_error.go:205-245
+  JSON null 一律当作字段不存在
+  switch:
+    f.Error 有值          → e = errorValue(f.Error)
+    f.Response.Error 有值 → e = errorValue(f.Response.Error)
+    typ == "error"        → e = {Message: f.Message, Code: canonical(f.Code)}   # 和 h3 一样，只取 code 和 message，Type、Param 留空
+  failed := typ ∈ {"response.failed", "response.error"} || stringValue(f.Response.Status) == "failed"   # 不区分大小写；H3 :220-227
+  if failed:
+      if 上面没取到错误: e = {Message: f.Message, Code: canonical(f.Code)}
+      if trim(e.Message) == "": e.Message = "Responses startup event reported failure"   # H3 :232
+  return e, 取到了错误 || failed
+
+func errorValue(raw) UpstreamError                          # 等同 NEWAPI relaykit/dto/openai_response.go:605 GetOpenAIError
+  对象   → 按 map[string]any 解：type、message、param 只在值是字符串时才取；code 取原值，经 canonical 处理
+  字符串 → {Message: 该字符串, Type: "error"}
+  其他   → {Message: fmt.Sprint(值), Type: "unknown_error"}
+
+func canonical(raw) json.RawMessage                         # 先解成 any，再用 encoding/json 编回去：
+                                                            # 和 h3 输出 OpenAIError.Code（类型是 any）时得到的字节完全一样，例如 429.0 → 429
+
 func IsRateLimit(e UpstreamError) bool
-  code := lower(trim(unquote(e.Code)))
+  code := lower(trim(codeText(e.Code)))                    # codeText：字符串取原值，其他值用 fmt.Sprint(解出来的 any)，和 h3 的 fmt.Sprint 一致
   text := replace(code + " " + lower(e.Type), "-"→"_", " "→"_", ":"→"_")
   return code == "429" ||
          containsAny(text, "rate_limit_exceeded", "rate_limit_error", "ratelimitreached",

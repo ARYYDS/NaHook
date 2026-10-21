@@ -171,3 +171,28 @@ DSH 报上来的拍板项，架构侧的裁决：
 | F4 | P2 | `streak_cap` 没有上限，T3 的左移会溢出 | design §6.4.1 的推导 | 加上 `≤ 23` 的校验 |
 | F5 | P2 | `Reload` 能改只在启动时生效的三个字段，改了也不起作用 | design §6.1 | 新增 `ErrRestartRequired`，快照不变 |
 | F6 | P3 | 空集合落盘成 `null`，和 SPEC 样例不一致 | design §5 | `Persist` 统一写成 `{}` 和 `[]` |
+
+### 7.5 T2 审计（提交 `33f5527`，由架构侧直接审计、直接修复）
+
+DSH 交付回报里自己做的决定和提出的风险，架构侧的裁决：
+
+| 事项 | 裁决 | 回写位置 |
+|---|---|---|
+| 读错误时把没收尾的最后一个事件也并进 Prefix | 采纳。原伪代码会丢掉这部分字节，违反 `Prefix+Rest == 原始字节` | 01 design §1.3 |
+| JSON `null` 当作字段不存在 | 采纳。和 h3 一致：h3 的 `any` 字段遇到 null 时是 nil | 01 design §1.3 |
+| `response.failed` 只带顶层 code/message 时要不要兜底 | 补上 h3 `:220-232` 的兜底逻辑。真实帧的形态还没见过（K2），兜底能多覆盖一种形态；不是限流的仍然放行，不会比现在更差 | 01 design §1.3；interface 2.1 |
+| 顶层 error 分支额外填了 Type 和 Param | 不采纳，改回和 h3 一样只取 code 和 message。T-F1 要求代 429 和 h3 逐字节一致 | 01 design §1.3 |
+| 小数形式的数字码值（`429.0`） | 和 h3 对齐：code 先解成 any 再编回去，判定用 `fmt.Sprint` | 01 design §1.3；interface 2.1 |
+| 空对象 `{}` 算作取到错误，最后放行 | 维持现状 | — |
+| 启动帧阶段不设总时限 | 维持现状。T5 的 `forward` 必须用 `r.Context()` 发请求，客户端断开（前提是 Caddy 能传过来，K1）时，读响应体会因 ctx 取消而返回 | 01 design §4、§1.6 |
+
+审计发现的问题，都在 `audit/T2` 分支上修复：
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| G1 | P1 | `ReadString('\n')` 对单行没有长度上限：上游发一个超长、又没有换行的行时，会先把整行读进内存，之后才检查 256KiB 的限制 | 新增 `readLine`，用 `ReadSlice` 逐块读，读到超过剩余预算就立即放行 |
+| G2 | P1 | 顶层 error 分支多填了 Type 和 Param，代 429 和 h3 对不上 | 只取 code 和 message |
+| G3 | P2 | 错误对象用固定类型的结构体解析：只要 type 或 message 不是字符串，整个对象就解析失败，被当成"没有错误" | 改成按 `map[string]any` 加类型断言解析，和 `GetOpenAIError` 一致 |
+| G4 | P2 | 没有 h3 的 failed 兜底 | 补上 |
+| G5 | P2 | code 原样保留：`429.0` 判定不中，输出也和 h3 不一样 | `canonical` 加 `codeText` |
+| G6 | P3 | `response.status` 声明成 string：status 不是字符串时整帧解析失败 | 改成 `json.RawMessage`，再用 `stringValue` 取值 |
