@@ -15,7 +15,7 @@ cmd/nahook.main
   ├─ obs.NewLogger / obs.NewStats
   ├─ gate.NewRegistry
   ├─ proxy.NewHandler(store, gates, stats, log) ─► http.Server{Addr: cfg.Listen}.Serve
-  ├─ control.Serve(ctx, cfg.ControlSocket, store, gates, stats)
+  ├─ control.Serve(ctx, cfg.ControlSocket, store, gates, stats, log)   # log 和传给 proxy.NewHandler 的是同一个
   └─ signal: SIGHUP ─► store.Reload；SIGTERM ─► Server.Shutdown
 
 proxy.(*Handler).ServeHTTP
@@ -103,7 +103,7 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 
 | nahook 接口 | 签名 / 路由 | 说明 |
 |---|---|---|
-| `Serve` | `func Serve(ctx context.Context, socket string, s *config.Store, g *gate.Registry, st *obs.Stats) error` | 启动时删掉残留的 socket → Listen → chmod 0600 |
+| `Serve` | `func Serve(ctx context.Context, socket string, s *config.Store, g *gate.Registry, st *obs.Stats, log *slog.Logger) error` | 启动时删掉残留的 socket → Listen → chmod 0600；design §6.4 的日志都写到 `log`，不用 `slog.Default` |
 | 路由 | `GET/PUT/DELETE /v1/retry`、`GET /v1/stats`、`POST /v1/reload` | design §5 |
 | nahookctl 子命令 | `retry get|set|unset`、`stats`、`reload`，全局参数 `--socket` | design §6.5 |
 

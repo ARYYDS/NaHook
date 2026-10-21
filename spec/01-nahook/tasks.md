@@ -84,7 +84,7 @@ L-DOC                                                                           
   - 前置：T2、T3、T4、T6（`obs`）；00 G1（T0 的结论。需要单请求总时限时，先改 design §4 和 §1.6，再开工）
   - 改动：
     - `internal/proxy`：`NewHandler`、`ServeHTTP`、`classify`、`forward`、`serveIntercept`、`release`、`passthrough`、`copyFlush`、`writeBadGateway`
-    - `cmd/nahook`：main（`config.Load` → `Validate` → `NewStore` → `obs.NewLogger`、`obs.NewStats` → `gate.NewRegistry` → `proxy.NewHandler` 和 `control.Serve`）、信号处理（SIGHUP → `Store.Reload`；SIGTERM → `Server.Shutdown`）
+    - `cmd/nahook`：main（`config.Load` → `Validate` → `NewStore` → `obs.NewLogger`、`obs.NewStats` → `gate.NewRegistry` → `proxy.NewHandler` 和 `control.Serve`，两者传入同一个 logger）、信号处理（SIGHUP → `Store.Reload`；SIGTERM → `Server.Shutdown`）
   - 依据：design §1.2、§1.6、§1.8、§5（日志）、§6.1；interface §1、2.5 ｜ audit T-F2、T-F5、T-F6、T-F7、T-F10、T-F16
   - 完成判据：
     - [ ] 用 httptest 起一个假 NewAPI，覆盖：重试到上限后返回代 429、重试中途成功、HTTP 429 透传、非流式透传、超大请求体透传、ctx 取消
@@ -126,7 +126,7 @@ L-DOC                                                                           
 
 - [ ] **T8 构建、打包和第一次发布**（L-GO）
   - 前置：T5、T6、T7；Win11 上的 `gh auth login` 已完成
-  - 改动：构建脚本 `scripts/build.ps1`（构建 → 写 `BUILDINFO.txt` 和 `SHA256SUMS`）；`scripts/release.ps1`（`gh release create`）；`deploy/nahook.service`、`deploy/nahook-test.service`、`deploy/mockrelay.service`、`deploy/config.example.json`、`deploy/test.example.json`
+  - 改动：构建脚本 `scripts/build.ps1`（构建 → 写 `BUILDINFO.txt` 和 `SHA256SUMS`）；`scripts/release.ps1`（`gh release create`）；`deploy/nahook.service`、`deploy/nahook-test.service`（两者都设 `UMask=0077`，design §6.4）、`deploy/mockrelay.service`、`deploy/config.example.json`、`deploy/test.example.json`
   - 依据：design §7（构建、产物、发布与分发流程）；00 §6.4 ｜ audit §3
   - 完成判据：
     - [ ] audit §3 的门禁都通过（在 Win11 的 `O:\NaHook` 上执行）

@@ -472,10 +472,12 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | 方法与路径 | 请求 | 响应 |
 |---|---|---|
 | `GET /v1/retry?model=M` | — | `{"scope":"M"或"*","max":3,"source":"per_model"或"global"}` |
-| `PUT /v1/retry` | `{"scope":"*"或模型名,"n":3}` | `{"scope":…,"old":…,"new":…}` |
+| `PUT /v1/retry` | `{"scope":"*"或模型名,"n":3}`；`n` 必填，缺了回 400（否则会被当成 0） | `{"scope":…,"old":…,"new":…}` |
 | `DELETE /v1/retry?model=M` | — | `{"scope":"M","removed":true}` |
 | `GET /v1/stats` | — | `{"counters":{…},"gates":[{"key","until_ms","streak","base_ms"}]}` |
-| `POST /v1/reload` | — | `{"ok":true}`；失败时回 500，并带上错误信息 |
+| `POST /v1/reload` | — | `{"ok":true}`；失败时状态码按 §6.4 映射，快照不变 |
+
+所有错误响应的响应体都是 `{"error":"<错误信息>"}`。
 
 ### 代 429 的响应体
 
@@ -490,6 +492,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `release` | `request_id`、`attempt` |
 | `give_up` | `request_id`、`key`、`attempts` |
 | `config.retry_max_changed` | `scope`、`old`、`new`、`uid` |
+| `config.reloaded` | `uid` |
 | `config.reload_failed` | `error` |
 
 ### 存储位置
@@ -537,8 +540,11 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
   - 409：`ErrRestartRequired`，也就是 reload 改了 `listen`、`control_socket` 或 `newapi`（这时快照不变）；
   - 500：其他写盘错误（这时文件和内存都不变）。
 - `ErrDirSync` 回 200，响应体里加 `"warning":"applied; directory fsync failed, not durable across power loss"`。这时修改已经生效。
-- 日志：`PUT`、`DELETE`、`reload` 成功后，由 control 打 `config.retry_max_changed` 或 `config.reloaded`，字段包括 `scope`、`old`、`new`、`uid`。
+- 日志：写到 `Serve` 收到的 `log`（`cmd/nahook` 传入的 `obs.NewLogger(os.Stdout)`，和 proxy 共用一个）。
+  - `PUT`、`DELETE` 生效后（包括 `ErrDirSync`）打 `config.retry_max_changed`，字段 `scope`、`old`、`new`、`uid`。`DELETE` 的 `new` 是删除后回落到的全局值。`old`、`new` 是在 Store 的写锁外面读的，两个运维命令同时执行时，日志里的值可能对不上；配置本身不受影响。
+  - `reload` 成功打 `config.reloaded`，字段 `uid`；失败（包括 409）打 `config.reload_failed`，字段 `error`。
   - `uid` 在 Linux 上通过 SO_PEERCRED 取（`syscall.GetsockoptUcred`，放在只在 linux 下编译的文件里）；其他平台记成 `-`。
+- 从 `Listen` 到 `chmod 0600` 之间，socket 的权限由进程的 umask 决定。systemd 单元设 `UMask=0077`，确保这段时间里其他用户也连不上。
 
 ### 6.4.1 `internal/config` 的校验和读写规则
 

@@ -294,3 +294,34 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 修复提交 `5cc175c`。Win11 门禁：gofmt 无输出；vet 退出码 0；`go test -race ./...` 五个包全部 ok，顶层 80 个 PASS、0 个 FAIL；新测试连跑 3 次稳定；反证：把 `server.go` 换回 `91bf3aa` 的版本，新测试在 5.00s 时失败（"hold:5 kept waiting after the client closed its connection"）；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF。
 
 排期调整：T5 要等 T0，原来的 T6 又依赖 T5，T7 合入后 DSH 就没有能开工的任务了。所以把 `obs` 从 T5 移到 T6，把 `cmd/nahook`（它要调用 `proxy.NewHandler`）从 T6 移到 T5。顺序改为 T7 → T6 → T5 → T8；T6 只依赖 T1、T3（01 tasks §1、T5、T6；`docs/任务书-DSH.md` §6）。
+
+### 7.10 T6 审计（提交 `215077b`，由架构侧直接审计、直接修复）
+
+DSH 交付回报里的自行决定和风险点，架构侧的裁决：
+
+| 事项 | 裁决 | 回写位置 |
+|---|---|---|
+| control 的日志走 `slog.Default()`（因为 interface 2.6 的 `Serve` 签名里没有 logger） | 改为显式传入：`Serve` 增加 `log *slog.Logger` 参数，和 `proxy.NewHandler` 保持一致，不依赖全局状态。`cmd/nahook` 还没写，现在改接口成本最低 | 01 interface §1、2.6；design §6.4；tasks T5 |
+| reload 的错误码按 §6.4 分类映射，§5 的"失败时回 500"只作兜底 | 采纳。§5 改为"按 §6.4 映射" | 01 design §5 |
+| `PUT` 的 `n` 必填 | 采纳 | 01 design §5 |
+| `DELETE` 日志里的 `new` 取回落后的全局值 | 采纳；同时写明 `old`、`new` 是在写锁外面读的，运维命令同时执行时日志可能对不上，配置本身不受影响 | 01 design §6.4 |
+| `config.reloaded` 只带 `uid`；409 也记 `config.reload_failed`；错误体是 `{"error":…}` | 采纳 | 01 design §5、§6.4 |
+| `Serve` 退出时删除 socket 文件；`nahookctl` 支持 `--x=y`、`--help`，负数交给服务端判断 | 采纳 | — |
+| `ErrDirSync` 只在响应写出函数上测 | 接受：Windows 上造不出目录 fsync 失败 | — |
+| `nahookctl` 不设超时 | 接受：短进程，控制面卡住时可以 Ctrl+C；没有出处的超时常数不加 | — |
+| SO_PEERCRED 只做了交叉编译，没有在 Linux 上运行过 | 留给 T10 的 T-F11 在 LT 上实测 | — |
+
+审计发现的问题，在 `audit/T6` 分支上修复：
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| M-a | P3 | 从 `Listen` 到 `chmod 0600` 之间，socket 的权限由 umask 决定 | systemd 单元设 `UMask=0077`，放进 T8 的改动 | 
+| M-b | P3 | control 依赖全局 `slog.Default`；测试要改全局 logger | 见上表第一行，提交 `5083dd8` |
+
+临近模块的问题（T3 的 gate 测试，和本次交付相关：T6 的门禁里出现了一次失败）：
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| M-c | P2 | `TestWaitReturnsOnContextCancel`、`TestWaitReturnsOnContextDeadline` 用 20ms 结束 ctx，而全抖动的等待时长取自 `[0, 2s)`，每次运行大约有 1% 的概率抽到更短的等待，计时器先到，测试失败，门禁时好时坏 | 随机取值改为包级变量 `jitter`（和 config 的 `syncDirFn` 同一做法），这两个测试把它固定为最长等待；生产代码仍用 `rand.N`，`TestWaitFullJitter` 仍用真随机。提交 `6d809c1` |
+
+Win11 门禁（`6d809c1`）：gofmt 无输出；vet 退出码 0；`go test -race ./...` 八个包全部 ok，顶层 104 个 PASS、0 个 FAIL、1 个 SKIP（`TestSocketMode`，权限断言只在 Linux 上做）；修复后的两个测试连跑 200 轮共 400 次，全部通过；对照：修复前的版本连跑 300 轮共 600 次，失败 7 次（约 1.2%）；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF。
