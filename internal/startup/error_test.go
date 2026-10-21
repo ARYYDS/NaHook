@@ -318,7 +318,9 @@ func TestCanonical(t *testing.T) {
 		{raw: `"rate_limit_exceeded"`, want: `"rate_limit_exceeded"`},
 		{raw: `429.0`, want: `429`},
 		{raw: ` 429 `, want: `429`},
-		{raw: `"<b>"`, want: `"<b>"`},
+		// encoding/json escapes HTML characters; the escape is built at run
+		// time so the expected bytes cannot be rewritten by an editor.
+		{raw: `"<b>"`, want: strings.ReplaceAll(`"#u003cb#u003e"`, "#", `\`)},
 		{raw: `{"b":1,"a":2}`, want: `{"a":2,"b":1}`},
 		{raw: `null`, want: ``},
 		{raw: ``, want: ``},

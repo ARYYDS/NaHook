@@ -123,8 +123,9 @@ func codeText(raw json.RawMessage) string {
 
 // canonical decodes a JSON value and encodes it again with encoding/json. H3
 // keeps OpenAIError.Code as any and gin encodes it on the way out, so this is
-// the byte form H3 would answer with (429.0 → 429, "<" and "<" both →
-// "<"). It returns nil for null or invalid input.
+// the byte form H3 would answer with: 429.0 becomes 429, and HTML characters
+// such as "<" are escaped the way encoding/json escapes them. It returns nil
+// for null or invalid input.
 func canonical(raw json.RawMessage) json.RawMessage {
 	if !hasJSON(raw) {
 		return nil
