@@ -7,9 +7,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,13 +19,25 @@ import (
 )
 
 // Sentinel errors. The control plane maps them to status codes (design §6.4):
-// ErrInvalidRetry and ErrInvalidConfig to 400, ErrRetryNotSet to 404, and any
-// other error out of a persist step to 500.
+// ErrInvalidRetry and ErrInvalidConfig to 400, ErrRetryNotSet to 404,
+// ErrRestartRequired to 409, ErrDirSync to 200 with a warning (the change is in
+// effect), and any other error out of a persist step to 500.
 var (
-	ErrInvalidConfig = errors.New("config: invalid configuration")
-	ErrInvalidRetry  = errors.New("config: retry max must not be negative")
-	ErrRetryNotSet   = errors.New("config: model has no per-model retry max")
+	ErrInvalidConfig   = errors.New("config: invalid configuration")
+	ErrInvalidRetry    = errors.New("config: invalid retry max")
+	ErrRetryNotSet     = errors.New("config: model has no per-model retry max")
+	ErrRestartRequired = errors.New("config: change takes effect only after a restart")
+	ErrDirSync         = errors.New("config: renamed into place but directory fsync failed")
 )
+
+// maxStreakCap bounds gate.streak_cap so that base << (streak_cap-1) cannot
+// overflow int64 nanoseconds: base is at most Caddy's response_header_timeout
+// (30m = 1.8e12ns) and 1.8e12 << 22 ≈ 7.5e18 < 2^63 (design §6.4.1).
+const maxStreakCap = 23
+
+// syncDirFn is the directory fsync step of writeFileAtomic. Tests replace it to
+// exercise the ErrDirSync path, which a real filesystem rarely produces.
+var syncDirFn = syncDir
 
 // Config mirrors /etc/nahook/config.json (design §5).
 type Config struct {
@@ -57,11 +71,11 @@ type GateConf struct {
 	StreakCap   int32 `json:"streak_cap"`
 }
 
-// Validate reports whether c can be served. It rejects only what the rest of
-// the program cannot run with: an empty listen address or control socket, a
-// newapi base that is not an absolute http(s) URL, a non-positive body limit,
-// a negative gate floor, a streak cap below 1 (the shift in design §1.5 needs
-// it) and a negative retry ceiling.
+// Validate reports whether c can be served, following the rule table in design
+// §6.4.1: an empty listen address or control socket, a newapi base that is not
+// an absolute http(s) URL, a non-positive body limit, a negative gate floor, a
+// streak cap outside 1..maxStreakCap, a negative retry ceiling, and a per-model
+// entry whose key is empty or "*" (the global scope) are all rejected.
 //
 // Load does not call Validate: the documented order is Load → Validate →
 // NewStore (interface §1), so a bad file never becomes a snapshot.
@@ -82,30 +96,40 @@ func (c *Config) Validate() error {
 	if c.Gate.BaseFloorMS < 0 {
 		return fmt.Errorf("%w: gate.base_floor_ms %d must not be negative", ErrInvalidConfig, c.Gate.BaseFloorMS)
 	}
-	if c.Gate.StreakCap < 1 {
-		return fmt.Errorf("%w: gate.streak_cap %d must be at least 1", ErrInvalidConfig, c.Gate.StreakCap)
+	if c.Gate.StreakCap < 1 || c.Gate.StreakCap > maxStreakCap {
+		return fmt.Errorf("%w: gate.streak_cap %d must be within 1..%d", ErrInvalidConfig, c.Gate.StreakCap, maxStreakCap)
 	}
 	if c.Retry.Max < 0 {
-		return fmt.Errorf("%w: retry.max %d", ErrInvalidRetry, c.Retry.Max)
+		return fmt.Errorf("%w: retry.max %d must not be negative", ErrInvalidRetry, c.Retry.Max)
 	}
 	for model, n := range c.Retry.PerModel {
+		if model == "" || model == "*" {
+			return fmt.Errorf("%w: retry.per_model key %q is reserved", ErrInvalidRetry, model)
+		}
 		if n < 0 {
-			return fmt.Errorf("%w: retry.per_model[%q]=%d", ErrInvalidRetry, model, n)
+			return fmt.Errorf("%w: retry.per_model[%q]=%d must not be negative", ErrInvalidRetry, model, n)
 		}
 	}
 	return nil
 }
 
 // Load reads and parses one configuration file. It does not validate the
-// result; the caller runs (*Config).Validate.
+// result; the caller runs (*Config).Validate. Unknown keys and anything after
+// the top-level object are rejected, so a misspelt key cannot silently fall
+// back to a zero value (design §6.4.1).
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
 	c := new(Config)
-	if err := json.Unmarshal(b, c); err != nil {
+	if err := dec.Decode(c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("config: parse %s: unexpected data after the configuration object", path)
 	}
 	return c, nil
 }
@@ -113,9 +137,21 @@ func Load(path string) (*Config, error) {
 // Persist writes c to path atomically: a temporary file in the same directory,
 // fsync of the file, rename, then fsync of the directory (design §8). The
 // configuration holds the control socket path and the upstream address, so the
-// file is created 0600 (design §5).
+// file is created 0600 (design §5). Empty collections are written as {} and []
+// to match the design §5 sample. A directory fsync failure is reported as
+// ErrDirSync: the rename has already happened and the new content is in place.
 func Persist(path string, c *Config) error {
-	buf, err := json.MarshalIndent(c, "", "  ")
+	out := *c
+	if out.Match.Paths == nil {
+		out.Match.Paths = []string{}
+	}
+	if out.Match.Models == nil {
+		out.Match.Models = []string{}
+	}
+	if out.Retry.PerModel == nil {
+		out.Retry.PerModel = map[string]int{}
+	}
+	buf, err := json.MarshalIndent(&out, "", "  ")
 	if err != nil {
 		return fmt.Errorf("config: marshal: %w", err)
 	}
@@ -154,7 +190,10 @@ func writeFileAtomic(path string, data []byte) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("config: rename %s to %s: %w", tmpName, path, err)
 	}
-	return syncDir(dir)
+	if err := syncDirFn(dir); err != nil {
+		return fmt.Errorf("%w: %v", ErrDirSync, err)
+	}
+	return nil
 }
 
 // syncDir makes the rename durable. Windows cannot flush a directory handle, so

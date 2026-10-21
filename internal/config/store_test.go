@@ -213,9 +213,9 @@ func TestReloadPublishesNewFile(t *testing.T) {
 	before := s.Current()
 
 	next := validConfig()
-	next.Listen = "127.0.0.1:19181"
 	next.Retry.Max = 0
 	next.Match.Models = nil
+	next.Gate.StreakCap = 2
 	if err := Persist(path, next); err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
@@ -225,11 +225,74 @@ func TestReloadPublishesNewFile(t *testing.T) {
 	if s.Current() == before {
 		t.Fatal("Reload did not publish a new snapshot")
 	}
-	if got := s.Current().Listen; got != "127.0.0.1:19181" {
-		t.Fatalf("listen = %q, want the reloaded value", got)
-	}
 	if got := s.RetryMax("gpt-6-astra"); got != 0 {
 		t.Fatalf("RetryMax = %d, want the reloaded 0", got)
+	}
+	if got := s.Current().Gate.StreakCap; got != 2 {
+		t.Fatalf("streak_cap = %d, want the reloaded 2", got)
+	}
+}
+
+// listen, control_socket and newapi are bound at start-up; a reload that
+// changes one of them is refused and the snapshot stays (design §1.7).
+func TestReloadRejectsRestartOnlyFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "listen", mutate: func(c *Config) { c.Listen = "127.0.0.1:19181" }},
+		{name: "control_socket", mutate: func(c *Config) { c.ControlSocket = "/run/nahook-test/ctl.sock" }},
+		{name: "newapi", mutate: func(c *Config) { c.NewAPI = "http://127.0.0.1:3001" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, path := newTestStore(t, validConfig())
+			before := s.Current()
+			next := validConfig()
+			tt.mutate(next)
+			next.Retry.Max = 9
+			if err := Persist(path, next); err != nil {
+				t.Fatalf("Persist: %v", err)
+			}
+			if err := s.Reload(); !errors.Is(err, ErrRestartRequired) {
+				t.Fatalf("Reload = %v, want ErrRestartRequired", err)
+			}
+			if s.Current() != before {
+				t.Fatal("a refused reload must keep the previous snapshot")
+			}
+		})
+	}
+}
+
+func TestSetRetryMaxRejectsEmptyScope(t *testing.T) {
+	s, _ := newTestStore(t, validConfig())
+	before := s.Current()
+	if _, err := s.SetRetryMax("", 2); !errors.Is(err, ErrInvalidRetry) {
+		t.Fatalf("SetRetryMax(\"\") = %v, want ErrInvalidRetry", err)
+	}
+	if s.Current() != before {
+		t.Fatal("a rejected write must keep the previous snapshot")
+	}
+}
+
+// When only the directory fsync fails, the file already holds the new value,
+// so the snapshot must follow it and the caller learns about it through
+// ErrDirSync (design §1.7).
+func TestSetRetryMaxDirSyncFailureStillApplies(t *testing.T) {
+	s, path := newTestStore(t, validConfig())
+	failDirSync(t)
+	old, err := s.SetRetryMax("gpt-6-astra", 6)
+	if !errors.Is(err, ErrDirSync) {
+		t.Fatalf("SetRetryMax = %v, want ErrDirSync", err)
+	}
+	if old != 3 {
+		t.Fatalf("old = %d, want the effective value 3", old)
+	}
+	if got := s.RetryMax("gpt-6-astra"); got != 6 {
+		t.Fatalf("snapshot RetryMax = %d, want 6", got)
+	}
+	if got := mustLoad(t, path).Retry.PerModel["gpt-6-astra"]; got != 6 {
+		t.Fatalf("file per_model = %d, want 6", got)
 	}
 }
 

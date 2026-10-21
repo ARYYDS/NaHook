@@ -56,6 +56,10 @@ func TestValidate(t *testing.T) {
 		{name: "body limit negative", mutate: func(c *Config) { c.BodyLimit = -1 }, wantErr: ErrInvalidConfig},
 		{name: "negative base floor", mutate: func(c *Config) { c.Gate.BaseFloorMS = -1 }, wantErr: ErrInvalidConfig},
 		{name: "streak cap zero", mutate: func(c *Config) { c.Gate.StreakCap = 0 }, wantErr: ErrInvalidConfig},
+		{name: "streak cap at the overflow bound", mutate: func(c *Config) { c.Gate.StreakCap = maxStreakCap }},
+		{name: "streak cap past the overflow bound", mutate: func(c *Config) { c.Gate.StreakCap = maxStreakCap + 1 }, wantErr: ErrInvalidConfig},
+		{name: "per-model empty key", mutate: func(c *Config) { c.Retry.PerModel[""] = 1 }, wantErr: ErrInvalidRetry},
+		{name: "per-model global key", mutate: func(c *Config) { c.Retry.PerModel["*"] = 1 }, wantErr: ErrInvalidRetry},
 		{name: "negative retry max", mutate: func(c *Config) { c.Retry.Max = -1 }, wantErr: ErrInvalidRetry},
 		{
 			name:    "negative per-model retry max",
@@ -185,6 +189,75 @@ func TestPersistReportsFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent-dir", "config.json")
 	if err := Persist(path, validConfig()); err == nil {
 		t.Fatal("Persist into a missing directory = nil, want error")
+	}
+}
+
+// A misspelt key must not silently fall back to a zero value (design §6.4.1).
+func TestLoadRejectsUnknownKeysAndTrailingData(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "misspelt nested key", body: `{"retry":{"maxx":3}}`},
+		{name: "misspelt top-level key", body: `{"lisen":"127.0.0.1:19080"}`},
+		{name: "second object after the configuration", body: specSample + `{}`},
+		{name: "trailing garbage", body: specSample + ` x`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			if c, err := Load(path); err == nil {
+				t.Fatalf("Load = %+v, nil; want an error", c)
+			}
+		})
+	}
+}
+
+// Empty collections are written as {} and [] like the design §5 sample.
+func TestPersistWritesEmptyCollections(t *testing.T) {
+	c := validConfig()
+	c.Match.Paths, c.Match.Models, c.Retry.PerModel = nil, nil, nil
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Persist(path, c); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for _, want := range []string{`"paths": []`, `"models": []`, `"per_model": {}`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("persisted file lacks %s:\n%s", want, b)
+		}
+	}
+	if c.Match.Paths != nil || c.Retry.PerModel != nil {
+		t.Fatal("Persist must not modify the config it writes")
+	}
+}
+
+// failDirSync makes the directory fsync step fail for the rest of the test.
+func failDirSync(t *testing.T) {
+	t.Helper()
+	orig := syncDirFn
+	syncDirFn = func(string) error { return errors.New("injected EIO") }
+	t.Cleanup(func() { syncDirFn = orig })
+}
+
+// After the rename the new content is in place even when the directory fsync
+// fails; Persist reports that as ErrDirSync (design §6.4.1).
+func TestPersistDirSyncFailureReportsErrDirSync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	failDirSync(t)
+	c := validConfig()
+	c.Retry.Max = 7
+	if err := Persist(path, c); !errors.Is(err, ErrDirSync) {
+		t.Fatalf("Persist = %v, want ErrDirSync", err)
+	}
+	if got := mustLoad(t, path); got.Retry.Max != 7 {
+		t.Fatalf("file retry.max = %d, want 7 (the rename happened)", got.Retry.Max)
 	}
 }
 
