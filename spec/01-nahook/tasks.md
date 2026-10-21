@@ -156,7 +156,7 @@ L-DOC                                                                           
   - 改动：不改代码；只记录结果。临时改动的 LT 面板设置（`RetryTimes`、心跳），测完改回原值
   - 依据：audit §2 的 T-C1–T-C4、T-F1–T-F17；audit K4、K6
   - 完成判据：
-    - [ ] 每一项都有实测记录（命令、输出摘要、结论），写进 specaudit §3
+    - [ ] 每一项都有实测记录（命令、输出摘要、结论），写进 specaudit §7.16；发现的问题登记到 §2、§3
     - [ ] T-C1/T-C2 的结论回写到 00 §6.1，确认 nahook 路由要不要 `flush_interval -1`
     - [ ] K4 的回退方向在 LT 上演练过一次：rc.45 → h3 → rc.45（各需用户同意）
   - 冲突：LT `/etc/caddy/Caddyfile`（切换 T-C1/T-C2 时）

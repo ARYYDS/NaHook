@@ -134,10 +134,14 @@ LT 上测试令牌对应的上游渠道是 mockrelay（§6.2）。
 ### 3.2 nahook 进程挂了
 
 ```text
-Caddy ─dial 127.0.0.1:19080 被拒─► 立即换下一个上游（连接失败时 POST 也一定会重试：Caddy reverse_proxy 文档 lb_retry_match 一节）
-      ─► NewAPI :3000 ─► 官方原样行为
-health_interval 10s 内把 nahook 标记为不健康 → 之后的请求直接走 NewAPI；nahook 恢复后自动回来
+Caddy ─dial 127.0.0.1:19080 被拒─► 被动健康检查记一次失败（fail_duration 10s，max_fails 默认 1）→ 19080 不可用
+      ─► 间隔 lb_try_interval（默认 250ms）后重试，lb_policy first 选到 NewAPI :3000 ─► 官方原样行为
+      （连接失败时 POST 也一定会重试：Caddy reverse_proxy 文档 lb_retry_match 一节）
+health_interval 10s 内主动检查也把 nahook 标记为不健康 → 之后的请求直接走 NewAPI
+nahook 恢复后：下一次主动检查成功、被动失败计数 10s 过期，流量自动回来
 ```
+
+没有 `fail_duration` 时，连接被拒不会被记成失败，`first` 每次重试都重新选中 19080，直到 `lb_try_duration` 用完，返回 502（§6.1；T10 T-C4 实测 5.03s 后 502）。
 
 ### 3.3 LT 上的测试链路
 
@@ -173,6 +177,7 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 | 测试渠道、测试令牌 | 存在 LT 的 MySQL `luna` 里，由用户在面板里创建（§6.2） | 无 |
 | 测试令牌的副本（给 curl 读取） | `/root/.nahook-test-token`，0600，T10 结束后删除 | 无 |
 | h3 对照实例的数据 | `/root/container/nahook-h3-ref/data`（SQLite，测完由用户删除） | 无 |
+| T10 的辅助脚本和中间文件 | `/root/nahook-t10/`，0700，T10 结束后删除 | 无 |
 
 ## §6 模块细节
 
@@ -190,6 +195,7 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 			health_uri      /api/status
 			health_interval 10s
 			health_timeout  5s
+			fail_duration   10s
 			transport http {
 				keepalive               10m
 				keepalive_idle_conns    2000
@@ -205,9 +211,23 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 ```
 
 - **不写 `flush_interval`。** 写了 `-1` 以后，Caddy 2.6.2 会把发往后端的请求上下文换成 `ignoreClientGoneContext`（caddy v2.6.2 `modules/caddyhttp/reverseproxy/reverseproxy.go:802-803`），客户端断开不会取消发给 nahook 的请求。nahook 在等待和重试期间不写任何字节，Caddy 也就没有机会通过写失败发现断开。T0 实测：写了 `-1` 的组合，客户端断开 18 秒后后端连接仍然开着；不写的组合，后端在 1ms 内就看到连接关闭（`specaudit.md` §7.12）。不写也不影响流式输出：上游响应是 `text/event-stream` 时，Caddy 会立即 flush（同版本 `streaming.go:133-137`）。T-C1、T-C2 在 LT 的完整链路上用 HTTP/2 复测。
-- 除 `lb_policy` 外，其余参数沿用各自主站点现有的配置。
+- **要写 `fail_duration 10s`。** caddy v2.6.2 没配 `fail_duration` 时，`countFailure` 直接返回（`modules/caddyhttp/reverseproxy/healthchecks.go`），`Upstream.Healthy()` 只在配了被动检查时才看失败次数（`hosts.go`），所以 nahook 挂掉以后、主动检查发现之前，`first` 每次重试都选中 19080，请求等满 `lb_try_duration` 后收到 502（T10 T-C4）。配上以后，第一次连接被拒就把 19080 标为不可用，重试改选 3000。客户端主动断开不算失败（`proxyLoopIteration` 排除了 `context.Canceled`）；默认路由没有配被动检查，不受 localhost:3000 失败计数的影响。
+- 除 `lb_policy` 和 `fail_duration` 外，其余参数沿用各自主站点现有的配置。
 - nahook 会把 `/api/status` 透传给 NewAPI，所以健康检查对两个上游都有效。
-- 在 LT 上由 T9 加入；在生产主机上由阶段 1（T11）加入。
+- 在 LT 上由 T9 加入（`fail_duration` 在 T10 补上）；在生产主机上由阶段 1（T11）加入。
+
+**待拍板：主站点默认路由的 `flush_interval -1` 和站点层 `encode`（两台主机，specaudit §4 D1）**
+
+```text
+客户端 ─HTTPS─► Caddy 主站点
+                 ├ encode zstd gzip（站点层，作用于下面两个 handle） ← 待定 ②
+                 ├ handle @stream_relay ─► nahook :19080 ─► NewAPI :3000   （不写 -1，已定）
+                 └ handle（其余路径） ─► NewAPI :3000，flush_interval -1   ← 待定 ①
+```
+
+- ① 场景：客户端调 `/v1/messages`（走默认 handle），上游一直不回响应头，客户端 30s 后断开。因为写了 `-1`，Caddy 不取消发往 NewAPI 的请求，NewAPI 一直等到 30m 的响应头超时，然后重试、扣费；LT 改测试机之前的日志里，客户端走后 NewAPI 等满 30m 再重试的记录有 33 次（不分路径）。去掉以后，客户端断开 1ms 内就传到后端（T0）；流式输出不受影响，Caddy 对 `text/event-stream` 会立即 flush（`streaming.go:133-137`）。
+- ② 场景：客户端带 `Accept-Encoding: gzip` 请求 `/v1/responses`，上游的 `response.created` 带回完整的 instructions，超过 512 字节，Caddy 开始压缩；之后每个 delta 的 Flush 都不冲刷压缩器，客户端可能攒一批才看到（`01-nahook/audit.md` §5 K9）。经过 nahook 时首次写入是 created 加第一个 delta，更容易超过 512 字节（specaudit Q18）。
+- 建议：① 两台主机都去掉默认 handle 的 `flush_interval -1`，先在 LT 上去掉并用 T-C2 的方法复测，再上生产。② 先给 mockrelay 加一个首帧超过 512 字节的脚本项，在 LT 上实测；确认会憋流以后，再给 `encode` 写一个不含 `text/event-stream` 的显式 `match`（写法届时用 `caddy validate` 校验），或者把 Caddy 升到 2.9 以上。
 
 ### 6.2 LT 的测试渠道和测试令牌（用户在面板里创建）
 
@@ -282,4 +302,5 @@ WantedBy=multi-user.target
 | 阶段 3 不备份就换镜像，或者换成没在 LT 上验证过的版本 | 回退时可能碰到表结构不兼容 | 先备份 MySQL；用和 LT 相同的 digest。rc.45 比 h3 的官方基线旧 4 个提交，表结构是 h3 的子集，LT 换镜像时启动迁移没有改表（`specaudit.md` §7.11） |
 | 改完 Caddyfile 用 restart | 现有连接会被断开 | `systemctl reload caddy`（优雅重载） |
 | 照抄主站点，在 nahook 路由里写 `flush_interval -1` | 客户端断开传不到 nahook，nahook 会在客户端走后继续等待和重试，直到用完上限 | 不写（§6.1；T0 实测） |
+| nahook 路由只配主动健康检查，不配 `fail_duration` | nahook 挂掉以后、下一次主动检查之前（最多 10s），每个请求都在 19080 上重试满 `lb_try_duration`（5s）后收到 502 | 写 `fail_duration 10s`（§3.2、§6.1；T10 T-C4） |
 | 生产的 3000 端口对公网开放 | 客户端直连就绕过了 nahook | 在安全组或防火墙上关掉 3000 的公网入口（`01-nahook/audit.md` §5 K5） |

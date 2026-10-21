@@ -21,7 +21,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q3 | R3 | 部署·生产主机的 3000 端口暴露在公网 | 脆弱 | P1 | 00 | 待 K5（生产主机） |
 | Q4 | R4 | 部署·换镜像后数据库回退 | 脆弱 | P1 | 00 | 正向已在 LT 上验证（2026-10-21）；回退方向待 T10 在 LT 上演练（K4） |
 | Q5 | R3 | 测试·LT 上测试分组的模型定价 | 未细分 | P2 | 00 | 部分关闭（T9）：请求没有因定价被拒；扣费在 T-F6、T-F9 核对 |
-| Q6 | R2 | 计费·被拦截的尝试是否为 $0 | 不明 | P2 | 01 | 待 T-F9 |
+| Q6 | R2 | 计费·被拦截的尝试是否为 $0 | 不明 | P2 | 01 | LT 已测（T-F9）：每次 $0、记 1 行日志；真实 failed 帧带 usage 的情况待 P-2 |
 | Q7 | — | 工程·源码放在哪、怎么构建 | 未细分 | P2 | 01 | 已关闭：仓库 `ARYYDS/NaHook`，在 Win11 的 `O:\NaHook` 上开发和构建 |
 | Q9 | — | 工程·产物怎么从 Win11 送到 LT | 未细分 | P2 | 01 | 已关闭：用 GitHub Release（仓库已公开） |
 | Q8 | R2 | 冷却门·base 没有上限 | 脆弱 | P2 | 01 | 待实测（T-F4、P-2） |
@@ -32,6 +32,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
 | Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 已关闭：消息末尾是本次 request id 时原样放行（design §1.6、§8；T-F17）；生产上的心跳设置待 K7 |
 | Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 待 K8（用户告知主机并批准只读核查） |
+| Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 设计已改（00 §3.2、§6.1、§8：`fail_duration 10s`）；LT 待用户装上后复测 T-C4 |
+| Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 待实测（K9，需要首帧超过 512 字节的 mockrelay 脚本项）和用户决定（§4 D1、D2） |
 
 ## 3. 逐项说明
 
@@ -82,11 +84,23 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 - 影响：生产阶段 T11–T13 的全部步骤（路径、端口、镜像、Caddy 配置）都以"生产和 LT 改动前一致"为前提。
 - 处理：K8。由用户告知主机并批准只读核查，按 LT 上做过的那套只读检查逐项比对（镜像 digest、compose、Caddyfile、端口、宿主机服务）。
 
+### Q17 nahook 挂掉时 Caddy 不立即回落
+
+- 证据：T10 T-C4，`systemctl stop nahook` 之后的第一个请求等了 5.03s，收到 502，Caddy 日志是 `dial tcp 127.0.0.1:19080: connect: connection refused`；12s 后的请求才走到 3000。原因在 caddy v2.6.2：没配 `fail_duration` 时 `countFailure` 直接返回（`modules/caddyhttp/reverseproxy/healthchecks.go`），`Upstream.Healthy()` 只在配了被动检查时才看失败次数（`hosts.go`），所以每次重试，`lb_policy first` 都重新选中 19080，直到 5s 的 `lb_try_duration` 用完。
+- 影响：nahook 进程挂掉以后、下一次主动健康检查之前（最多 10s），nahook 路由上的每个请求都要等 5s，然后收到 502。设计原来写的"被拒后立即换下一个上游"不成立。
+- 处理：nahook 路由加 `fail_duration 10s`（`max_fails` 默认 1）。第一次连接被拒就把 19080 标为不可用，间隔 `lb_try_interval`（默认 250ms）后重试选到 3000。客户端主动断开不算失败（`proxyLoopIteration` 排除了 `context.Canceled`）；默认路由没配被动检查，不受影响。生产阶段 1（T11）沿用。
+
+### Q18 站点层 `encode` 和 nahook 路由
+
+- 证据：caddy v2.6.2 `modules/caddyhttp/encode/encode.go` 的 `Write` 只在头还没写、并且这次写入超过 `MinLength`（默认 512）时才调用 `init` 开始压缩；头还没写时 `Flush` 什么都不做；开始压缩以后，Flush 也不冲刷压缩器（01 audit K9）。nahook 放行时，把启动阶段读到的帧（`response.created` 加第一个非启动事件）一次写出（`internal/proxy/stream.go:19`），所以经过 nahook 时 Caddy 的首次写入比直连大。T10 用 mockrelay 实测：首次写入约 320 字节，没有压缩，逐帧正常。
+- 影响（推论，未实测）：真实上游的 `response.created` 带回完整的 response 对象（含 instructions），很可能超过 512 字节；客户端带 `Accept-Encoding` 时，后面的事件可能被攒在压缩器里。直连路由也有这个问题，nahook 路由上更容易触发。
+- 处理：K9。需要 mockrelay 增加一个首帧超过 512 字节、之后按秒发 delta 的脚本项再测（§4 D2）；结论和主站点 `encode`、`flush_interval -1` 的去留一起由用户决定（§4 D1）。
+
 ### Q6 被拦截那几次尝试的计费
 
 - 证据：`NEWAPI/service/responses_usage.go:107` 的逻辑是：流失败且没有输出时，不估算输入 token。
 - 影响：如果上游在 failed 帧里带了 usage，NewAPI 会按它计费。
-- 处理：T-F9 实测并记录。
+- 处理：T-F9 已在 LT 上实测（§7.16）：mockrelay 的 failed 帧不带 usage，每次被拦截的尝试记 1 行消费日志，quota 0，内容是 "Upstream returned no usage, so nothing was charged"。真实上游在 failed 帧里带 usage 时会按它计费，阶段 2（P-2）看真实日志确认。
 
 ### Q7 源码放在哪、怎么构建
 
@@ -118,7 +132,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 | 编号 | 内容 | 位置 |
 |---|---|---|
-| — | 目前没有待拍板项 | — |
+| D1 | 主站点默认路由的 `flush_interval -1` 和站点层 `encode` 的去留（两台主机） | 00 design §6.1 末尾"待拍板" |
+| D2 | 是否给 mockrelay 增加首帧超过 512 字节的脚本项，用来实测 K9 | 01 audit §5 K9；Q18 |
 
 ## 5. 开工前待查索引
 
@@ -511,3 +526,36 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 - reload 时 Caddy 提示 "Caddyfile input is not formatted"。原文件本来就不符合 `caddy fmt`（参数对齐用的空格、站点块开头的空行），不是这次引入的，不影响加载。
 - 测试令牌的副本放在 LT 的 `/root/.nahook-test-token`（0600），供 T10 的 curl 读取，T10 结束后删除（00 design §5）。
 - 主站点原有的 `reverse_proxy` 原样保留在 `handle {}` 里，包括 `flush_interval -1`；它和站点层 `encode` 的去留仍待用户决定，K9 在 T10 实测。
+
+### 7.16 T10：在 LT 上跑审计清单（2026-10-21 起，进行中）
+
+用户批准了四组：A 只调 mockrelay 和 nahookctl；B 改 Caddy、停启 nahook、写坏配置文件；C 改面板设置；D h3 对照实例和 K4 演练。替换 LT 的 Caddyfile 并 reload 的操作被本机的权限分类器拦下（T9 一次；T10 准备切换脚本时又一次，理由是绕过前一次拦截），这类操作改由用户在自己的终端里执行，架构侧只生成候选文件并 `caddy validate`。辅助脚本和中间文件在 LT 的 `/root/nahook-t10/`（0700）。
+
+| 项 | 方法要点 | 结果 | 结论 |
+|---|---|---|---|
+| T-F2 | `retry set 2`，脚本一直是 `rate_limit` | mockrelay 3 次；客户端 429；`rate_limited` +3、`retries` +2、`gave_up` +1 | 通过 |
+| T-F3 | 脚本 `rate_limit, hold_rate_limit:3, rate_limit`；第二次尝试被拖住时执行 `retry set 1 --model gpt-6-astra` | `config.retry_max_changed`（scope `gpt-6-astra`，3→1，uid 0）落在第一次 intercept 之后；第二次判定时 `max` 是 1，共 2 次尝试后 429（3.18s）；配置文件写入 `per_model: {"gpt-6-astra": 1}`；`unset` 后恢复 | 通过 |
+| T-F4 | 16 个并发请求，脚本前 16 次 `rate_limit`、之后 `ok`，跑 4 轮。k 取进入冷却门的先后：nahook `wait` 日志的时间减去 `wait_ms` | 每轮 16 个都是 200，mockrelay 16 + 16；64 次重试全部落在 `[t0, until]` 内（窗口 246–275ms）；pearson(k, wait_ms) 四轮分别是 0.163、0.289、−0.119、0.210 | 通过：和 0 的差在 n=16 的随机波动（约 ±0.26）以内，排队的话会接近 1。略偏正，是因为 until 随后续的拦截往后推，先到的请求抽签区间更短 |
+| T-F5 | 三类不拦截的请求（A `stream=false`、B 不命中的模型、C chat 不带 stream），各经 DIRECT、NH（19080）、SITE 发 100 次；响应体里的 request id 换成占位符后取哈希 | 每类 300 个响应只有一种响应体；状态码一致（A 500、B 503、C 200）；`intercepted` 不变。p50（A/B/C）：DIRECT 3.59/0.94/3.85ms，NH 3.53/0.98/3.86ms，SITE 16.51/13.77/16.84ms | 通过：nahook 本身的附加延迟在测量噪声以内；SITE 多出的约 13ms 是 Caddy 加上每次新建的 TLS 连接 |
+| T-F6 | `ok`，经 SITE 和 DIRECT 各一次；用 `GET /api/log/token`（令牌鉴权、只读，rc.45 `router/api-router.go:359`）按 request id 取消费日志 | SSE 字节相同；两条日志都是 quota 125、prompt 10、completion 3、渠道 5 | 通过 |
+| T-F8 | 把配置文件写成截断的 JSON 后 `systemctl reload nahook`，最后恢复原文件 | 日志 `config.reload_failed`（unexpected EOF）；pid 不变；`retry get` 仍是 3；`nahookctl reload` 退出码 1，返回同样的错误；期间拦截照常；恢复后 `config.reloaded`，文件哈希和原来相同 | 通过 |
+| T-F9 | `rate_limit, rate_limit, ok` 经 SITE；用 nahook 日志里每次尝试的 request id 对日志 | 两次被拦截的尝试各 1 行消费日志，quota 0，内容 "Upstream returned no usage, so nothing was charged"；放行的那次 quota 125 | 已测：每次被拦截的尝试 $0、记 1 行；一个被拦截 n 次的请求共 n+1 行日志（Q6） |
+| T-F10 | 同样的 `X-Forwarded-For`、`X-Real-IP`（203.0.113.7）经 NH 和 DIRECT 各发一次；再经 SITE 分别走 nahook 路由、默认路由，以及客户端自带 XFF。看 NewAPI 的 GIN 访问日志（消费日志的 ip 为空，测试账号没有开 IP 记录） | NH 和 DIRECT 都是 203.0.113.7；SITE 三种情况都是真实客户端 43.162.107.217 | 通过 |
+| T-F11 | 看权限；用 `runuser -u nobody` 执行 `stats` 和 `retry set 9` | 目录 0700、socket 0600；nobody 两次都是 permission denied，上限仍是 3 | 通过 |
+| T-F12 | `quota` | 200，原样放行；`rate_limited` 不变、`released` +1；mockrelay 1 次；和直连逐字节相同 | 通过 |
+| T-F13 | `chat_rate_limit`，走 chat 路径 | mockrelay 4 次后 429 | 通过 |
+| T-F14 | `rate_limit_failed_only` | mockrelay 4 次后 429 | 通过 |
+| T-F16 | 67,109,936 字节的请求体经 SITE，再直连一次 | 200；`intercepted` 不变，只有 `passthrough` 增加；响应体和直连相同；两边都约 45s，耗时在 NewAPI 处理大请求体（直连 43.9s） | 通过 |
+| T-C2 | 现行配置（不写 `-1`）；`hold:30`；`curl --http2 --max-time 2` 经 SITE | 客户端 2.0s 放弃；2.5s 时 `client_gone` +1，nahook 到 3000 的连接从 11 条变成 10 条；mockrelay 只收到 1 次 | 通过；加上 `fail_duration` 后和 T-C4 一起复测 |
+| T-C3 | `slow:30`，客户端 3s 时断开 | NewAPI 消费日志的 `stream_status`：`end_reason=client_gone`、`end_error=context canceled`；容器日志显示 NewAPI 主动关掉了到上游的连接；按已收到的内容扣了 quota 55 | 通过 |
+| T-C4 | `systemctl stop nahook` 后立即发请求，12s 后再发；然后启动 | 停掉后的第一个请求 **5.03s 后收到 502**（Caddy 日志 `dial tcp 127.0.0.1:19080: connect: connection refused`），没有回落；12s 时 200（走 3000）；启动后 1s 内流量回到 nahook | **不通过**，见 Q17。设计已改（00 §3.2、§6.1 加 `fail_duration 10s`），LT 上待用户装上后复测 |
+| K9 | mockrelay `slow:4`，经 SITE 带和不带 `--compressed`，记录每行到达的时刻；对照 DIRECT、NH | 两种情况都是每秒到一帧，响应里没有 `Content-Encoding` | 用这个脚本测不出：首次写入约 320 字节，没有触发压缩，见 Q18 |
+
+其他观察：
+- 经过 nahook 时，`response.created` 要等到第一个非启动事件才一起发出（`slow` 下晚约 1s，直连 7ms 就到）。这是 01 design §1.3 的设计行为：启动事件只是"继续读"。客户端看到第一个 token 的时间不变。
+- chat 路径上每个 chunk 都晚一拍才发出，直连也一样，这是 NewAPI 自己扣住上一块再发，和 nahook 无关。
+- T-F3 里 `hold_rate_limit:3` 那次尝试让 base 变成 3004ms（`stats` 的 `base_ms`），说明 base 跟着单次尝试的耗时走（Q8 仍待 P-2 看真实分布）。
+- 每组测试之后计数不变量都成立，例如 T-F4 之后 `rate_limited`(83) = `retries`(78) + `gave_up`(5)，`intercepted`(76) = `released`(71) + `gave_up`(5)。
+- 在 LT 上准备好的 Caddy 候选文件（由 T9 的文件生成，`caddy validate` 通过）：`/root/nahook-t10/Caddyfile.final`（加 `fail_duration 10s`，sha256 `96e194dc9bd1ca721a796c397f192929493026d8e3214cb17e67ad43ff3c21a0`）和 `/root/nahook-t10/Caddyfile.tc1`（再加 `flush_interval -1`，只给 T-C1 用，sha256 `214e75233265f71cf88f8da5e1527e258f59e90ba2a6ff84deb288ecd3322eb2`）。
+
+还没做：T-C1（要临时装上 `Caddyfile.tc1`）；T-C2、T-C4 复测（要装上 `Caddyfile.final`）；T-F7、T-F15、T-F17（要改面板设置）；T-F1 和 K4（D 组）；K9 的大首帧实测（待用户决定 D2）。
