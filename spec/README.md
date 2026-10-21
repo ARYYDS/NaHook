@@ -2,7 +2,7 @@
 
 | 目录 / 文件 | 内容 |
 |---|---|
-| `00-总体架构/` | LT 上 Caddy + nahook + NewAPI 的整体蓝图、分阶段上线、全局排期和同文件锁表 |
+| `00-总体架构/` | 测试机 LT 与生产主机上 Caddy + nahook + NewAPI 的整体蓝图、先测试后上线的顺序、分阶段上线、全局排期和同文件锁表 |
 | `01-nahook/` | nahook 本体：design、interface、audit、tasks |
 | `specaudit.md` | SPEC 阶段的问题、待拍板、决策溯源 |
 

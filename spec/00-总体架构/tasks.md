@@ -4,21 +4,22 @@
 
 | 前置项 | 状态 | 缺了它能做到哪一步 |
 |---|---|---|
-| `01-nahook` design §7 的待拍板（源码放在哪、怎么构建） | 待拍板 | 能做 T0 风险实验；写不了代码仓库 |
 | LT 的 root 登录（USGL 服务器 `lt`） | 已有 | — |
-| 用户在测试 NewAPI 上完成初始化 | 待用户 | 能搭到容器那一步，跑不了 T10 |
+| LT 和生产隔离，只做测试 | 已确认（2026-10-21，用户） | — |
+| 用户在 LT 面板里建好测试渠道和测试令牌（design §6.2） | 待用户 | 能装好 nahook 和 mockrelay，跑不了 T10 |
+| 生产主机是哪台、怎么访问（`01-nahook/audit.md` §5 K8） | 待用户 | LT 上的全部工作都能做；生产阶段（T11–T13）开不了工 |
 | 每个生产阶段都要用户同意 | — | 每个生产阶段之前都要停下来等 |
 
 ## 1. 阶段与车道
 
 ```text
-阶段     A 风险验证        B 开发             C 测试环境            D 生产
-L-OPS   01:T0            ·                  01:T9 → 01:T10       01:T11 → 01:T12 → 01:T13
-L-GO    ·                01:T1 → … → T8     ·                    ·
-L-DOC   ·                ·                  ·                    01:T14
+阶段     A 风险验证        B 开发                C 测试环境（LT）        D 生产（生产主机）
+L-OPS   01:T0            ·                     01:T9 → 01:T10          K8 → 01:T11 → 01:T12 → 01:T13
+L-GO    ·                01:T1 → … → T8        ·                       ·
+L-DOC   ·                ·                     ·                       01:T14
 ```
 
-风险验证排在最前面：T0 的结论（Caddy 断开会不会传到后端）可能推翻生产路由的写法，甚至需要给 nahook 加一个单请求的总时限。
+风险验证排在最前面：T0 的结论（Caddy 断开会不会传到后端）可能推翻 Caddy 路由的写法，甚至需要给 nahook 加一个单请求的总时限。
 
 ## 2. 全局任务
 
@@ -28,28 +29,31 @@ L-DOC   ·                ·                  ·                    01:T14
     - [ ] 结论回写到 `00-总体架构/design.md` §6.1 和 `01-nahook/audit.md` §5 K1
     - [ ] 如果需要加单请求总时限，先改 `01-nahook/design.md` §4，再开始 `01:T5`
 
-- [ ] **G2 测试环境收口**
+- [ ] **G2 测试环境收口（LT）**
   - 前置：`01:T10`
   - 完成判据：
     - [ ] audit 全部有实测记录
-    - [ ] K4（数据库回退兼容）、K6（自用模式）已查清
+    - [ ] K4（回退方向的兼容性）、K6（测试分组的定价）已查清
 
-- [ ] **G3 生产上线收口**
+- [ ] **G3 生产上线收口（生产主机）**
   - 前置：`01:T13`
   - 完成判据：
+    - [ ] K8 已核对：生产主机的基线和 LT 改动前一致
     - [ ] 三个阶段的验证和回退演练都有记录
-    - [ ] K5（3000 端口是否暴露在公网）已处理
+    - [ ] K5（3000 端口是否暴露在公网）、K7（心跳设置）已处理
 
 ## 3. 全局同文件锁表
 
 | 资源 | 谁会动它 | 规则 |
 |---|---|---|
-| LT `/etc/caddy/Caddyfile` | 01:T0、T9、T10、T11 | 同一时刻只能有一个任务在改；改前备份；`caddy validate` 通过后才 `systemctl reload caddy` |
-| LT `/root/container/luna-task/compose.yaml` | 01:T12、T13 | 改前备份成 `compose.yaml.bak.<时间戳>`；需要用户同意 |
-| LT `/etc/nahook/` | 01:T9、T11；运行期间是 nahookctl | 部署之后只允许通过 nahookctl 修改 |
-| LT systemd 单元 | 01:T9、T11 | — |
-| nahook 仓库 | 01:T1–T8 | 一次只有一个 Go 开发子代理 |
+| LT `/etc/caddy/Caddyfile` | 01:T0（临时站点）、T9（nahook 路由）、T10（切换 `flush_interval`） | 同一时刻只能有一个任务在改；改前备份；`caddy validate` 通过后才 `systemctl reload caddy` |
+| LT `/etc/nahook/`、systemd 单元 | 01:T9；运行期间是 nahookctl | 部署之后只允许通过 nahookctl 修改配置 |
+| LT 的 NewAPI 面板配置（测试渠道、测试令牌、`RetryTimes`） | 用户（T9、T10） | 临时改动测完改回原值 |
+| 生产 `/etc/caddy/Caddyfile` | 01:T11 | 改前备份；`caddy validate` 通过后才 reload；需要用户同意 |
+| 生产 `/root/container/luna-task/compose.yaml` | 01:T12、T13 | 改前备份成 `compose.yaml.bak.<时间戳>`；需要用户同意 |
+| 生产 `/etc/nahook/`、systemd 单元 | 01:T11；运行期间是 nahookctl | 部署之后只允许通过 nahookctl 修改配置 |
 | 生产 MySQL | 01:T13 之前做备份（用户操作） | 本 SPEC 不直接读写 |
+| nahook 仓库 | 01:T1–T8 | 一次只有一个 Go 开发子代理 |
 
 ## 4. 完成定义
 

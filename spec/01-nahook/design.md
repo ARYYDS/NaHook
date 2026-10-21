@@ -4,7 +4,7 @@
 
 ### 范围
 
-nahook 是一个独立的常驻进程，部署在 LT 宿主机上，串在 Caddy 和 NewAPI 之间，只处理"流式 Responses / Chat Completions 在启动阶段被上游限流"这一种情况。它做五件事：
+nahook 是一个独立的常驻进程，部署在 Caddy 和 NewAPI 所在的宿主机上（测试机 LT 和生产主机各一套，00-总体架构 §2），串在 Caddy 和 NewAPI 之间，只处理"流式 Responses / Chat Completions 在启动阶段被上游限流"这一种情况。它做五件事：
 
 1. 识别 NewAPI 透传出来的 200 SSE 启动帧里的限流错误；
 2. 在客户端收到任何字节之前，把它换成一个和 NewAPI 格式一致的 HTTP 429（下称"代 429"）；
@@ -229,6 +229,9 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
         # NewAPI 自己的终态错误：心跳先提交了 200，它按 RetryTimes 重试完以后把错误写进了流里，
         # 消息末尾带着本次请求的 id（NEWAPI controller/relay.go:96、:99-101、:242；common/utils.go:269）。
         # 和非 200 一样原样透传，不叠加重试（R2）
+        # 官方 rc.45（LT 当前版本）还没有 writeRelayStreamError：心跳提交 200 后，终态错误由 c.JSON 直接追加在流后面，
+        # 不带 data:（NEWAPI v1.0.0-rc.45 controller/relay.go:102-107）。startup.Read 读不出事件，读到 EOF 放行，
+        # 同样不会叠加重试，只是走下面的 VerdictRelease 分支、计 Released
         h.st.Inc(obs.Passthrough); release(w, resp, res.Prefix, res.Rest); return
     if res.Verdict == startup.VerdictRelease:
         h.gates.ResetModel(meta.Model)                   # 这个模型下所有 key 的 streak 清零（§6.3）
@@ -504,7 +507,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | 控制口 | `/run/nahook/ctl.sock`（0600，由 systemd 的 `RuntimeDirectory=nahook` 创建） |
 | 日志 | journald（`journalctl -u nahook`） |
 | systemd 单元 | `/etc/systemd/system/nahook.service` |
-| 测试环境 | 见 00-总体架构 §5 |
+| 测试环境 | 测试机 LT，见 00-总体架构 §2、§5 |
 
 ## §6 模块细节
 
@@ -581,7 +584,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `stats` | `GET /v1/stats` |
 | `reload` | `POST /v1/reload` |
 
-全局参数 `--socket PATH`：默认 `/run/nahook/ctl.sock`；测试实例用 `/run/nahook-test/ctl.sock`（00-总体架构 §5）。
+全局参数 `--socket PATH`：默认 `/run/nahook/ctl.sock`。LT 和生产主机上各只有一个 nahook 实例，都用默认路径（00-总体架构 §5）。
 
 退出码：成功 0；参数错误 2；控制口返回错误 1。
 
@@ -653,10 +656,10 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | 依赖 | **只用标准库**（`net/http`、`encoding/json`、`log/slog`、`sync/atomic`、`math/rand/v2`） | 不新增第三方依赖；配置用 JSON 正是为了不引入 YAML 库 |
 | 构建 | 在 Win11 上：`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath`，输出到 `O:\WinCache\nahook\dist\<8hex>\` | LT 是 x86_64、Debian 13，没装 Go（实测） |
 | 产物 | `O:\WinCache\nahook\dist\<8hex>\` 下的 `nahook`、`nahookctl`、`mockrelay`、`BUILDINFO.txt`（提交号、`go version`）和 `SHA256SUMS`；**不进 git** | — |
-| 分发 | GitHub Release：tag 是 `build-<8hex>`，标为 prerelease，附件就是上面五个文件。由 Win11 上的 `gh release create` 发布。LT 从公开地址 `https://github.com/ARYYDS/NaHook/releases/download/build-<8hex>/<文件名>` 下载，用 `sha256sum -c SHA256SUMS` 校验 | 用户拍板（仓库已公开，LT 不需要令牌） |
-| 运行 | systemd 257；`Restart=always`、`RuntimeDirectory=nahook` | LT 实测版本 |
+| 分发 | GitHub Release：tag 是 `build-<8hex>`，标为 prerelease，附件就是上面五个文件。由 Win11 上的 `gh release create` 发布。目标主机（先 LT，T10 通过后生产主机）从公开地址 `https://github.com/ARYYDS/NaHook/releases/download/build-<8hex>/<文件名>` 下载，用 `sha256sum -c SHA256SUMS` 校验 | 用户拍板（仓库已公开，主机不需要令牌） |
+| 运行 | systemd 257；`Restart=always`、`UMask=0077`、`RuntimeDirectory=nahook` | LT 实测版本；生产主机待 K8 |
 | 入口 | 已有的 Caddy 2.6.2 | 不升级 |
-| 测试环境 | Docker 29.8.2 上跑官方镜像 `calciumion/new-api`（固定 digest） | 见 00-总体架构 §5 |
+| 测试环境 | 测试机 LT：官方 `calciumion/new-api` rc.45（固定 digest，audit §5 K3）+ mockrelay | 见 00-总体架构 §0、§2 |
 
 ### 发布与分发流程
 
@@ -665,12 +668,12 @@ Win11 O:\NaHook（dev 分支已推送，工作区干净）
   └─ 构建 ─► O:\WinCache\nahook\dist\<8hex>\{nahook,nahookctl,mockrelay,BUILDINFO.txt,SHA256SUMS}
   └─ gh release create build-<8hex> --target <完整提交号> --prerelease --title "build <8hex>" --notes-file BUILDINFO.txt <五个文件>
 GitHub Release（公开）
-  └─ LT：curl -fL 下载到 /root/nahook-dist/<8hex>/ ─► sha256sum -c SHA256SUMS
+  └─ 先 LT，T10 通过后生产主机：curl -fL 下载到 /root/nahook-dist/<8hex>/ ─► sha256sum -c SHA256SUMS
         ─►（请示用户）install 到 /usr/local/bin ─►（请示用户）systemctl restart
 ```
 
 - 只有收到明确指令时才发 Release（T8 交付时发第一次）。
-- 每次往 LT 上下载、安装、重启，都要先请示用户。
+- 每次往 LT 或生产主机上下载、安装、重启，都要先请示用户。同一个版本先在 LT 上跑过 T10 的相关审计项，才能装到生产主机上。
 - 发布出去的 Release 不覆盖，也不删除：一个提交只对应一个 tag。
 
 ## §8 易错点
@@ -690,4 +693,4 @@ GitHub Release（公开）
 | socket 文件残留 | 重启时 Listen 失败 | 启动时先删掉；或交给 `RuntimeDirectory` 管理 |
 | 处理函数不读请求体，就开始等待（mockrelay 的 `hold`、`slow`、`stall`） | 请求带请求体时，net/http 要等请求体读完才启动检测断开的后台读，所以对端断开后 `r.Context()` 不会被取消，等待会一直持续到结束 | 等待之前先 `io.Copy(io.Discard, r.Body)`（Go 源码 `net/http/server.go` 里 `startBackgroundRead` 的注释：请求带请求体时，要等请求体全部读完才启动后台读）。nahook 的 `classify` 会先把请求体读进缓存，所以不受影响 |
 | 一直不读完、不关闭被拦截的那次响应体 | 连接泄漏 | 被拦截后立即 `resp.Body.Close()` |
-| 只要 200 SSE 里出现限流帧就重试 | 打开心跳时，NewAPI 会先提交 200，按 RetryTimes 重试完以后再把自己的终态错误写进流里；nahook 再重试一轮，两层重试就叠加了 | 消息以 ` (request id: <本次的 X-Oneapi-Request-Id>)` 结尾时原样放行（§1.6；`NEWAPI/controller/relay.go:99-101`） |
+| 只要 200 SSE 里出现限流帧就重试 | 打开心跳时，NewAPI 会先提交 200，按 RetryTimes 重试完以后再把自己的终态错误写进流里；nahook 再重试一轮，两层重试就叠加了 | 消息以 ` (request id: <本次的 X-Oneapi-Request-Id>)` 结尾时原样放行（§1.6；`NEWAPI/controller/relay.go:99-101`）。rc.45 把这个错误写成不带 `data:` 的裸 JSON，本来就会被放行（§1.6 注释） |

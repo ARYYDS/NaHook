@@ -14,34 +14,34 @@
 
 ## 2. 审计清单
 
-测试环境就是 00-总体架构 §2 的"测试（甲）"。T-F1 还需要临时起一个 h3 测试实例做对照：`127.0.0.1:3002`，镜像 h3，打开护栏，指向同一个 mockrelay，测完就删。
+T-C、T-F 都在测试机 LT 上做（00-总体架构 §2）：经 `lt.xhub.chat` 发请求，用测试令牌，上游是 mockrelay；"直连"指直接请求 `127.0.0.1:3000`。T-F1 还需要临时起一个 h3 对照实例（00 §6.3）：`127.0.0.1:3002`，打开护栏，指向同一个 mockrelay，测完就删。P 项在生产主机上做。
 
 | 编号 | 对应 design | 检查方法 | 通过判据 |
 |---|---|---|---|
-| T-C1 | 00 §6.2 | 测试站点**保留** `flush_interval -1`；mockrelay 设为 `hold:30`；`curl --max-time 2` 经 19443 发请求 | 实测记录 nahook 的 `r.Context()` 是否在 2s 左右被取消（看 nahook 日志，以及 `ss -tn` 里到 3001 的连接是否关闭） |
-| T-C2 | 00 §6.2 | 同上，但去掉 `flush_interval -1` 后 reload | 约 2s 内被取消；nahook 不再重试；到 3001 的连接被关闭 |
-| T-C3 | 00 §3.3 | mockrelay 设为 `slow:30`；进入流式阶段后断开 | 测试 NewAPI 日志里这次流的结束原因是 `client_gone` |
-| T-C4 | 00 §3.2 | `systemctl stop nahook-test` 后发请求 | 请求由 3001 正常完成；10s 内 Caddy 把 19081 标为不健康；启动 nahook-test 后流量自动回来 |
-| T-F1 | §1.4 | 同一条 `rate_limit` 脚本：先经 nahook-test（上限设为 0），再经 h3 测试实例 3002（护栏打开，`RetryTimes=0`），分别抓客户端拿到的完整响应 | 状态码、`Content-Type`、响应体逐字节一致（`X-Oneapi-Request-Id` 的值除外） |
+| T-C1 | 00 §6.1 | LT 的 nahook 路由**写上** `flush_interval -1`；mockrelay 设为 `hold:30`；`curl --max-time 2` 经 `lt.xhub.chat` 发请求 | 实测记录 nahook 的 `r.Context()` 是否在 2s 左右被取消（看 nahook 日志里的 `client_gone` 计数，以及 `ss -tn` 里 nahook 到 `127.0.0.1:3000` 的连接是否关闭） |
+| T-C2 | 00 §6.1 | 同上，但去掉 `flush_interval -1` 后 reload | 约 2s 内被取消；nahook 不再重试；到 3000 的连接被关闭 |
+| T-C3 | 00 §3.3 | mockrelay 设为 `slow:30`；进入流式阶段后断开 | LT 的 NewAPI 日志里这次流的结束原因是 `client_gone` |
+| T-C4 | 00 §3.2 | `systemctl stop nahook` 后发请求 | 请求由 3000 正常完成；10s 内 Caddy 把 19080 标为不健康；启动 nahook 后流量自动回来 |
+| T-F1 | §1.4 | 同一条 `rate_limit` 脚本：先经 LT 的 nahook（上限设为 0），再直连 h3 对照实例 3002（护栏打开，`RetryTimes=0`），分别抓客户端拿到的完整响应 | 状态码、`Content-Type`、响应体逐字节一致（`X-Oneapi-Request-Id` 的值除外） |
 | T-F2 | §1.6 | 上限设为 2；脚本是 `rate_limit` × 10 | mockrelay 恰好收到 3 次请求；客户端拿到代 429 |
-| T-F3 | §1.7 | 上限 3；脚本 `rate_limit` × 10；在第 1 次拦截后执行 `nahookctl --socket /run/nahook-test/ctl.sock retry set 1 --model gpt-6-astra` | 这个请求一共只打 2 次就拿到代 429；配置文件里是新值；日志里有一条 `config.retry_max_changed` |
+| T-F3 | §1.7 | 上限 3；脚本 `rate_limit` × 10；在第 1 次拦截后执行 `nahookctl retry set 1 --model gpt-6-astra` | 这个请求一共只打 2 次就拿到代 429；配置文件里是新值；日志里有一条 `config.retry_max_changed` |
 | T-F4 | §1.5 | 16 个并发请求，脚本是前 16 次 `rate_limit`、之后 `ok`；mockrelay 记下每次重试到达的时间 | 重试的到达时间分布在 `[t0, until]` 里；排序后第 k 个的到达时间和 k 没有线性关系（相关系数接近 0，实测记录）；没有任何一个超出 until |
-| T-F5 | §1.2、§1.8 | 非流式请求、不命中的模型、`stream=false`，分别经 nahook 和直连 3001，各 100 次 | 响应逐字节一致；延迟差值实测并记录 |
-| T-F6 | §1.8 | 脚本 `ok`，经 nahook 和直连各一次 | 客户端拿到的字节一致；测试 NewAPI 的消费日志里 token 数和 quota 一致 |
-| T-F7 | §1.6 | 脚本 `http429`；测试 NewAPI `RetryTimes=0` | nahook 不重试（mockrelay 只收到 1 次）；客户端拿到的是 NewAPI 原样的 429 |
-| T-F8 | §1.7 | 把配置文件写坏后 `systemctl reload nahook-test` | 继续使用旧配置；日志里有 `config.reload_failed`；`retry get` 返回旧值 |
-| T-F9 | §0 前置约束 | 被拦截的那几次尝试，看测试 NewAPI 的日志和计费 | 实测记录：每次是否 $0、各记了几行日志 |
-| T-F10 | §6.1 | 对比经 nahook 和直连时，测试 NewAPI 日志里记录的客户端 IP | 一致（XFF、X-Real-IP 都没被改） |
-| T-F11 | §6.4 | 查看 `/run/nahook-test/ctl.sock` 的权限；用非 root 用户执行 `nahookctl` | 权限 0600；非 root 用户被拒 |
+| T-F5 | §1.2、§1.8 | 非流式请求、不命中的模型、`stream=false`，分别经 nahook 和直连 3000，各 100 次 | 响应逐字节一致；延迟差值实测并记录 |
+| T-F6 | §1.8 | 脚本 `ok`，经 nahook 和直连各一次 | 客户端拿到的字节一致；LT NewAPI 的消费日志里 token 数和 quota 一致 |
+| T-F7 | §1.6 | 脚本 `http429`；LT NewAPI 的 `RetryTimes` 临时设为 0，测完改回 | nahook 不重试（mockrelay 只收到 1 次）；客户端拿到的是 NewAPI 原样的 429 |
+| T-F8 | §1.7 | 把配置文件写坏后 `systemctl reload nahook` | 继续使用旧配置；日志里有 `config.reload_failed`；`retry get` 返回旧值 |
+| T-F9 | §0 前置约束 | 被拦截的那几次尝试，看 LT NewAPI 的日志和计费 | 实测记录：每次是否 $0、各记了几行日志 |
+| T-F10 | §6.1 | 对比经 nahook 和直连时，LT NewAPI 日志里记录的客户端 IP | 一致（XFF、X-Real-IP 都没被改） |
+| T-F11 | §6.4 | 查看 `/run/nahook/ctl.sock` 的权限；用非 root 用户执行 `nahookctl` | 权限 0600；非 root 用户被拒 |
 | T-F12 | §1.3 | 脚本 `quota` | 不拦截，原样放行 |
 | T-F13 | §1.3 | 脚本 `chat_rate_limit`，走 `/v1/chat/completions` | 被拦截，按上限重试 |
 | T-F14 | §1.3 | 脚本 `rate_limit_failed_only` | 被拦截 |
-| T-F15 | §1.3、2.5 | 测试 NewAPI 打开保活、间隔设到最小；脚本 `hold_rate_limit:5` 和 `stall_rate_limit:5` 各跑一次（PING 的两个来源：等上游响应头时，以及流式阶段） | 能正确拦截；放行的流里保留了 `: PING` |
+| T-F15 | §1.3、2.5 | LT NewAPI 临时打开保活、间隔设到最小（测完改回）；脚本 `hold_rate_limit:5` 和 `stall_rate_limit:5` 各跑一次（PING 的两个来源：等上游响应头时，以及流式阶段） | 能正确拦截；放行的流里保留了 `: PING` |
 | T-F16 | §1.2 | 请求体大于 64MiB | 透传，不拦截，NewAPI 正常处理（或按它自己的限制拒绝） |
-| T-F17 | §1.6 | 测试 NewAPI 打开心跳、间隔 1s，`RetryTimes=0`；脚本 `hold_http429:3` | mockrelay 只收到 1 次请求；客户端拿到 200 SSE：`: PING` 之后是 NewAPI 写的 `{"error":…}`，消息末尾是本次的 request id；nahook 计数 `passthrough` 加 1，`rate_limited` 不变 |
-| P-1 | 00 §1.1 阶段 1 | 生产环境护栏还开着时上线 nahook；观察 30 分钟 | nahook 只有透传、没有拦截；`/v1/responses` 的 p50 延迟和上线前比较（实测记录）；停掉 nahook 后请求不中断 |
-| P-2 | 00 §1.1 阶段 2 | 关掉护栏，等下一次限流 | journal 里出现 intercept 并接着 release 或 give_up；客户端拿到的要么是成功的流，要么是 HTTP 429，不会是 SSE 错误 |
-| P-3 | 00 §1.1 阶段 3 | 换成官方镜像 | 同 P-2；面板登录、渠道列表、日志页正常 |
+| T-F17 | §1.6 | LT NewAPI 临时打开心跳、间隔 1s，`RetryTimes=0`（测完改回）；脚本 `hold_http429:3` | mockrelay 只收到 1 次请求；客户端拿到 200：`: PING` 之后是 NewAPI 写的错误，消息末尾是本次的 request id；nahook 的 `rate_limited` 不变。LT 的 rc.45 用 `c.JSON` 把错误直接追加在流后面（没有 `data:`），nahook 读到 EOF 放行，计 `released` 加 1；带 `writeRelayStreamError` 的版本（`#7857` 起）写成 SSE 帧，按 request id 规则计 `passthrough` 加 1 |
+| P-1 | 00 §1.2 阶段 1 | 在生产主机上，护栏还开着时上线 nahook；观察 30 分钟 | nahook 只有透传、没有拦截；`/v1/responses` 的 p50 延迟和上线前比较（实测记录）；停掉 nahook 后请求不中断 |
+| P-2 | 00 §1.2 阶段 2 | 在生产主机上关掉护栏，等下一次限流 | journal 里出现 intercept 并接着 release 或 give_up；客户端拿到的要么是成功的流，要么是 HTTP 429，不会是 SSE 错误 |
+| P-3 | 00 §1.2 阶段 3 | 在生产主机上换成和 LT 相同 digest 的官方镜像 | 同 P-2；面板登录、渠道列表、日志页正常 |
 
 ## 3. CI 门禁
 
@@ -103,10 +103,11 @@ $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -tr
 
 | 编号 | 要查的点 | 现状 | 影响 |
 |---|---|---|---|
-| K1 | Caddy 2.6.2 加上 `flush_interval -1` 时，客户端断开会不会传到后端 | 文档写的是"不取消"；#4952 引入了这个行为，2024 年 11 月回退了（`自动调度/06-community.md` §3）。2.6.2 很可能受影响 | 决定生产路由（00 §6.1）写不写 `flush_interval -1`。如果不写也传不到，就要另外评估 nahook 是否需要一个单请求的总时限 |
+| K1 | Caddy 2.6.2 加上 `flush_interval -1` 时，客户端断开会不会传到后端 | 文档写的是"不取消"；#4952 引入了这个行为，2024 年 11 月回退了（`自动调度/06-community.md` §3）。2.6.2 很可能受影响 | 决定 nahook 路由（00 §6.1）写不写 `flush_interval -1`。如果不写也传不到，就要另外评估 nahook 是否需要一个单请求的总时限。由 T0 在 LT 上实测（`docs/T0/测试方案.md`） |
 | K2 | 真实中转站 api21 在流里报限流时帧长什么样：错误在 `error` 事件里还是 `response.failed` 里，前面有没有 `response.created` | 只知道 message 原文和 `type=tokens`、`code=rate_limit_exceeded`（`429-vs-quota.md`），没见过原始帧 | 影响 `upstreamError` 能不能取到错误。message 兜底规则能覆盖大多数形态。可以在阶段 2 开始后，让 nahook 把前几次拦截的原始帧截断后记日志来确认（这些帧里没有密钥） |
-| K3 | 阶段 3 要固定的官方镜像 digest | 还没定 | 测试 NewAPI 和生产要用同一个 digest |
-| K4 | 从官方镜像回退到 h3 时，数据库兼不兼容 | 官方相比 h3 基线改了 `model/usedata.go`，有新增列（`git diff 32e587406..206e0fa5c -- model/`） | 在测试环境验证：先用官方镜像建好 SQLite 库，再换 h3 镜像启动，做一轮冒烟 |
-| K5 | 生产 3000 端口能不能从公网访问 | 容器监听 `0.0.0.0:3000`，安全组情况不明 | 如果能访问，直连的客户端会绕过 nahook。需要用户在云控制台确认，或者从外网测一次 |
-| K6 | 测试 NewAPI 的"自用模式"能不能免去模型定价 | 还没验证 | 不行的话，测试实例就要给 `gpt-6-astra` 配上价格 |
-| K7 | 生产 NewAPI 有没有打开心跳（`general_setting.ping_interval_enabled`），间隔是多少 | 官方默认是关的（`NEWAPI/setting/operation_setting/general_setting.go:28`），生产上的值不清楚；由用户在面板的系统设置里看 | 打开时，NewAPI 的终态错误可能以 200 SSE 的形式出现，靠 design §1.6 的 request id 规则放行。只影响这种情况出现的频率，不影响正确性；T11 之前查清即可 |
+| K3 | 阶段 3 要固定的官方镜像 digest | **已定**：`calciumion/new-api@sha256:6c63c7ee9cd5bf7880df3984e99dd3ef07992d7a97538cfb2719adf9d87bc3f9`（`v1.0.0-rc.45`，源码 `6cf0d90b`），2026-10-21 起在 LT 上运行 | 生产阶段 3 用同一个 digest。要换别的版本，先在 LT 上重做 K4 并通过 T10 的相关审计项 |
+| K4 | h3 和官方 rc.45 之间来回切换时，数据库兼不兼容 | 正向已验证：h3 `38e69e3` = 官方 `32e587406` + 护栏提交，护栏没改表；rc.45 比 `32e587406` 旧 4 个提交，表结构上只差 `audit_logs` 的一个复合索引（`058c823`），启动迁移只建不删。2026-10-21 在 LT 上换镜像，启动迁移没有报错，渠道和设置都正常读到。回退方向（rc.45 → h3）从代码看兼容，还没在 LT 上实际切换过 | 生产阶段 3 的回退方案依赖它。T10 期间在 LT 上演练一次回退再切回来（各需用户同意） |
+| K5 | 生产主机的 3000 端口能不能从公网访问 | 容器监听 `0.0.0.0:3000`，安全组情况不明 | 如果能访问，直连的客户端会绕过 nahook。需要用户在云控制台确认，或者从外网测一次 |
+| K6 | LT 上测试令牌所在分组对 `gpt-6-astra` 的定价 | 还没查 | T-F6、T-F9 要看计费。定价缺失时请求会被 NewAPI 拒绝，T9 就要先补上价格 |
+| K7 | 生产主机的 NewAPI 有没有打开心跳（`general_setting.ping_interval_enabled`），间隔是多少 | 官方默认是关的（`NEWAPI/setting/operation_setting/general_setting.go:28`），生产上的值不清楚；由用户在面板的系统设置里看 | 打开时，NewAPI 的终态错误可能以 200 SSE 的形式出现，靠 design §1.6 的 request id 规则放行。只影响这种情况出现的频率，不影响正确性；T11 之前查清即可 |
+| K8 | 生产主机是哪台、怎么访问；它的基线是否和 LT 在 2026-10-21 之前一致（NewAPI h3 `38e69e3` 并打开护栏、Caddy 2.6.2 和相同的站点配置、`/root/container/luna-task/compose.yaml`、19080 空闲） | 用户告知"和 LT 一模一样"，还没核实 | 生产阶段（T11–T13）的全部步骤都以它为前提。由用户告知主机，并批准只读核查后再查 |

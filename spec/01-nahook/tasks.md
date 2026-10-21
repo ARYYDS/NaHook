@@ -8,26 +8,29 @@
 | 产物通过 GitHub Release 分发（design §7） | 已定 | — |
 | L-GO 车道由 Win11 上的 DSH 执行；任务书和开工提示词见 `docs/` | 已定 | — |
 | LT 上的每一次替换或安装 | 都要先请示用户 | 请示之前停在那一步 |
-| 用户在测试 NewAPI 上完成初始化：root 账号、自用模式、测试渠道、测试令牌（00 §6.3） | 待用户操作 | 能做到 T9 起容器；T10 跑不了 |
-| K1（Caddy 是否吞掉客户端断开） | 由 T0 实测 | 不影响写代码；影响 T11 的生产路由写法 |
-| K3（官方镜像 digest） | 部署当天确定 | 影响 T9 和 T13 |
+| LT 只做测试（2026-10-21 起和生产隔离），上面的 NewAPI 已是官方 rc.45 | 已确认 | — |
+| 用户在 LT 面板里建好测试渠道和测试令牌，并放进独立分组（00 §6.2） | 待用户操作 | 能做到 T9 装好 nahook 和 mockrelay；T10 跑不了 |
+| K1（Caddy 是否吞掉客户端断开） | 由 T0 实测 | 不影响写代码；影响 T5（要不要总时限）和 nahook 路由的写法 |
+| K3（官方镜像 digest） | 已定（audit §5） | — |
+| K8（生产主机是哪台、基线是否和 LT 改动前一致） | 待用户 | LT 上的工作都能做；T11–T13 开不了工 |
 | 每个生产阶段都要用户明确同意 | — | T11、T12、T13 前都要停下来等 |
 
 ## 1. 阶段与车道
 
 ```text
-          阶段 A：风险验证     阶段 B：开发                       阶段 C：测试环境     阶段 D：生产
-L-OPS  │ T0 Caddy 断开实验 │                                  │ T9 搭测试环境      │ T11 → T12 → T13
-       │                  │                                  │ T10 跑审计清单      │
-L-GO   │                  │ T1 → T2 → T3 → T4 → T7 → T6 → T5 → T8 │                  │
+          阶段 A：风险验证     阶段 B：开发                           阶段 C：测试环境（LT）  阶段 D：生产（生产主机）
+L-OPS  │ T0 Caddy 断开实验 │                                      │ T9 搭测试环境          │ K8 → T11 → T12 → T13
+       │（在 LT 上）       │                                      │ T10 跑审计清单          │
+L-GO   │                  │ T1 → T2 → T3 → T4 → T7 → T6 → T5 → T8 │                        │
                             （T5 开工前要等 00 G1，也就是 T0 的结论）
                             （Win11 上的 DSH 串行执行；每个任务交付后，由开发机另派审计）
-L-DOC                                                                               │ T14 运维手册
+L-DOC                                                                                         │ T14 运维手册
 ```
 
-- L-OPS 只改 LT 上的配置和 Caddyfile，不碰 Go 代码；L-GO 只改 nahook 仓库。两条车道可以并行。
+- L-OPS 只改主机上的配置和 Caddyfile，不碰 Go 代码；L-GO 只改 nahook 仓库。两条车道可以并行。
+- 阶段 A、C 在测试机 LT 上做；阶段 D 在生产主机上做，开工前先完成 K8。
 - T7、T6 不依赖 T0，排在 T5 前面，用来填 T0 结论出来之前的空档；T5 要等 G1，并依赖 T6 的 `obs`。
-- T9 依赖 T8 的产物；T11 依赖 T10 全部通过。
+- T9 依赖 T8 的产物和 G1；T11 依赖 T10 全部通过和 K8。
 
 ## 2. 任务
 
@@ -126,7 +129,7 @@ L-DOC                                                                           
 
 - [ ] **T8 构建、打包和第一次发布**（L-GO）
   - 前置：T5、T6、T7；Win11 上的 `gh auth login` 已完成
-  - 改动：构建脚本 `scripts/build.ps1`（构建 → 写 `BUILDINFO.txt` 和 `SHA256SUMS`）；`scripts/release.ps1`（`gh release create`）；`deploy/nahook.service`、`deploy/nahook-test.service`（两者都设 `UMask=0077`，design §6.4）、`deploy/mockrelay.service`、`deploy/config.example.json`、`deploy/test.example.json`
+  - 改动：构建脚本 `scripts/build.ps1`（构建 → 写 `BUILDINFO.txt` 和 `SHA256SUMS`）；`scripts/release.ps1`（`gh release create`）；`deploy/nahook.service`（设 `UMask=0077`，design §6.4）、`deploy/mockrelay.service`（只装在 LT 上）、`deploy/config.example.json`；单元内容见 00 §6.4
   - 依据：design §7（构建、产物、发布与分发流程）；00 §6.4 ｜ audit §3
   - 完成判据：
     - [ ] audit §3 的门禁都通过（在 Win11 的 `O:\NaHook` 上执行）
@@ -135,59 +138,60 @@ L-DOC                                                                           
     - [ ] 产物不进 git
   - 冲突：无
 
-- [ ] **T9 搭测试环境（甲）**（L-OPS，**每一步在 LT 上的操作都要请示用户**）
-  - 前置：T8 已发布 Release；K3；用户完成测试 NewAPI 的初始化
+- [ ] **T9 在 LT 上搭测试环境**（L-OPS，**每一步在 LT 上的操作都要请示用户**）
+  - 前置：T8 已发布 Release；00 G1（T0 的结论决定 nahook 路由写不写 `flush_interval -1`）；用户建好测试渠道和测试令牌（00 §6.2）
   - 改动：在 LT 上：
     - 从 Release `build-<8hex>` 下载到 `/root/nahook-dist/<8hex>/`，`sha256sum -c SHA256SUMS` 通过后，再安装到 `/usr/local/bin`；
-    - 安装 `nahook-test.service`、`mockrelay.service`；
-    - 起测试 NewAPI 容器（00 §6.3）；
-    - Caddyfile 加测试站点 19443（00 §6.2），reload
+    - 安装 `nahook.service`、`mockrelay.service`（00 §6.4）和 `/etc/nahook/config.json`（`retry.max=3`，`match.models` 包含 `gpt-6-astra`）；
+    - 备份 Caddyfile 后，在 `lt.xhub.chat` 站点里加 nahook 路由（00 §6.1），`caddy validate` 通过后 reload
   - 依据：00 §2、§6 ｜ audit §2
   - 完成判据：
-    - [ ] `curl 127.0.0.1:19443/api/status` 返回 200
-    - [ ] mockrelay 设为 `ok` 时，经 19443 能拿到完整的流
-  - 冲突：`/etc/caddy/Caddyfile`（见 §3）
+    - [ ] `https://lt.xhub.chat/api/status` 返回 200；`nahookctl stats` 能返回
+    - [ ] mockrelay 设为 `ok` 时，用测试令牌经 `lt.xhub.chat` 能拿到完整的流；mockrelay 的 `/__log` 有记录
+    - [ ] 隔离：用测试令牌发请求后，LT 上其他渠道没有新的调用（00 §6.2）
+  - 冲突：LT `/etc/caddy/Caddyfile`（见 §3）
 
-- [ ] **T10 在测试环境跑审计清单**（L-OPS）
+- [ ] **T10 在 LT 上跑审计清单**（L-OPS）
   - 前置：T9
-  - 改动：不改代码；只记录结果
-  - 依据：audit §2 的 T-C1–T-C4、T-F1–T-F16；audit K4、K6
+  - 改动：不改代码；只记录结果。临时改动的 LT 面板设置（`RetryTimes`、心跳），测完改回原值
+  - 依据：audit §2 的 T-C1–T-C4、T-F1–T-F17；audit K4、K6
   - 完成判据：
     - [ ] 每一项都有实测记录（命令、输出摘要、结论），写进 specaudit §3
-    - [ ] T-C1/T-C2 的结论回写到 00 §6.1，决定生产路由要不要 `flush_interval -1`
-  - 冲突：`/etc/caddy/Caddyfile`（切换 T-C1/T-C2 时）
+    - [ ] T-C1/T-C2 的结论回写到 00 §6.1，确认 nahook 路由要不要 `flush_interval -1`
+    - [ ] K4 的回退方向在 LT 上演练过一次：rc.45 → h3 → rc.45（各需用户同意）
+  - 冲突：LT `/etc/caddy/Caddyfile`（切换 T-C1/T-C2 时）
 
-- [ ] **T11 生产阶段 1：部署 nahook + Caddy 生产路由（护栏仍开着）**（L-OPS，**需要用户同意**）
-  - 前置：T10 全部通过
-  - 改动：安装 `nahook.service` 和 `/etc/nahook/config.json`（`retry.max=3`）；备份 Caddyfile 后加生产路由（00 §6.1），reload
-  - 依据：00 §1.1 阶段 1 ｜ audit P-1
+- [ ] **T11 生产阶段 1：部署 nahook + Caddy 路由（护栏仍开着）**（L-OPS，在生产主机上，**需要用户同意**）
+  - 前置：T10 全部通过；K8 已核对
+  - 改动：从同一个 Release 安装 `nahook.service` 和 `/etc/nahook/config.json`（`retry.max=3`）；备份 Caddyfile 后加 nahook 路由（00 §6.1，`flush_interval` 按 LT 上 T-C1/T-C2 的结论），reload
+  - 依据：00 §1.2 阶段 1 ｜ audit P-1
   - 完成判据：
     - [ ] P-1 通过
     - [ ] 回退演练：去掉路由后 reload，请求正常
-  - 冲突：`/etc/caddy/Caddyfile`
+  - 冲突：生产 `/etc/caddy/Caddyfile`
 
-- [ ] **T12 生产阶段 2：在 h3 上关护栏**（L-OPS，**需要用户同意**）
+- [ ] **T12 生产阶段 2：在 h3 上关护栏**（L-OPS，在生产主机上，**需要用户同意**）
   - 前置：T11
   - 改动：备份 `compose.yaml`；把 `RESPONSES_STREAM_STARTUP_GUARD_ENABLED` 设为 false；重建容器
-  - 依据：00 §1.1 阶段 2 ｜ audit P-2、K2
+  - 依据：00 §1.2 阶段 2 ｜ audit P-2、K2、K7
   - 完成判据：
     - [ ] P-2 通过
     - [ ] K2 确认了真实帧的形态
-  - 冲突：`/root/container/luna-task/compose.yaml`
+  - 冲突：生产 `/root/container/luna-task/compose.yaml`
 
-- [ ] **T13 生产阶段 3：换成官方镜像**（L-OPS，**需要用户同意**）
-  - 前置：T12 稳定运行（观察时长由用户定）；K4 通过；MySQL 已备份（用户操作）
-  - 改动：`compose.yaml` 改用固定 digest 的官方镜像，重建容器
-  - 依据：00 §1.1 阶段 3 ｜ audit P-3
+- [ ] **T13 生产阶段 3：换成官方镜像**（L-OPS，在生产主机上，**需要用户同意**）
+  - 前置：T12 稳定运行（观察时长由用户定）；K4 的回退方向已在 LT 上演练；MySQL 已备份（用户操作）
+  - 改动：`compose.yaml` 改用和 LT 相同 digest 的官方镜像（K3），删掉护栏开关这一行，重建容器。步骤和 LT 在 2026-10-21 的操作相同（specaudit §7.11）
+  - 依据：00 §1.2 阶段 3 ｜ audit P-3、K3、K4
   - 完成判据：
     - [ ] P-3 通过
     - [ ] 回退演练方案写进 T14
-  - 冲突：`/root/container/luna-task/compose.yaml`
+  - 冲突：生产 `/root/container/luna-task/compose.yaml`
 
 - [ ] **T14 运维手册**（L-DOC）
   - 前置：T11
   - 改动：`渠道监控/自动调度/` 不动；在 `渠道监控/` 下新增 `nahook-runbook.md`，内容包括 `nahookctl` 用法、三个阶段的回退步骤、日志怎么看
-  - 依据：design §5、§6.5；00 §1.1
+  - 依据：design §5、§6.5；00 §1.2
   - 完成判据：
     - [ ] 每个回退步骤都写到可以直接执行的命令
   - 冲突：无
@@ -196,9 +200,11 @@ L-DOC                                                                           
 
 | 文件 | 本 SPEC 的任务 | 合并顺序 |
 |---|---|---|
-| LT `/etc/caddy/Caddyfile` | T0（临时站点）、T9（测试站点）、T10（切换 `-1`）、T11（生产路由） | T0 → T9 → T10 → T11；每次改之前先备份，改完用 `caddy validate` 检查后再 reload |
-| LT `/root/container/luna-task/compose.yaml` | T12、T13 | T12 → T13 |
-| LT `/etc/nahook/*.json` | T9、T11；运行期间由 nahookctl 写入 | 部署之后只允许通过 nahookctl 修改 |
+| LT `/etc/caddy/Caddyfile` | T0（临时站点）、T9（nahook 路由）、T10（切换 `-1`） | T0 → T9 → T10；每次改之前先备份，改完用 `caddy validate` 检查后再 reload |
+| LT `/etc/nahook/config.json` | T9；运行期间由 nahookctl 写入 | 部署之后只允许通过 nahookctl 修改 |
+| 生产 `/etc/caddy/Caddyfile` | T11 | 改之前先备份，`caddy validate` 通过后再 reload |
+| 生产 `/root/container/luna-task/compose.yaml` | T12、T13 | T12 → T13 |
+| 生产 `/etc/nahook/config.json` | T11；运行期间由 nahookctl 写入 | 部署之后只允许通过 nahookctl 修改 |
 | nahook 仓库 | T1–T8 | 车道内串行 |
 
 全局锁表以 `00-总体架构/tasks.md` §3 为准。
@@ -207,5 +213,5 @@ L-DOC                                                                           
 
 - [ ] audit §2 的每一项都有实测记录
 - [ ] audit §3 的 CI 门禁已经接入构建脚本
-- [ ] audit §5 的 K1–K6 全部查清，并已回写 design 和 interface，在 specaudit 里销项
+- [ ] audit §5 的 K1–K8 全部查清，并已回写 design 和 interface，在 specaudit 里销项
 - [ ] 生产三个阶段都完成，并且都做过回退演练（或者用户明确免掉）
