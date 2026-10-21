@@ -421,3 +421,31 @@ SPEC 落点：
 | K1 销项；T-C1、T-C2 改用 HTTP/2，并写明两者的预期 | 01 audit §2、§5 |
 | G1、T0 完成；T5 的前置满足 | 00 tasks G1；01 tasks T0、T5 |
 | 补上 `cmd/nahook` 的规定（启动顺序、SIGHUP 日志、SIGTERM 时 Shutdown、退出码），T5 开工前补全 | 01 design §6.8；01 tasks T5 |
+
+### 7.13 T5 审计（提交 `e84039e`，由架构侧直接审计、直接修复）
+
+DSH 交付回报里的自行决定和风险点，架构侧的裁决：
+
+| 事项 | 裁决 | 回写位置 |
+|---|---|---|
+| `classify` 的返回约定（整包读完时 `rest` 为 nil；超限时返回 `MultiReader`） | 采纳，和 design §1.2 一致 | — |
+| `forward` 不复制 `Host`、`Content-Length` 两个头（由请求字段承载） | 采纳 | — |
+| `joinPath`：`newapi` 带路径时不沿用客户端的 RawPath | 采纳；部署时 `newapi` 不带路径 | — |
+| `isEventStream` 用 `mime.ParseMediaType` | 采纳 | — |
+| 测试缝：`Handler.client` 可替换；`runWithSignals` 接收信号通道 | 采纳 | — |
+| 启动失败的事件名 `startup_failed`；配置读取或校验失败写 stderr | 采纳 | 01 design §5、§6.8 |
+| `NewHandler` 遇到解析不了的 `newapi` 时退化成空地址 | 采纳（`Validate` 已挡住） | — |
+| 请求进行中热改上限只在代码路径上成立 | 接受，由 T-F3 在 LT 上验证 | — |
+| SIGHUP 没有进程内测试 | 接受，由 T-F8 在 LT 上验证 | — |
+| 读启动帧时客户端断开要不要计 `client_gone` | 要：见下表 N-c | 01 design §1.6、§6.7；interface §3 |
+| `release` 先打日志再写 | 接受 | — |
+
+审计发现的问题，在 `audit/T5` 分支上修复：
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| N-a | P2 | 数据面的 `http.Client` 会自动跟随重定向：NewAPI 回 3xx 时，nahook 自己去请求新地址，碰到 301/302 还会把 POST 改成 GET，客户端拿不到原始的 3xx | `CheckRedirect` 返回 `http.ErrUseLastResponse` |
+| N-b | P3 | 客户端没带 `User-Agent` 时，net/http 会补上 `Go-http-client/1.1`，NewAPI 看到的请求和直连时不一样 | 显式设成空值 |
+| N-c | P3 | 读启动帧时客户端断开：`startup.Read` 因读错误返回放行，代码计 `released`、调 `ResetModel` 清零这个模型的冷却门，并往已断开的连接里写 | 放行分支先看 `r.Context()`：已取消就计 `client_gone`，不写，也不 `ResetModel` |
+
+修复提交 `c6464a2`。Win11 门禁：gofmt 无输出；vet 退出码 0；`go test -race ./...` 十个包全部 ok，顶层 127 个 PASS、0 个 FAIL、1 个 SKIP（`TestSocketMode`，只在 Linux 上做）；`internal/proxy`、`cmd/nahook` 连跑 5 轮稳定；反证：把 `proxy.go`、`intercept.go` 换回 `e84039e` 的版本，三个新测试全部失败（写出了响应并把 streak 从 1 清成 0；客户端拿到 200 而不是 302；NewAPI 收到 `Go-http-client/1.1`）；linux/amd64 交叉编译和 vet 退出码 0；go.mod 没有 require；行尾全部是 LF。

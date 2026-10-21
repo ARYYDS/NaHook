@@ -234,6 +234,8 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
         # 同样不会叠加重试，只是走下面的 VerdictRelease 分支、计 Released
         h.st.Inc(obs.Passthrough); release(w, resp, res.Prefix, res.Rest); return
     if res.Verdict == startup.VerdictRelease:
+        if r.Context().Err() != nil:                     # 读启动帧时客户端走了，Read 因读错误返回放行：
+            resp.Body.Close(); h.st.Inc(obs.ClientGone); return   # 不写响应，也不能 ResetModel（没有真正放行）
         h.gates.ResetModel(meta.Model)                   # 这个模型下所有 key 的 streak 清零（§6.3）
         h.st.Inc(obs.Released); log release{request_id: rid, attempt: n}
         release(w, resp, res.Prefix, res.Rest); return
@@ -498,6 +500,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `config.retry_max_changed` | `scope`、`old`、`new`、`uid` |
 | `config.reloaded` | `uid` |
 | `config.reload_failed` | `error` |
+| `startup_failed` | `component`（`data` 或 `control`）、`error`；配置读取或校验失败发生在建 logger 之前，写到 stderr，不走这个事件 |
 
 ### 存储位置
 
@@ -518,7 +521,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 |---|---|
 | `NewHandler(store *config.Store, gates *gate.Registry, st *obs.Stats, log *slog.Logger) *Handler` | 用 `newapi` 地址构造 `http.Transport{DisableCompression: true, MaxIdleConns: 2000, MaxIdleConnsPerHost: 2000, IdleConnTimeout: 10m}` |
 | `(*Handler).ServeHTTP` | 调 `classify`；拦截走 `serveIntercept`，否则走 `forward` + `passthrough` |
-| `forward(ctx, r, body)` | 用 `http.NewRequestWithContext` 新建请求：方法照抄；URL 是 `newapi` 地址加上 `r.URL` 的路径（含 `RawPath`）和 `RawQuery`，不设 `RequestURI`（客户端请求设了会报错）；`Host = r.Host`（Caddy 默认原样转发 Host，NewAPI 现在看到的就是它）；请求头去掉逐跳头后原样复制，再设 `Accept-Encoding: identity`（`startup.Read` 要读明文；走到 nahook 的只有 relay 路由，NewAPI 在 relay 路由上不压缩，gzip 只挂在 `NEWAPI/router/api-router.go:20`、`dashboard.go:13`、`web-router.go:23`）。请求体：`body` 是 `*bytes.Reader` 时，`ContentLength` 和 `GetBody` 由 `http.NewRequestWithContext` 自动设好（Go net/http 对 `*bytes.Reader` 的特殊处理）；否则（流式透传）手动设 `ContentLength = r.ContentLength`，不设 `GetBody`。**不改动** `X-Forwarded-For`、`X-Real-IP`、`Authorization` |
+| `forward(ctx, r, body)` | 用 `http.NewRequestWithContext` 新建请求：方法照抄；URL 是 `newapi` 地址加上 `r.URL` 的路径（含 `RawPath`）和 `RawQuery`，不设 `RequestURI`（客户端请求设了会报错）；`Host = r.Host`（Caddy 默认原样转发 Host，NewAPI 现在看到的就是它）；请求头去掉逐跳头后原样复制，再设 `Accept-Encoding: identity`（`startup.Read` 要读明文；走到 nahook 的只有 relay 路由，NewAPI 在 relay 路由上不压缩，gzip 只挂在 `NEWAPI/router/api-router.go:20`、`dashboard.go:13`、`web-router.go:23`）。请求体：`body` 是 `*bytes.Reader` 时，`ContentLength` 和 `GetBody` 由 `http.NewRequestWithContext` 自动设好（Go net/http 对 `*bytes.Reader` 的特殊处理）；否则（流式透传）手动设 `ContentLength = r.ContentLength`，不设 `GetBody`。**不改动** `X-Forwarded-For`、`X-Real-IP`、`Authorization`。客户端没带 `User-Agent` 时显式设成空值，否则 net/http 会补上 `Go-http-client/1.1`（`httputil.ReverseProxy` 也这样做）。`http.Client` 设 `CheckRedirect` 返回 `http.ErrUseLastResponse`：3xx 原样交给客户端，不跟随（net/http 跟随 301/302 时会把 POST 改成 GET；NewAPI 自己的转发也这样关掉了，`NEWAPI/relay/channel/api_request.go` 的 `keepUpstreamRedirectResponse`） |
 | 逐跳头 | `Connection`、`Keep-Alive`、`Proxy-Connection`、`Proxy-Authenticate`、`Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`，以及 `Connection` 头里点名的字段（RFC 9110 §7.6.1） |
 | `writeBadGateway` | 回 502 `{"error":{"message":"nahook: upstream unavailable","type":"nahook_error","param":"","code":"upstream_unavailable"}}` |
 
@@ -641,7 +644,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `GaveUp` | `gave_up` | 返回代 429 |
 | `Passthrough` | `passthrough` | 不拦截的请求转发成功；或拦截路径上 NewAPI 回了非 200 或非 SSE |
 | `BadGateway` | `bad_gateway` | 连不上 NewAPI，回了 502 |
-| `ClientGone` | `client_gone` | `forward` 或 `Wait` 因为 `r.Context()` 取消而返回 |
+| `ClientGone` | `client_gone` | `forward`、启动帧读取或 `Wait` 因为 `r.Context()` 取消而结束 |
 
 不变量：`rate_limited = retries + gave_up`（每次判为限流后，恰好走这两条路中的一条）；每个被拦截的请求恰好以 `released`、`gave_up`、`passthrough`、`bad_gateway`、`client_gone` 之一结束。
 
@@ -652,7 +655,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | 参数 | `-config PATH`，默认 `/etc/nahook/config.json` |
 | 启动顺序 | `config.Load` → `Validate` → `config.NewStore` → `obs.NewLogger(os.Stdout)`、`obs.NewStats` → `gate.NewRegistry` → `proxy.NewHandler(store, gates, stats, log)` → 启动 `control.Serve(ctx, cfg.ControlSocket, store, gates, stats, log)` → 启动数据面 `http.Server{Addr: cfg.Listen, Handler: h}`。同一个 `log` 传给 proxy 和 control，不调用 `slog.SetDefault` |
 | 数据面 `http.Server` | 不设 `ReadTimeout`、`WriteTimeout`（流式响应，§4）；只监听 `127.0.0.1`，前面是 Caddy |
-| 启动失败 | 配置读不到或校验不过、数据面或控制口监听失败：打一条错误日志后以退出码 1 退出，由 systemd 的 `Restart=always` 重启 |
+| 启动失败 | 配置读不到或校验不过：写一行到 stderr（这时还没有 logger），退出码 1。数据面或控制口监听失败：打 `startup_failed`（§5），退出码 1。都由 systemd 的 `Restart=always` 重启 |
 | SIGHUP | 调 `store.Reload()`。成功打 `config.reloaded`，失败打 `config.reload_failed`，字段同 §5；信号没有对端，`uid` 记 `-` |
 | SIGTERM、SIGINT | 取消 control 的 ctx；对数据面调 `Server.Shutdown`，不另设超时：已经在流式输出的请求会等它结束，最长由 systemd 的 `TimeoutStopSec`（默认 90s）兜底。监听一关，Caddy 就会按 `lb_policy first` 把新请求交给 NewAPI（00-总体架构 §3.2） |
 | 退出码 | 正常停止 0；启动失败 1 |
