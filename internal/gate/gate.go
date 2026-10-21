@@ -82,6 +82,10 @@ func (g *Gate) OnReleased() {
 	g.streak.Store(0)
 }
 
+// jitter draws the full-jitter wait from [0, remain). Tests replace it to pin
+// the draw; production always uses rand.N.
+var jitter = rand.N[time.Duration]
+
 // Wait sleeps for a uniformly random duration in [0, until-now) and returns nil,
 // or returns ctx.Err() as soon as ctx is done, whichever happens first
 // (design §1.5).
@@ -91,7 +95,7 @@ func (g *Gate) Wait(ctx context.Context) error {
 		return nil
 	}
 
-	t := time.NewTimer(rand.N(remain))
+	t := time.NewTimer(jitter(remain))
 	defer t.Stop()
 
 	select {
