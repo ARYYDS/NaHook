@@ -68,7 +68,7 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 
 | nahook 接口 | 签名 | 对照 | 说明 |
 |---|---|---|---|
-| `(*Gate).OnRateLimit` | `func (g *Gate) OnRateLimit(elapsed, floor time.Duration, streakCap int32)` | `渠道监控/4-4-tpm-retry.md` §7（等待要能被取消、下限约 50ms）；NewAPI 里没有对应函数 | 冷却截止时间用 CAS 取最大值 |
+| `(*Gate).OnRateLimit` | `func (g *Gate) OnRateLimit(elapsed, floor time.Duration, streakCap int32)` | `渠道监控/4-4-tpm-retry.md` §7（等待要能被取消、下限约 50ms）；NewAPI 里没有对应函数 | 冷却截止时间用 CAS 取最大值；streak 用 CAS 加 1 且不超过 `streakCap`；base 取 `min(max(elapsed, floor), maxBase)`，窗口用这个本地值算（design §1.5） |
 | `(*Gate).OnReleased` | `func (g *Gate) OnReleased()` | — | — |
 | `(*Gate).Wait` | `func (g *Gate) Wait(ctx context.Context) error` | 写法上参照 `NEWAPI/relay/helper/common.go:90` `StartStreamKeepAlive` 里"计时器 + ctx"的 select 结构 | 全抖动 `rand.N(remain)` |
 | `(*Registry).Get` / `ResetModel` / `Snapshot` | `Get(key string) *Gate`；`ResetModel(model string)`；`Snapshot() []GateStat` | — | `sync.Map` |
@@ -116,7 +116,7 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 | `IsRateLimit` | `e` 来自 `upstreamError` | 同一个输入，结果和 h3 的 429 分支一致（只除了 `insufficient_quota`） | — |
 | `serveIntercept` | `body` 是完整缓存下来的请求体 | 在 `release` 或 `proxy429.Write` 之前 `w` 没有被写过；每次尝试只发一次上游请求；`n ≤ RetryMax` | ctx 被取消 → 不写响应，直接返回；连不上 NewAPI → 502 |
 | `(*Gate).Wait` | — | 等待时长 < `until - now`；只用自己的计时器 | ctx 被取消 → 返回 `ctx.Err()` |
-| `(*Gate).OnRateLimit` | `elapsed ≥ 0` | `until` 只增不减；`streak ≤ streakCap` | — |
+| `(*Gate).OnRateLimit` | `elapsed ≥ 0` | `until` 只增不减；存下来的 `streak` 始终 ≤ `streakCap`；`base ≤ maxBase`，所以 `base << (s-1)` 不会溢出 | — |
 | `(*Store).SetRetryMax` | `n ≥ 0`，scope 不为空 | 文件内容和内存快照一致；数据面读不到中间状态 | 校验失败，或 rename 之前写盘失败 → 快照不变，返回错误；rename 之后目录 fsync 失败 → 快照切换，返回 `ErrDirSync` |
 | `proxy429.Write` | `w` 没被写过 | 状态码 429；`Content-Type` 和响应体格式与 NewAPI 一致 | — |
 | `control.Serve` | 由 systemd 创建好 `RuntimeDirectory` | socket 权限 0600 | Listen 失败 → 进程退出，systemd 自动重启 |

@@ -196,3 +196,24 @@ DSH 交付回报里自己做的决定和提出的风险，架构侧的裁决：
 | G4 | P2 | 没有 h3 的 failed 兜底 | 补上 |
 | G5 | P2 | code 原样保留：`429.0` 判定不中，输出也和 h3 不一样 | `canonical` 加 `codeText` |
 | G6 | P3 | `response.status` 声明成 string：status 不是字符串时整帧解析失败 | 改成 `json.RawMessage`，再用 `stringValue` 取值 |
+
+### 7.6 T3 审计（提交 `96203f1`，由架构侧直接审计、直接修复）
+
+DSH 交付回报里的风险点和自行决定，架构侧的裁决：
+
+| 事项 | 裁决 | 回写位置 |
+|---|---|---|
+| 存下来的 streak 不封顶（stats 会显示超过 streak_cap，累加到 2^31 会溢出） | 封顶：用 CAS 加 1，且不超过 streakCap。§1.5 和 §4 的写法统一 | 01 design §1.5；interface 2.3、§3 |
+| Snapshot 是否列出从没被拦截过的 key | 全部列出。拦截期过后 streak 归零，但 until 和 base 还能说明最近发生过什么，便于运维 | — |
+| `Wait` 的测试按墙钟计时，留 150ms 容差 | 接受，不为此注入时钟 | — |
+| `Key` 的正则区分大小写，只认 `org-` 前缀 | 维持 SPEC 原样。认不出 org 时退化为 `model|-`，这是允许的降级 | — |
+| `ResetModel` 依赖 `model|` 这个约定 | 维持。模型名本身带 `|` 时前缀可能误匹配，目前没有这样的模型名，记为已知限制 | — |
+| 按 key 排序、`s<1` 的保护、`remain≤0` 时不看 ctx、`LoadOrStore` 写法 | 全部采纳 | — |
+
+审计发现的问题，都在 `audit/T3` 分支上修复：
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| J1 | P2 | `OnRateLimit` 存完 base 又从原子变量里读回来算窗口。并发时可能拿到另一个写者存的 base | 用本地值算窗口 |
+| J2 | P2 | 存下来的 streak 不封顶 | 用 CAS 加 1，且不超过 streakCap |
+| J3 | P2 | base 没有上限。`gate.base_floor_ms` 只校验了 ≥ 0，配置一个很大的值时 `base << (s-1)` 会溢出；elapsed 在 Caddy 不传断开时（K1）理论上也没有上限 | gate 里取 `min(…, 30m)`；config 校验 `base_floor_ms ≤ 1800000`。两处用的是 §6.4.1 同一个推导 |
