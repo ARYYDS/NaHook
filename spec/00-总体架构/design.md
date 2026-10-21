@@ -134,14 +134,16 @@ LT 上测试令牌对应的上游渠道是 mockrelay（§6.2）。
 ### 3.2 nahook 进程挂了
 
 ```text
-Caddy ─dial 127.0.0.1:19080 被拒─► 被动健康检查记一次失败（fail_duration 10s，max_fails 默认 1）→ 19080 不可用
-      ─► 间隔 lb_try_interval（默认 250ms）后重试，lb_policy first 选到 NewAPI :3000 ─► 官方原样行为
-      （连接失败时 POST 也一定会重试：Caddy reverse_proxy 文档 lb_retry_match 一节）
-health_interval 10s 内主动检查也把 nahook 标记为不健康 → 之后的请求直接走 NewAPI
-nahook 恢复后：下一次主动检查成功、被动失败计数 10s 过期，流量自动回来
+请求 1  ─► Caddy ─dial 127.0.0.1:19080 被拒─► 立即 502（nahook 路由不重试）
+                  └ 被动健康检查记一次失败（fail_duration 10s，max_fails 默认 1）→ 19080 不可用
+请求 2… ─► Caddy ─lb_policy first 跳过 19080─► NewAPI :3000 ─► 官方原样行为
+health_interval 10s 内主动检查也把 nahook 标记为不健康 → 被动计数过期以后仍然直接走 NewAPI
+nahook 恢复后：下一次主动检查成功、被动失败计数过期，流量自动回来
 ```
 
-没有 `fail_duration` 时，连接被拒不会被记成失败，`first` 每次重试都重新选中 19080，直到 `lb_try_duration` 用完，返回 502（§6.1；T10 T-C4 实测 5.03s 后 502）。
+- nahook 路由不能靠重试回落：Go 的 Transport 在连接失败时也会关闭请求体，Caddy 2.6.2 重试时往 3000 写请求体会失败（`body closed by handler`），这次失败还记在 3000 头上，把 3000 也标成不可用，nahook 路由 10s 内全部 503（T10 T-C4 第二次实测）。Caddy 维护者的说法是 POST 要重试就得先缓冲请求体（caddyserver/caddy#5454，以 not planned 关闭）；为罕见的崩溃场景让所有请求都先在 Caddy 里缓冲，不划算。
+- 只配主动检查、不配 `fail_duration` 时，连接被拒不会被记成失败，`first` 每次重试都重新选中 19080，直到 `lb_try_duration` 用完才返回 502（T10 T-C4 第一次实测：5.03s 后 502）。
+- 代价：nahook 崩溃时正在处理的请求，以及发现它连不上的第一个请求，收到 502；之后的请求不受影响。
 
 ### 3.3 LT 上的测试链路
 
@@ -191,7 +193,6 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 	handle @stream_relay {
 		reverse_proxy 127.0.0.1:19080 localhost:3000 {
 			lb_policy       first
-			lb_try_duration 5s
 			health_uri      /api/status
 			health_interval 10s
 			health_timeout  5s
@@ -211,10 +212,10 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 ```
 
 - **不写 `flush_interval`。** 写了 `-1` 以后，Caddy 2.6.2 会把发往后端的请求上下文换成 `ignoreClientGoneContext`（caddy v2.6.2 `modules/caddyhttp/reverseproxy/reverseproxy.go:802-803`），客户端断开不会取消发给 nahook 的请求。nahook 在等待和重试期间不写任何字节，Caddy 也就没有机会通过写失败发现断开。T0 实测：写了 `-1` 的组合，客户端断开 18 秒后后端连接仍然开着；不写的组合，后端在 1ms 内就看到连接关闭（`specaudit.md` §7.12）。不写也不影响流式输出：上游响应是 `text/event-stream` 时，Caddy 会立即 flush（同版本 `streaming.go:133-137`）。T-C1、T-C2 在 LT 的完整链路上用 HTTP/2 复测。
-- **要写 `fail_duration 10s`。** caddy v2.6.2 没配 `fail_duration` 时，`countFailure` 直接返回（`modules/caddyhttp/reverseproxy/healthchecks.go`），`Upstream.Healthy()` 只在配了被动检查时才看失败次数（`hosts.go`），所以 nahook 挂掉以后、主动检查发现之前，`first` 每次重试都选中 19080，请求等满 `lb_try_duration` 后收到 502（T10 T-C4）。配上以后，第一次连接被拒就把 19080 标为不可用，重试改选 3000。客户端主动断开不算失败（`proxyLoopIteration` 排除了 `context.Canceled`）；默认路由没有配被动检查，不受 localhost:3000 失败计数的影响。
-- 除 `lb_policy` 和 `fail_duration` 外，其余参数沿用各自主站点现有的配置。
+- **写 `fail_duration 10s`，不写 `lb_try_duration`。** caddy v2.6.2 没配 `fail_duration` 时，`countFailure` 直接返回（`modules/caddyhttp/reverseproxy/healthchecks.go`），`Upstream.Healthy()` 只在配了被动检查时才看失败次数（`hosts.go`），所以 nahook 挂掉以后、主动检查发现之前，`first` 每次重试都选中 19080。配上 `fail_duration` 以后，第一次连接被拒就把 19080 标成不可用，后面的请求改选 3000。不写 `lb_try_duration`（不重试）是因为重试时请求体已经被关闭，见 §3.2。客户端主动断开不算失败（`proxyLoopIteration` 排除了 `context.Canceled`）；默认路由没有配被动检查，不受 localhost:3000 失败计数的影响。
+- 除 `lb_policy`、`fail_duration` 和不写 `lb_try_duration` 外，其余参数沿用各自主站点现有的配置。
 - nahook 会把 `/api/status` 透传给 NewAPI，所以健康检查对两个上游都有效。
-- 在 LT 上由 T9 加入（`fail_duration` 在 T10 补上）；在生产主机上由阶段 1（T11）加入。
+- 在 LT 上由 T9 加入（`fail_duration` 和去掉 `lb_try_duration` 是 T10 改的）；在生产主机上由阶段 1（T11）加入。
 
 **待拍板：主站点默认路由的 `flush_interval -1` 和站点层 `encode`（两台主机，specaudit §4 D1）**
 
@@ -303,4 +304,5 @@ WantedBy=multi-user.target
 | 改完 Caddyfile 用 restart | 现有连接会被断开 | `systemctl reload caddy`（优雅重载） |
 | 照抄主站点，在 nahook 路由里写 `flush_interval -1` | 客户端断开传不到 nahook，nahook 会在客户端走后继续等待和重试，直到用完上限 | 不写（§6.1；T0 实测） |
 | nahook 路由只配主动健康检查，不配 `fail_duration` | nahook 挂掉以后、下一次主动检查之前（最多 10s），每个请求都在 19080 上重试满 `lb_try_duration`（5s）后收到 502 | 写 `fail_duration 10s`（§3.2、§6.1；T10 T-C4） |
+| nahook 路由照抄主站点的 `lb_try_duration 5s`，指望重试回落到 3000 | Caddy 2.6.2 重试 POST 时请求体已被关闭，写给 3000 失败，3000 也被记一次失败；nahook 路由 10s 内全部 503 | 不写 `lb_try_duration`（§3.2；caddyserver/caddy#5454；T10 T-C4） |
 | 生产的 3000 端口对公网开放 | 客户端直连就绕过了 nahook | 在安全组或防火墙上关掉 3000 的公网入口（`01-nahook/audit.md` §5 K5） |

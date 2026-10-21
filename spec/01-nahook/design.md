@@ -309,6 +309,9 @@ func copyFlush(w, src)
   for { n, err := src.Read(buf); if n > 0 { w.Write(buf[:n]); http.NewResponseController(w).Flush() }; if err != nil { return } }
 ```
 
+- 拦截路径上，判定之前客户端收不到任何字节：启动帧、NewAPI 的 `: PING`，以及重试和冷却等待的整段时间都不写 `w`（audit §1 第一条要点）。这些字节在放行时随 `prefix` 一次写出（T10 T-F15：客户端 11.9s 内没有收到字节，放行时 3 行 `: PING` 和 `response.created` 同时到达）。代价是客户端在启动阶段看不到心跳（specaudit Q19）。
+- `prefix` 只用一次 `Write` 写出，所以 Caddy 收到的首次写入就是启动阶段读到的全部字节（specaudit Q18）。
+
 ## §2 架构
 
 ### 逻辑架构

@@ -21,7 +21,7 @@ T-C、T-F 都在测试机 LT 上做（00-总体架构 §2）：经 `lt.xhub.chat
 | T-C1 | 00 §6.1 | LT 的 nahook 路由临时**写上** `flush_interval -1`；mockrelay 设为 `hold:30`；`curl --http2 --max-time 2` 经 `lt.xhub.chat` 发请求（T0 只测了 HTTP/1.1，这里补上 HTTP/2） | 实测记录 nahook 的 `r.Context()` 是否在 2s 左右被取消（看 nahook 日志里的 `client_gone` 计数，以及 `ss -tn` 里 nahook 到 `127.0.0.1:3000` 的连接是否关闭） |
 | T-C2 | 00 §6.1 | 同上，但去掉 `flush_interval -1` 后 reload（这是正式配置） | 约 2s 内被取消；nahook 不再重试；到 3000 的连接被关闭。T-C1 预期相反：按 T0 的结论，2s 时不会取消 |
 | T-C3 | 00 §3.3 | mockrelay 设为 `slow:30`；进入流式阶段后断开 | LT 的 NewAPI 日志里这次流的结束原因是 `client_gone` |
-| T-C4 | 00 §3.2 | `systemctl stop nahook` 后立即发请求，12s 后再发一次；然后启动 nahook | 停掉后的第一个请求就由 3000 完成（不能是等满 `lb_try_duration` 后的 502）；10s 内 Caddy 把 19080 标为不健康；启动 nahook 后流量自动回来 |
+| T-C4 | 00 §3.2 | `systemctl stop nahook` 后立即连发 3 个请求，12s 后再发一次；然后启动 nahook | 停掉后的第一个请求立即收到 502（不能等满 5s），之后的请求由 3000 完成（不能是 503）；10s 内 Caddy 把 19080 标为不健康；启动 nahook 后流量自动回来 |
 | T-F1 | §1.4 | 同一条 `rate_limit` 脚本：先经 LT 的 nahook（上限设为 0），再直连 h3 对照实例 3002（护栏打开，`RetryTimes=0`），分别抓客户端拿到的完整响应 | 状态码、`Content-Type`、响应体逐字节一致（`X-Oneapi-Request-Id` 的值除外） |
 | T-F2 | §1.6 | 上限设为 2；脚本是 `rate_limit` × 10 | mockrelay 恰好收到 3 次请求；客户端拿到代 429 |
 | T-F3 | §1.7 | 上限 3；脚本 `rate_limit` × 10；在第 1 次拦截后执行 `nahookctl retry set 1 --model gpt-6-astra` | 这个请求一共只打 2 次就拿到代 429；配置文件里是新值；日志里有一条 `config.retry_max_changed` |
@@ -38,7 +38,7 @@ T-C、T-F 都在测试机 LT 上做（00-总体架构 §2）：经 `lt.xhub.chat
 | T-F14 | §1.3 | 脚本 `rate_limit_failed_only` | 被拦截 |
 | T-F15 | §1.3、2.5 | LT NewAPI 临时打开保活、间隔设到最小（测完改回）；脚本 `hold_rate_limit:5` 和 `stall_rate_limit:5` 各跑一次（PING 的两个来源：等上游响应头时，以及流式阶段） | 能正确拦截；放行的流里保留了 `: PING` |
 | T-F16 | §1.2 | 请求体大于 64MiB | 透传，不拦截，NewAPI 正常处理（或按它自己的限制拒绝） |
-| T-F17 | §1.6 | LT NewAPI 临时打开心跳、间隔 1s，`RetryTimes=0`（测完改回）；脚本 `hold_http429:3` | mockrelay 只收到 1 次请求；客户端拿到 200：`: PING` 之后是 NewAPI 写的错误，消息末尾是本次的 request id；nahook 的 `rate_limited` 不变。LT 的 rc.45 用 `c.JSON` 把错误直接追加在流后面（没有 `data:`），nahook 读到 EOF 放行，计 `released` 加 1；带 `writeRelayStreamError` 的版本（`#7857` 起）写成 SSE 帧，按 request id 规则计 `passthrough` 加 1 |
+| T-F17 | §1.6 | NewAPI 临时打开心跳、间隔调到最小，`RetryTimes=0`（测完改回）；脚本 `hold_http429:3`。LT 的 rc.45 和 h3 对照实例（3002）各跑一次 | mockrelay 只收到 1 次请求；客户端拿到 200，`: PING` 之后是 NewAPI 写的错误；nahook 的 `rate_limited` 不变。rc.45 用 `c.JSON` 把错误直接追加在流后面（没有 `data:`，消息末尾也没有 request id），nahook 读到 EOF 放行，`released` 加 1；h3（带 `writeRelayStreamError`，`#7857` 起）写成 SSE 错误帧、消息末尾是本次的 request id，按 request id 规则放行，`passthrough` 加 1 |
 | P-1 | 00 §1.2 阶段 1 | 在生产主机上，护栏还开着时上线 nahook；观察 30 分钟 | nahook 只有透传、没有拦截；`/v1/responses` 的 p50 延迟和上线前比较（实测记录）；停掉 nahook 后请求不中断 |
 | P-2 | 00 §1.2 阶段 2 | 在生产主机上关掉护栏，等下一次限流 | journal 里出现 intercept 并接着 release 或 give_up；客户端拿到的要么是成功的流，要么是 HTTP 429，不会是 SSE 错误 |
 | P-3 | 00 §1.2 阶段 3 | 在生产主机上换成和 LT 相同 digest 的官方镜像 | 同 P-2；面板登录、渠道列表、日志页正常 |

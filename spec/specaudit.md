@@ -32,7 +32,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
 | Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 已关闭：消息末尾是本次 request id 时原样放行（design §1.6、§8；T-F17）；生产上的心跳设置待 K7 |
 | Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 待 K8（用户告知主机并批准只读核查） |
-| Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 设计已改（00 §3.2、§6.1、§8：`fail_duration 10s`）；LT 待用户装上后复测 T-C4 |
+| Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 设计已改（00 §3.2、§6.1、§8：`fail_duration 10s`，不写 `lb_try_duration`）；LT 待用户装上 `Caddyfile.final2` 后复测 T-C4 |
+| Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
 | Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 待实测（K9，需要首帧超过 512 字节的 mockrelay 脚本项）和用户决定（§4 D1、D2） |
 
 ## 3. 逐项说明
@@ -88,13 +89,20 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 - 证据：T10 T-C4，`systemctl stop nahook` 之后的第一个请求等了 5.03s，收到 502，Caddy 日志是 `dial tcp 127.0.0.1:19080: connect: connection refused`；12s 后的请求才走到 3000。原因在 caddy v2.6.2：没配 `fail_duration` 时 `countFailure` 直接返回（`modules/caddyhttp/reverseproxy/healthchecks.go`），`Upstream.Healthy()` 只在配了被动检查时才看失败次数（`hosts.go`），所以每次重试，`lb_policy first` 都重新选中 19080，直到 5s 的 `lb_try_duration` 用完。
 - 影响：nahook 进程挂掉以后、下一次主动健康检查之前（最多 10s），nahook 路由上的每个请求都要等 5s，然后收到 502。设计原来写的"被拒后立即换下一个上游"不成立。
-- 处理：nahook 路由加 `fail_duration 10s`（`max_fails` 默认 1）。第一次连接被拒就把 19080 标为不可用，间隔 `lb_try_interval`（默认 250ms）后重试选到 3000。客户端主动断开不算失败（`proxyLoopIteration` 排除了 `context.Canceled`）；默认路由没配被动检查，不受影响。生产阶段 1（T11）沿用。
+- 第二次实测：加上 `fail_duration 10s` 以后，停掉 nahook 后的第一个请求 0.26s 收到 502，Caddy 日志是 `readfrom tcp 127.0.0.1:59272->127.0.0.1:3000: body closed by handler`；紧接着的两个请求立即收到 503 `no upstreams available`。Go 的 Transport 在连接失败时也会关闭请求体，重试时往 3000 写请求体就失败了，这次失败还记在 3000 头上，两个上游都成了不可用。Caddy 维护者在 caddyserver/caddy#5454 里说，POST 要重试就得先缓冲请求体（该 issue 以 not planned 关闭）。
+- 处理：nahook 路由写 `fail_duration 10s`（`max_fails` 默认 1），不写 `lb_try_duration`（不重试）。发现连不上的第一个请求立即收到 502，同时 19080 被标成不可用，后面的请求直接选 3000。没有采用 `request_buffers`：那会让所有请求都先在 Caddy 里缓冲（请求体最大 64MiB 以上），只为了崩溃那一瞬间；而且 2.6.2 上缓冲后能不能重试成功也没有验证。客户端主动断开不算失败（`proxyLoopIteration` 排除了 `context.Canceled`）；默认路由没配被动检查，不受影响。生产阶段 1（T11）沿用。
 
 ### Q18 站点层 `encode` 和 nahook 路由
 
 - 证据：caddy v2.6.2 `modules/caddyhttp/encode/encode.go` 的 `Write` 只在头还没写、并且这次写入超过 `MinLength`（默认 512）时才调用 `init` 开始压缩；头还没写时 `Flush` 什么都不做；开始压缩以后，Flush 也不冲刷压缩器（01 audit K9）。nahook 放行时，把启动阶段读到的帧（`response.created` 加第一个非启动事件）一次写出（`internal/proxy/stream.go:19`），所以经过 nahook 时 Caddy 的首次写入比直连大。T10 用 mockrelay 实测：首次写入约 320 字节，没有压缩，逐帧正常。
 - 影响（推论，未实测）：真实上游的 `response.created` 带回完整的 response 对象（含 instructions），很可能超过 512 字节；客户端带 `Accept-Encoding` 时，后面的事件可能被攒在压缩器里。直连路由也有这个问题，nahook 路由上更容易触发。
 - 处理：K9。需要 mockrelay 增加一个首帧超过 512 字节、之后按秒发 delta 的脚本项再测（§4 D2）；结论和主站点 `encode`、`flush_interval -1` 的去留一起由用户决定（§4 D1）。
+
+### Q19 启动阶段客户端收不到心跳
+
+- 证据：T10 T-F15，脚本 `hold_rate_limit:5, hold:3`：客户端 11.9s 内没有收到任何字节，放行时 3 行 `: PING` 和 `response.created` 同时到达。nahook 在判定之前不写 `w`，这是能返回 429 的前提（01 audit §1 第一条要点）。
+- 影响：直连官方 NewAPI 并打开心跳时，客户端每隔几秒就能收到 `: PING`；经过 nahook 时，整个启动阶段（上游迟迟不回、每次重试、冷却等待）都是静默的，空闲超时比这段时间短的客户端或中间层会断开。常见情况下静默很短：LT 上真实的限流帧约 1.3s 就到（01 design §3）；上游一直不回响应头时，最长到 Caddy 的 30m。
+- 处理：这是"先判定、后写出"这个设计固有的代价，不改；已写进 01 design §1.8。生产阶段 1、2 观察有没有客户端在启动阶段断开（`client_gone` 计数和 NewAPI 日志），和 K7（心跳设置）一起看。
 
 ### Q6 被拦截那几次尝试的计费
 
@@ -558,4 +566,17 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 - 每组测试之后计数不变量都成立，例如 T-F4 之后 `rate_limited`(83) = `retries`(78) + `gave_up`(5)，`intercepted`(76) = `released`(71) + `gave_up`(5)。
 - 在 LT 上准备好的 Caddy 候选文件（由 T9 的文件生成，`caddy validate` 通过）：`/root/nahook-t10/Caddyfile.final`（加 `fail_duration 10s`，sha256 `96e194dc9bd1ca721a796c397f192929493026d8e3214cb17e67ad43ff3c21a0`）和 `/root/nahook-t10/Caddyfile.tc1`（再加 `flush_interval -1`，只给 T-C1 用，sha256 `214e75233265f71cf88f8da5e1527e258f59e90ba2a6ff84deb288ecd3322eb2`）。
 
-还没做：T-C1（要临时装上 `Caddyfile.tc1`）；T-C2、T-C4 复测（要装上 `Caddyfile.final`）；T-F7、T-F15、T-F17（要改面板设置）；T-F1 和 K4（D 组）；K9 的大首帧实测（待用户决定 D2）。
+第二轮：用户先装上 `Caddyfile.tc1`，并把 LT 面板的失败重试次数改为 0、打开心跳并调到最小间隔；T-C1 之后再换成 `Caddyfile.final`。
+
+| 项 | 方法要点 | 结果 | 结论 |
+|---|---|---|---|
+| T-C1 | nahook 路由临时写上 `flush_interval -1`（`Caddyfile.tc1`）；`hold:30`；`curl --http2 --max-time 2` 经 SITE | 客户端 2.0s 放弃；直到 35.5s，`client_gone` 一直是 0，nahook 到 3000 的连接一直开着；约 30s 时 mockrelay 回了 `ok`，nahook 记 `release attempt 0`，放行给了 28s 前就已经离开的客户端 | 符合预期：写了 `-1` 就不传递断开，HTTP/2 下和 T0 在 HTTP/1.1 下的结论一致。确认 nahook 路由不写 `-1`（00 §6.1） |
+| T-C2（复测） | 装上 `Caddyfile.final`，做法同 T-C2 | 2.5s 时 `client_gone` +1，连接从 2 条变成 1 条，mockrelay 1 次 | 通过 |
+| T-C4（第二次） | `Caddyfile.final`（加了 `fail_duration 10s`，仍有 `lb_try_duration 5s`）；停掉 nahook 后连发 3 个请求，12s 后再发一次 | 请求 1：0.26s 后 502，Caddy 日志 `readfrom tcp 127.0.0.1:59272->127.0.0.1:3000: body closed by handler`；请求 2、3：立即 503 `no upstreams available`；12s 时 200；启动后 6s 流量回到 nahook | **不通过**：重试时请求体已被关闭，3000 也被记了一次失败（Q17）。设计改为不写 `lb_try_duration`，候选文件 `Caddyfile.final2`，待用户装上后复测 |
+| T-F7 | `http429`；`RetryTimes=0` | mockrelay 1 次；客户端 429，和直连逐字节相同；`passthrough` +1，`rate_limited` 不变 | 通过。rc.45 自己回 429 时，`Content-Type` 是 `text/event-stream`；nahook 只看状态码，不受影响 |
+| T-F15 | 心跳打开；脚本 `hold_rate_limit:5, hold:3`（等响应头期间的 PING）和 `stall_rate_limit:5, hold:3`（流式阶段的 PING） | 两次都是 intercept → wait（3872ms、1880ms）→ `release attempt 1`；客户端 200，流里有 3 行 `: PING` | 通过。客户端在放行之前收不到任何字节（11.9s、9.9s），见 Q19 |
+| T-F17 | 心跳打开、`RetryTimes=0`；`hold_http429:3` | mockrelay 1 次；客户端 200：3 行 `: PING`，然后是直接追加的 JSON 错误（没有 `data:`）；`rate_limited` 不变，`released` +1 | rc.45 部分通过。和原判据不一样的地方：rc.45 追加的错误消息**末尾没有 request id**。这不影响 rc.45（读到 EOF 就放行），但 request id 规则针对的是写 SSE 错误帧的版本（h3），所以改在 h3 对照实例上补测（audit T-F17 已改） |
+
+新增的 Caddy 候选文件 `/root/nahook-t10/Caddyfile.final2`：由 `Caddyfile.final` 去掉 nahook 路由的 `lb_try_duration 5s`，`caddy validate` 通过，sha256 `40093312f74e4e2d5602fc8b99d66aef2da10a03abab5c73175af05ecc43fa9a`；`caddy adapt` 确认 nahook 路由只剩 `first` 策略和 `fail_duration 10s`，默认路由不变。
+
+还没做：T-C4 第三次（装上 `Caddyfile.final2` 以后）；LT 面板改回原值（用户）；T-F1 和 h3 上的 T-F17（等用户初始化 3002）；K4（D 组）；K9 的大首帧实测（待用户决定 D2）。
