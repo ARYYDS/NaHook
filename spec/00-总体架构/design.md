@@ -171,7 +171,7 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 
 | 内容 | LT | 生产主机 |
 |---|---|---|
-| Caddyfile | `/etc/caddy/Caddyfile`；改之前先备份成 `Caddyfile.bak.<时间戳>`；加 nahook 路由之前的版本是 `Caddyfile.bak.20261021192639` | 同左（K8 核对） |
+| Caddyfile | `/etc/caddy/Caddyfile`；改之前先备份成 `Caddyfile.bak.<时间戳>`；加 nahook 路由之前的版本是 `Caddyfile.bak.20261021192639`；T10 之后的版本是 `/root/nahook-t10/Caddyfile.final3`（sha256 `d596319d293a93156b780ebfcc773971c70bc1a8d362afb869cb42ebc3f1518d`） | 同左（K8 核对） |
 | NewAPI 编排 | `/root/container/luna-task/compose.yaml`；2026-10-21 已换成官方镜像，换之前的备份是 `compose.yaml.bak.20261021131926` | 同路径（K8 核对）；阶段 2 改环境变量，阶段 3 改镜像，改之前先备份成 `compose.yaml.bak.<时间戳>` |
 | nahook 配置 | `/etc/nahook/config.json` | 同左 |
 | systemd 单元 | `/etc/systemd/system/{nahook,mockrelay}.service` | `/etc/systemd/system/nahook.service` |
@@ -207,7 +207,7 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 		}
 	}
 	handle {
-		reverse_proxy localhost:3000 { …原配置原样… }
+		reverse_proxy localhost:3000 { …原配置，但不写 flush_interval… }
 	}
 ```
 
@@ -217,18 +217,11 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 - nahook 会把 `/api/status` 透传给 NewAPI，所以健康检查对两个上游都有效。
 - 在 LT 上由 T9 加入（`fail_duration` 和去掉 `lb_try_duration` 是 T10 改的）；在生产主机上由阶段 1（T11）加入。
 
-**待拍板：主站点默认路由的 `flush_interval -1` 和站点层 `encode`（两台主机，specaudit §4 D1）**
+**主站点的默认路由和站点层（2026-10-21 用户拍板，specaudit §7.16）**
 
-```text
-客户端 ─HTTPS─► Caddy 主站点
-                 ├ encode zstd gzip（站点层，作用于下面两个 handle） ← 待定 ②
-                 ├ handle @stream_relay ─► nahook :19080 ─► NewAPI :3000   （不写 -1，已定）
-                 └ handle（其余路径） ─► NewAPI :3000，flush_interval -1   ← 待定 ①
-```
-
-- ① 场景：客户端调 `/v1/messages`（走默认 handle），上游一直不回响应头，客户端 30s 后断开。因为写了 `-1`，Caddy 不取消发往 NewAPI 的请求，NewAPI 一直等到 30m 的响应头超时，然后重试、扣费；LT 改测试机之前的日志里，客户端走后 NewAPI 等满 30m 再重试的记录有 33 次（不分路径）。去掉以后，客户端断开 1ms 内就传到后端（T0）；流式输出不受影响，Caddy 对 `text/event-stream` 会立即 flush（`streaming.go:133-137`）。
-- ② 场景：客户端带 `Accept-Encoding: gzip` 请求 `/v1/responses`，上游的 `response.created` 带回完整的 instructions，超过 512 字节，Caddy 开始压缩；之后每个 delta 的 Flush 都不冲刷压缩器，客户端可能攒一批才看到（`01-nahook/audit.md` §5 K9）。经过 nahook 时首次写入是 created 加第一个 delta，更容易超过 512 字节（specaudit Q18）。
-- 建议：① 两台主机都去掉默认 handle 的 `flush_interval -1`，先在 LT 上去掉并用 T-C2 的方法复测，再上生产。② 先给 mockrelay 加一个首帧超过 512 字节的脚本项，在 LT 上实测；确认会憋流以后，再给 `encode` 写一个不含 `text/event-stream` 的显式 `match`（写法届时用 `caddy validate` 校验），或者把 Caddy 升到 2.9 以上。
+- 默认路由（`handle { … }`）也不写 `flush_interval`。写了 `-1` 时，客户端断开不会传到 NewAPI，NewAPI 会一直等到 30m 的响应头超时，然后重试、扣费；LT 改测试机之前的日志里，这样的记录有 33 次（不分路径）。去掉以后，客户端断开 1ms 内就传到后端（T0）；流式输出照常逐帧到达，Caddy 对 `text/event-stream` 会立即 flush（`streaming.go:133-137`）。T10 实测：`/v1/messages` 经站点和直连 NewAPI，逐帧到达时间只差约 12ms。
+- 站点层不写 `encode`。Caddy 2.6.2 的 `encode` 在首次写入超过 512 字节后才开始压缩，之后的 Flush 不冲刷压缩器，可能把 SSE 事件攒住（`01-nahook/audit.md` §5 K9）；经过 nahook 时首次写入更大，更容易触发（specaudit Q18）。去掉以后面板照样是压缩的：NewAPI 自己发出预压缩的前端文件（T10 实测首页带 `Content-Encoding: gzip`）。
+- LT 在 T10 改成了这个样子（`Caddyfile.final3`）；用户告知生产主站点本来就没有这两行，K8 核查时确认。
 
 ### 6.2 LT 的测试渠道和测试令牌（用户在面板里创建）
 
@@ -305,4 +298,6 @@ WantedBy=multi-user.target
 | 照抄主站点，在 nahook 路由里写 `flush_interval -1` | 客户端断开传不到 nahook，nahook 会在客户端走后继续等待和重试，直到用完上限 | 不写（§6.1；T0 实测） |
 | nahook 路由只配主动健康检查，不配 `fail_duration` | nahook 挂掉以后、下一次主动检查之前（最多 10s），每个请求都在 19080 上重试满 `lb_try_duration`（5s）后收到 502 | 写 `fail_duration 10s`（§3.2、§6.1；T10 T-C4） |
 | nahook 路由照抄主站点的 `lb_try_duration 5s`，指望重试回落到 3000 | Caddy 2.6.2 重试 POST 时请求体已被关闭，写给 3000 失败，3000 也被记一次失败；nahook 路由 10s 内全部 503 | 不写 `lb_try_duration`（§3.2；caddyserver/caddy#5454；T10 T-C4） |
+| 主站点默认路由写 `flush_interval -1` | 客户端断开传不到 NewAPI，NewAPI 等满 30m 的响应头超时以后还会重试、扣费 | 不写（§6.1；T0） |
+| 站点层写 `encode zstd gzip` | Caddy 2.6.2 可能把 SSE 事件攒在压缩器里，客户端一批一批地收到 | 不写；前端文件由 NewAPI 自己预压缩（§6.1） |
 | 生产的 3000 端口对公网开放 | 客户端直连就绕过了 nahook | 在安全组或防火墙上关掉 3000 的公网入口（`01-nahook/audit.md` §5 K5） |

@@ -20,7 +20,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q2 | R3 | 判定·真实帧形态 | 不明 | P1 | 01 | 待 K2（阶段 2 确认）；message 兜底规则已覆盖大多数情况 |
 | Q3 | R3 | 部署·生产主机的 3000 端口暴露在公网 | 脆弱 | P1 | 00 | 待 K5（生产主机） |
 | Q4 | R4 | 部署·换镜像后数据库回退 | 脆弱 | P1 | 00 | 正向已在 LT 上验证（2026-10-21）；回退方向待 T10 在 LT 上演练（K4） |
-| Q5 | R3 | 测试·LT 上测试分组的模型定价 | 未细分 | P2 | 00 | 部分关闭（T9）：请求没有因定价被拒；扣费在 T-F6、T-F9 核对 |
+| Q5 | R3 | 测试·LT 上测试分组的模型定价 | 未细分 | P2 | 00 | 已关闭：T9 请求没有因定价被拒；T-F6 经 nahook 和直连扣费一致（quota 125） |
 | Q6 | R2 | 计费·被拦截的尝试是否为 $0 | 不明 | P2 | 01 | LT 已测（T-F9）：每次 $0、记 1 行日志；真实 failed 帧带 usage 的情况待 P-2 |
 | Q7 | — | 工程·源码放在哪、怎么构建 | 未细分 | P2 | 01 | 已关闭：仓库 `ARYYDS/NaHook`，在 Win11 的 `O:\NaHook` 上开发和构建 |
 | Q9 | — | 工程·产物怎么从 Win11 送到 LT | 未细分 | P2 | 01 | 已关闭：用 GitHub Release（仓库已公开） |
@@ -30,12 +30,12 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q12 | R5 | 转发·`forward` 没写 Host、URL 和请求体长度的规则 | 未细分 | P2 | 01 | 已关闭：design §6.1 |
 | Q13 | R5 | 排期·T6 漏了对 T5 的依赖；T5 要等 G1，但排在 T7 前面 | 耦合 | P2 | 01 | 已关闭：`obs` 放进 T6，`cmd/nahook` 放进 T5；顺序改为 T7 → T6 → T5，T6 不依赖 T0（§7.9） |
 | Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
-| Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 重新打开，见 Q20：request id 规则只认得 NewAPI 自己生成的错误；生产上的心跳设置待 K7 |
+| Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 重新打开，见 Q20：request id 规则只认得 NewAPI 自己生成的错误；K7：LT 的心跳一直开着（间隔 1s），生产相同 |
 | Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 待 K8（用户告知主机并批准只读核查） |
 | Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 设计已改（00 §3.2、§6.1、§8：`fail_duration 10s`，不写 `lb_try_duration`）；LT 待用户装上 `Caddyfile.final2` 后复测 T-C4 |
 | Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
 | Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 设计已改（01 design §1.3、§1.6、§8；interface 2.1、2.5）；待 T15 实现，并在 LT 上用关护栏的 h3 复测 T-F17 |
-| Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 待实测（K9，需要首帧超过 512 字节的 mockrelay 脚本项）和用户决定（§4 D1、D2） |
+| Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 已关闭：用户拍板去掉站点层 `encode`（LT 在 T10 去掉；生产本来没有，K8 时确认） |
 
 ## 3. 逐项说明
 
@@ -78,7 +78,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 ### Q5 LT 上测试分组的模型定价
 
 - 影响：测试令牌所在分组对 `gpt-6-astra` 没有定价的话，NewAPI 可能会拒绝请求；T-F6、T-F9 也要看计费。
-- 处理：K6。T9 实测请求没有被拒；扣费是否符合预期在 T10 的 T-F6、T-F9 核对。
+- 处理：K6。T9 实测请求没有被拒；T10 核对了扣费：T-F6 经 nahook 和直连都是 quota 125，T-F9 被拦截的尝试 quota 0。已关闭。
 
 ### Q16 生产主机未核实
 
@@ -97,7 +97,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 - 证据：caddy v2.6.2 `modules/caddyhttp/encode/encode.go` 的 `Write` 只在头还没写、并且这次写入超过 `MinLength`（默认 512）时才调用 `init` 开始压缩；头还没写时 `Flush` 什么都不做；开始压缩以后，Flush 也不冲刷压缩器（01 audit K9）。nahook 放行时，把启动阶段读到的帧（`response.created` 加第一个非启动事件）一次写出（`internal/proxy/stream.go:19`），所以经过 nahook 时 Caddy 的首次写入比直连大。T10 用 mockrelay 实测：首次写入约 320 字节，没有压缩，逐帧正常。
 - 影响（推论，未实测）：真实上游的 `response.created` 带回完整的 response 对象（含 instructions），很可能超过 512 字节；客户端带 `Accept-Encoding` 时，后面的事件可能被攒在压缩器里。直连路由也有这个问题，nahook 路由上更容易触发。
-- 处理：K9。需要 mockrelay 增加一个首帧超过 512 字节、之后按秒发 delta 的脚本项再测（§4 D2）；结论和主站点 `encode`、`flush_interval -1` 的去留一起由用户决定（§4 D1）。
+- 处理：2026-10-21 用户拍板：站点层不写 `encode`（00 design §6.1）。LT 在 T10 去掉；用户告知生产本来没有，K8 时确认。不再需要首帧超过 512 字节的 mockrelay 脚本项。已关闭。
 
 ### Q19 启动阶段客户端收不到心跳
 
@@ -109,7 +109,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 - 证据：T10 在关掉护栏的 h3（`38e69e3`）上跑 T-F17（心跳打开、间隔 1s，`RetryTimes=0`，脚本 `hold_http429:3`）。直连时 h3 回 200：3 行 `: PING`，然后是 `data: {"error":{"message":"Rate limit reached … Please try again in 28ms.",…}}` 和 `data: [DONE]`，消息末尾**没有** request id。经过 nahook 时，nahook 把它当成上游限流，重试了 3 次（mockrelay 共收到 4 次，冷却等待 2195ms、10254ms、11397ms），客户端 35.9s 后拿到代 429。原因在 h3 源码：`Relay` 的 defer 先 `SetMessage(MessageWithRequestId(…))`（`controller/relay.go:96-99`），再由 `writeRelayStreamError` 输出 `ToOpenAIError(…)`（`:242-258`）；而 `SetMessage` 只改 `e.Err`，`ToOpenAIError` 遇到 `ErrorTypeOpenAIError` 时直接返回上游原来的错误对象（`relaykit/types/error.go:178-190`）。所以只有 NewAPI 自己生成的错误带后缀，转发上游的 OpenAI 错误不带。rc.45 没有 `writeRelayStreamError`，错误由 `c.JSON` 直接追加（没有 `data:`），nahook 读到 EOF 放行，不受影响（T10 T-F17 rc.45 部分）。
 - 影响：生产阶段 2（h3 关护栏）和阶段 3（如果换成带 `#7857` 的官方版本）上，只要心跳打开、上游的 HTTP 错误回得比心跳间隔慢（或者 NewAPI 的几次重试加起来比心跳间隔长），每个这样的请求对上游的调用会放大到 (1 + `retry.max`) × (1 + RetryTimes) 倍，客户端还要多等几轮冷却。护栏开着时（阶段 1）心跳在启动阶段不发出，h3 直接回 HTTP 429，不受影响（T10 实测）。
-- 处理：01 design §1.6 增加第 2 条规则：判定帧之前只有心跳（至少一个纯注释事件，没有别的事件），并且判定帧不带 type，就认定是 NewAPI 的终态错误，原样透传。只会往放行的方向误判（上游很慢、心跳已发出、上游第一帧就是不带 type 的限流错误时，客户端看到的和官方一样）。由 T15 实现，部署到 LT 后用关护栏的 h3 复测 T-F17；T11 之前完成。K7（生产的心跳设置）仍要查：心跳关着时不会走到这条路径。
+- 处理：01 design §1.6 增加第 2 条规则：判定帧之前只有心跳（至少一个纯注释事件，没有别的事件），并且判定帧不带 type，就认定是 NewAPI 的终态错误，原样透传。只会往放行的方向误判（上游很慢、心跳已发出、上游第一帧就是不带 type 的限流错误时，客户端看到的和官方一样）。由 T15 实现，部署到 LT 后用关护栏的 h3 复测 T-F17；T11 之前完成。K7：LT 的心跳一直开着、间隔 1s，生产和 LT 一样（用户告知），所以生产上一定会走到这条路径，T15 必须在 T12 之前部署到生产。
 
 ### Q6 被拦截那几次尝试的计费
 
@@ -147,8 +147,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 | 编号 | 内容 | 位置 |
 |---|---|---|
-| D1 | 主站点默认路由的 `flush_interval -1` 和站点层 `encode` 的去留（两台主机） | 00 design §6.1 末尾"待拍板" |
-| D2 | 是否给 mockrelay 增加首帧超过 512 字节的脚本项，用来实测 K9 | 01 audit §5 K9；Q18 |
+| — | 目前没有待拍板项（D1、D2 已于 2026-10-21 拍板，见 §7.16） | — |
 
 ## 5. 开工前待查索引
 
@@ -159,10 +158,10 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | K3 | 官方镜像要固定的 digest | 01 audit §5 | 已定：rc.45 `sha256:6c63c7ee…87bc3f9` |
 | K4 | h3 与 rc.45 来回切换的数据库兼容性 | 01 audit §5 | 正向已验证；回退方向在 01:T10 演练 |
 | K5 | 生产主机的 3000 端口是否暴露在公网 | 01 audit §5 | 00:G3 |
-| K6 | LT 上测试分组的定价 | 01 audit §5 | 01:T9 已确认请求不被拒；扣费在 01:T10（T-F6、T-F9）核对 |
-| K7 | 生产主机的心跳设置 | 01 audit §5 | 01:T12 |
+| K6 | LT 上测试分组的定价 | 01 audit §5 | 已查清（01:T9、T10） |
+| K7 | 生产主机的心跳设置 | 01 audit §5 | LT 已查清（心跳开着、间隔 1s）；生产在 K8 时确认 |
 | K8 | 生产主机是哪台、基线是否和 LT 改动前一致 | 01 audit §5 | 01:T11 之前 |
-| K9 | 站点层 `encode` 会不会憋住 SSE | 01 audit §5 | 01:T10 |
+| K9 | 站点层 `encode` 会不会憋住 SSE | 01 audit §5 | 已处理：去掉 `encode`（D1） |
 
 ## 6. 还没写 SPEC 的部分与写作顺序
 
@@ -604,3 +603,19 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 收尾：面板（K4 期间设成失败重试次数 0、心跳打开）待用户改回原值。3002 的 h3 对照实例没有用上，按 00 design §6.3 由用户删除（`docker rm -f nahook-h3-ref`，再删 `/root/container/nahook-h3-ref/data`）。
 
 还没做：T15 实现、发布、在 LT 上替换 nahook 后用关护栏的 h3 复测 T-F17（切换方法同 K4，需要用户同意）；K9 的大首帧实测（待用户决定 D2）。
+
+拍板（2026-10-21，用户）：
+
+| 编号 | 用户的决定 | 架构侧的执行 |
+|---|---|---|
+| D1 | 同意建议；默认路由的 `flush_interval -1` 和站点层 `encode zstd gzip` 都直接去掉。这是测试时留下的配置，其他站点都没有这两行，也没有 gzip，不影响正常使用 | 由 `Caddyfile.final2` 删掉这两行生成 `Caddyfile.final3`（`caddy validate` 通过；`caddy adapt` 确认两个 `reverse_proxy` 都没有 `flush_interval`，站点没有 `encode`），用户执行替换和 reload；00 design §6.1、§8 改成现行设计 |
+| D2 | 同意建议 | 去掉 `encode` 以后 K9 没有可测的对象，T16 不再新建；Q18 关闭 |
+| K7 | LT 的心跳一直是开着的，从没关过（间隔 1s） | 01 audit K7 写明；Q20 的修复（T15）是生产阶段 2 之前的硬前置 |
+| — | 面板已改回（失败重试次数 3、心跳间隔 1）；3002 对照实例已删除 | 已核对：`docker ps -a` 里没有 `nahook-h3-ref`，数据目录不存在 |
+
+第四轮验证（`Caddyfile.final3`，sha256 `d596319d293a93156b780ebfcc773971c70bc1a8d362afb869cb42ebc3f1518d`）：
+- reload 后没有新的错误日志；面板首页 200，带 `Content-Encoding: gzip`（NewAPI 自己的预压缩）；`/api/status`、`/v1/models` 200。
+- nahook 路由：`ok` 200，没有 `Content-Encoding`；`rate_limit, ok` 照常拦截后放行。
+- 默认路由的流式：`/v1/messages`（NewAPI 转成 chat 发给 mockrelay，`slow:3`）经站点是 2020ms、3020ms 两批到达，直连 NewAPI 是 2008ms、3008ms，只差 TLS 的约 12ms，Caddy 没有攒住事件。两批而不是三批，是 NewAPI 的 chat 处理扣住上一块再发，直连也一样。
+
+T10 还剩：T15 部署到 LT 后，用关护栏的 h3 复测 T-F17。

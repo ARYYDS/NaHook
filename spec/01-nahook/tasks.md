@@ -181,7 +181,7 @@ L-DOC                                                                           
 
 - [ ] **T11 生产阶段 1：部署 nahook + Caddy 路由（护栏仍开着）**（L-OPS，在生产主机上，**需要用户同意**）
   - 前置：T10 全部通过；T15 已部署到 LT 并复测 T-F17；K8 已核对
-  - 改动：从同一个 Release 安装 `nahook.service` 和 `/etc/nahook/config.json`（`retry.max=3`）；备份 Caddyfile 后加 nahook 路由（00 §6.1，`flush_interval` 按 LT 上 T-C1/T-C2 的结论），reload
+  - 改动：从同一个 Release 安装 `nahook.service` 和 `/etc/nahook/config.json`（`retry.max=3`）；备份 Caddyfile 后加 nahook 路由（00 §6.1：不写 `flush_interval`、写 `fail_duration 10s`、不写 `lb_try_duration`）；主站点默认路由如果有 `flush_interval -1`、站点层如果有 `encode`，一并去掉（00 §6.1；用户告知生产没有，K8 核对）；reload
   - 依据：00 §1.2 阶段 1 ｜ audit P-1
   - 完成判据：
     - [ ] P-1 通过
