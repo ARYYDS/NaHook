@@ -79,14 +79,15 @@ const MaxBytes  = 256 << 10    # H3 responses_startup_error.go:24
 type Verdict int               # VerdictRelease | VerdictRateLimit
 type UpstreamError struct { Message, Type, Param string; Code json.RawMessage }
 type Result struct { Verdict Verdict; Prefix []byte; Rest *bufio.Reader; Err UpstreamError
-                     HeartbeatOnly bool   # 判定帧之前至少有一个事件，并且每一个都只由注释行组成（例如 ": PING"）
+                     HeartbeatOnly bool   # 判定帧之前至少有一个事件，并且每一个都只由注释行组成（例如 ": PING"；只有空行的不算事件）
                      Untyped bool }       # 判定帧既没有 type 字段，也没有 event: 行
                                           # 这两项只在 VerdictRateLimit 时有意义，供 §1.6 的 newAPIFinalError 使用
 
 func Read(body io.Reader) Result
   reader := bufio.NewReader(body); prefix, event := bytes.Buffer{}
   eventName := ""; dataLines := nil; events := 0
-  commentOnly := true; heartbeats := 0; dataSeen := false   # 当前事件是否只有注释行；之前的纯注释事件数；之前是否出现过别的事件
+  commentOnly := true; hasComment := false                  # 当前事件的非空行是否都是注释；当前事件有没有注释行
+  heartbeats := 0; dataSeen := false                        # 之前的纯注释事件数；之前是否出现过别的事件
   loop:
     line, overflow, readErr := readLine(reader, MaxBytes - prefix.Len() - event.Len())
         # readLine 用 ReadSlice 逐块拼一行，一旦超过给定上限就立即返回，
@@ -97,7 +98,7 @@ func Read(body io.Reader) Result
     switch trim(line):
       前缀 "event:" → eventName = 去掉前缀后的值；commentOnly = false
       前缀 "data:"  → dataLines = append(dataLines, 去掉前缀后的值)；commentOnly = false
-      前缀 ":"      → 注释（例如 ": PING"），只留在 event 里
+      前缀 ":"      → 注释（例如 ": PING"），只留在 event 里；hasComment = true
       其他非空行     → commentOnly = false
     if trim(line) == "" || readErr == io.EOF:
       if event.Len() > 0:
@@ -106,11 +107,12 @@ func Read(body io.Reader) Result
         d, e, typed := inspect(eventName, join(dataLines, "\n"))
         prefix.Write(event)
         switch d:
-          decisionContinue  → if commentOnly { heartbeats++ } else { dataSeen = true }；继续读下一个事件
+          decisionContinue  → if !commentOnly { dataSeen = true } else if hasComment { heartbeats++ }；继续读下一个事件
+                              # 只有空行的事件 SSE 不会派发，两样都不算
           decisionRelease   → return Result{VerdictRelease, prefix, reader}
           decisionRateLimit → return Result{VerdictRateLimit, prefix, reader, e,
                                             HeartbeatOnly: heartbeats > 0 && !dataSeen, Untyped: !typed}
-      event.Reset(); dataLines = nil; eventName = ""; commentOnly = true
+      event.Reset(); dataLines = nil; eventName = ""; commentOnly = true; hasComment = false
     if readErr != nil:
       return Result{VerdictRelease, prefix+event, reader}   # EOF 或读错：原样放行；没收尾的最后一个事件也并进 Prefix，
                                                             # 保证 Prefix+Rest == 原始字节

@@ -619,3 +619,31 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 - 默认路由的流式：`/v1/messages`（NewAPI 转成 chat 发给 mockrelay，`slow:3`）经站点是 2020ms、3020ms 两批到达，直连 NewAPI 是 2008ms、3008ms，只差 TLS 的约 12ms，Caddy 没有攒住事件。两批而不是三批，是 NewAPI 的 chat 处理扣住上一块再发，直连也一样。
 
 T10 还剩：T15 部署到 LT 后，用关护栏的 h3 复测 T-F17。
+
+### 7.17 T15 审计（提交 `f45d5a1`，由架构侧直接审计、直接修复）
+
+DSH 交付回报里的自行决定和风险点，架构侧的裁决：
+
+| 事项 | 裁决 | 回写位置 |
+|---|---|---|
+| `typed` 用 trim 之后的类型判断，`type` 字段只有空白时当作没有类型 | 采纳：和 design 的 `trim(typ) != ""` 一致 | — |
+| 空行不参与 `commentOnly` | 采纳这个意图，但只有空行的事件仍被算成了心跳，见 U-a | design §1.3 |
+| `HeartbeatOnly` 的"至少一个事件"由 `heartbeats > 0` 保证 | 采纳 | — |
+| `newAPIFinalError` 不检查 `Verdict`，调用处先判 `VerdictRateLimit` | 采纳：和 design §1.6 的调用点一致 | — |
+| 假上游沿用 `fakeUpstream`，新增两个脚本项 | 采纳 | — |
+| 风险 2：要不要再收紧规则 2（至少两个心跳、心跳总时长） | 不收紧：误判只会往放行的方向，收紧只会让 NewAPI 的终态错误更容易被重试（design §1.6） | — |
+| 风险 3：rc.45 的裸 JSON 终态错误没有单测 | 补上：心跳、裸 JSON、EOF → 放行，`Prefix+Rest` 等于原始字节 | — |
+| 风险 1：要在 LT 上用关护栏的 h3 复测 T-F17 | 是，属于 T10，替换和切换需要用户同意 | tasks T15、T10 |
+
+审计发现的问题，在 `audit/T15` 分支上修复：
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| U-a | P3 | 只有空行的"事件"（例如流开头单独一个空行）走到 `decisionContinue` 时 `commentOnly` 仍是 true，被算成一个心跳。SSE 不会派发这种事件，design 要求的是"由注释行组成"。误判只往放行的方向，NewAPI 的输出里实际也不会单独出现空行，但规则和设计不一致 | 增加 `hasComment`：事件里至少有一行注释才算心跳；只有空行的事件既不算心跳也不算数据。补两个用例（单独的空行不算心跳；空行加心跳，心跳照算）；`intercept.go` 调用处的注释改成指向两条规则 |
+
+修复提交 `f88c073`。
+
+核验（Win11，一次性克隆）：
+- 门禁：gofmt 无输出；vet 退出码 0；`go test -race -count=1 ./...` 十一个包全部 ok；linux/amd64 交叉编译和 vet 退出码 0；`go.mod` 没有 require；改动文件行尾全是 LF。
+- 反向检查：把 `internal/startup/startup.go` 换回 `f45d5a1` 的版本，新用例"单独的空行不算心跳"失败（`HeartbeatOnly = true, want false`）；换回审计版后通过。
+- 新增用例都在 `-v` 下跑到：`TestReadHeartbeatFlags` 八个子例、`TestReadRawJSONAfterHeartbeatIsReleased`。

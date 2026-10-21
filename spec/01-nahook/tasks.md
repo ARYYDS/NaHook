@@ -170,12 +170,12 @@ L-DOC                                                                           
     - 测试：`internal/startup` 和 `internal/proxy` 的单测
   - 依据：design §1.3、§1.6、§8 ｜ audit T-F15、T-F17；interface 2.1、2.5、§3
   - 完成判据：
-    - [ ] startup 单测：`: PING` ×2 → `data: {"error":{限流}}` → `data: [DONE]`，得到 `VerdictRateLimit`、`HeartbeatOnly=true`、`Untyped=true`，`Prefix+Rest` 等于原始字节
-    - [ ] startup 单测：没有注释、第一帧就是 `data: {"error":{限流}}` → `HeartbeatOnly=false`
-    - [ ] startup 单测：`: PING` → `event: response.created` → 限流 → `HeartbeatOnly=false`；`: PING` → `{"type":"error",…限流}` → `Untyped=false`；`: PING` → `event: error` + `data: {"error":…}` → `Untyped=false`；只有 `event:` 行、没有 data 的事件不算纯注释事件
-    - [ ] proxy 单测（假 NewAPI）：心跳 + 不带 type 的限流错误 + `[DONE]` → 客户端拿到 200 和逐字节相同的流，上游只被请求 1 次，`passthrough` +1、`rate_limited` 不变
-    - [ ] proxy 单测：心跳 + `response.created` + 限流 → 照常拦截并重试；没有心跳的 Chat 限流帧 → 照常拦截并重试；request id 后缀规则的原有测试仍然通过
-    - [ ] audit §3 的门禁全部通过
+    - [x] startup 单测：`: PING` ×2 → `data: {"error":{限流}}` → `data: [DONE]`，得到 `VerdictRateLimit`、`HeartbeatOnly=true`、`Untyped=true`，`Prefix+Rest` 等于原始字节
+    - [x] startup 单测：没有注释、第一帧就是 `data: {"error":{限流}}` → `HeartbeatOnly=false`
+    - [x] startup 单测：`: PING` → `event: response.created` → 限流 → `HeartbeatOnly=false`；`: PING` → `{"type":"error",…限流}` → `Untyped=false`；`: PING` → `event: error` + `data: {"error":…}` → `Untyped=false`；只有 `event:` 行、没有 data 的事件不算纯注释事件
+    - [x] proxy 单测（假 NewAPI）：心跳 + 不带 type 的限流错误 + `[DONE]` → 客户端拿到 200 和逐字节相同的流，上游只被请求 1 次，`passthrough` +1、`rate_limited` 不变
+    - [x] proxy 单测：心跳 + `response.created` + 限流 → 照常拦截并重试；没有心跳的 Chat 限流帧 → 照常拦截并重试；request id 后缀规则的原有测试仍然通过
+    - [x] audit §3 的门禁全部通过（DSH `f45d5a1`；审计 `f88c073`，specaudit §7.17）
     - [ ] 审计合并到 main 之后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
   - 冲突：只改 L-GO 车道的文件；LT 上的替换属于 T10（需要用户同意）
 
