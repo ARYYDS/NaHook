@@ -11,13 +11,14 @@ gets exactly one release (design §7, T8). The five attachments come from
 O:\WinCache\nahook\dist\<8hex>\ and are never copied into the repository.
 #>
 [CmdletBinding()]
-param()
+param(
+    [string]$DistRoot = 'O:\WinCache\nahook\dist'
+)
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
-$Repo = 'O:\NaHook'
-$DistRoot = 'O:\WinCache\nahook\dist'
+$Repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $GitHubRepo = 'ARYYDS/NaHook'
 
 function Stop-Release([string]$Message) {
@@ -48,6 +49,18 @@ foreach ($name in $attachments) {
     if (-not (Test-Path -LiteralPath (Join-Path $dist $name))) {
         Stop-Release "missing $dist\$name; run scripts/build.ps1 first"
     }
+}
+
+# The dist directory must belong to this commit and still match its checksums:
+# what is uploaded is exactly what build.ps1 produced for HEAD.
+$infoCommit = (Select-String -LiteralPath (Join-Path $dist 'BUILDINFO.txt') -Pattern '^commit: ([0-9a-f]{40})$').Matches |
+    ForEach-Object { $_.Groups[1].Value } | Select-Object -First 1
+if ($infoCommit -ne $commit) { Stop-Release "BUILDINFO.txt is for $infoCommit, not HEAD $commit" }
+foreach ($line in [IO.File]::ReadAllLines((Join-Path $dist 'SHA256SUMS'))) {
+    if ($line -notmatch '^([0-9a-f]{64})  (\S+)$') { Stop-Release "malformed SHA256SUMS line: $line" }
+    $want, $name = $Matches[1], $Matches[2]
+    $got = (Get-FileHash -LiteralPath (Join-Path $dist $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($got -ne $want) { Stop-Release "$name does not match SHA256SUMS" }
 }
 
 # A tag without a release would still make the create fail, but this reports it

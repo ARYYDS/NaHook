@@ -19,24 +19,33 @@ Linux reads them unchanged; PowerShell's default text cmdlets would write CRLF
 (design §7, T8).
 #>
 [CmdletBinding()]
-param()
+param(
+    # Where the per-commit dist directories live. The default is the Win11
+    # layout of the task book; an audit run passes a scratch directory.
+    [string]$DistRoot = 'O:\WinCache\nahook\dist'
+)
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
-$Repo = 'O:\NaHook'
-$DistRoot = 'O:\WinCache\nahook\dist'
+# The repository is the one this script belongs to, so a separate clone builds
+# itself and never O:\NaHook by accident.
+$Repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $GoBin = 'O:\WinCache\tools\go\bin'
 $GccBin = 'O:\WinCache\tools\msys64\ucrt64\bin'
 $TmpDir = 'O:\WinCache\tmp'
 
 $script:dist = $null
+# created is set only once this run has made the dist directory itself. A
+# failure removes that directory and nothing else; a dist directory that
+# already existed is never touched.
+$script:created = $null
 
 function Stop-Build([string]$Message) {
     Write-Host "build: $Message" -ForegroundColor Red
-    if ($script:dist -and (Test-Path -LiteralPath $script:dist)) {
-        Remove-Item -LiteralPath $script:dist -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "build: removed incomplete $script:dist" -ForegroundColor Yellow
+    if ($script:created -and (Test-Path -LiteralPath $script:created)) {
+        Remove-Item -LiteralPath $script:created -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "build: removed incomplete $script:created" -ForegroundColor Yellow
     }
     exit 1
 }
@@ -62,7 +71,8 @@ if (Test-Path -LiteralPath $script:dist) {
     Stop-Build "refusing to overwrite existing $script:dist"
 }
 
-New-Item -ItemType Directory -Path $script:dist -Force | Out-Null
+New-Item -ItemType Directory -Path $script:dist | Out-Null
+$script:created = $script:dist
 
 # 2. Cross-compile the three commands (design §7).
 $env:PATH = "$GoBin;$GccBin;" + $env:PATH
