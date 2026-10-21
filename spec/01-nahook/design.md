@@ -433,6 +433,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | 发往 NewAPI 的响应头超时 | 不设 | 由 Caddy 的 `response_header_timeout 30m` 兜底（LT Caddyfile） |
 | 启动帧阶段 | 不另设计时器 | NewAPI 的 `STREAMING_TIMEOUT` 默认 300s（`NEWAPI/common/init.go:185`）到期会关流 → `Read` 拿到 EOF → 放行 |
 | 抖动等待 | `[0, until-now)` | §1.5 |
+| 单请求总时限 | 不设：客户端断开由 Caddy 传过来，`r.Context()` 随之取消，`forward` 和 `Wait` 都会返回 | T0 实测：nahook 路由不写 `flush_interval -1` 时，断开在 1ms 内传到后端（00-总体架构 §6.1；`specaudit.md` §7.12） |
 | 空闲连接 | `IdleConnTimeout 10m`，`MaxIdleConnsPerHost 2000` | 和 LT Caddyfile 里的 `keepalive 10m`、`keepalive_idle_conns 2000` 一致 |
 
 ### 状态机
@@ -643,6 +644,18 @@ Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游
 | `ClientGone` | `client_gone` | `forward` 或 `Wait` 因为 `r.Context()` 取消而返回 |
 
 不变量：`rate_limited = retries + gave_up`（每次判为限流后，恰好走这两条路中的一条）；每个被拦截的请求恰好以 `released`、`gave_up`、`passthrough`、`bad_gateway`、`client_gone` 之一结束。
+
+### 6.8 `cmd/nahook`
+
+| 项 | 规定 |
+|---|---|
+| 参数 | `-config PATH`，默认 `/etc/nahook/config.json` |
+| 启动顺序 | `config.Load` → `Validate` → `config.NewStore` → `obs.NewLogger(os.Stdout)`、`obs.NewStats` → `gate.NewRegistry` → `proxy.NewHandler(store, gates, stats, log)` → 启动 `control.Serve(ctx, cfg.ControlSocket, store, gates, stats, log)` → 启动数据面 `http.Server{Addr: cfg.Listen, Handler: h}`。同一个 `log` 传给 proxy 和 control，不调用 `slog.SetDefault` |
+| 数据面 `http.Server` | 不设 `ReadTimeout`、`WriteTimeout`（流式响应，§4）；只监听 `127.0.0.1`，前面是 Caddy |
+| 启动失败 | 配置读不到或校验不过、数据面或控制口监听失败：打一条错误日志后以退出码 1 退出，由 systemd 的 `Restart=always` 重启 |
+| SIGHUP | 调 `store.Reload()`。成功打 `config.reloaded`，失败打 `config.reload_failed`，字段同 §5；信号没有对端，`uid` 记 `-` |
+| SIGTERM、SIGINT | 取消 control 的 ctx；对数据面调 `Server.Shutdown`，不另设超时：已经在流式输出的请求会等它结束，最长由 systemd 的 `TimeoutStopSec`（默认 90s）兜底。监听一关，Caddy 就会按 `lb_policy first` 把新请求交给 NewAPI（00-总体架构 §3.2） |
+| 退出码 | 正常停止 0；启动失败 1 |
 
 ## §7 技术栈与依赖
 

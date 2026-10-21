@@ -203,7 +203,7 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 	}
 ```
 
-- `flush_interval` 写不写，先按 T0 的结论定（`00-总体架构/tasks.md` G1），再由 T-C1、T-C2 在 LT 的完整链路上确认（`01-nahook/audit.md` §5 K1）。
+- **不写 `flush_interval`。** 写了 `-1` 以后，Caddy 2.6.2 会把发往后端的请求上下文换成 `ignoreClientGoneContext`（caddy v2.6.2 `modules/caddyhttp/reverseproxy/reverseproxy.go:802-803`），客户端断开不会取消发给 nahook 的请求。nahook 在等待和重试期间不写任何字节，Caddy 也就没有机会通过写失败发现断开。T0 实测：写了 `-1` 的组合，客户端断开 18 秒后后端连接仍然开着；不写的组合，后端在 1ms 内就看到连接关闭（`specaudit.md` §7.12）。不写也不影响流式输出：上游响应是 `text/event-stream` 时，Caddy 会立即 flush（同版本 `streaming.go:133-137`）。T-C1、T-C2 在 LT 的完整链路上用 HTTP/2 复测。
 - 除 `lb_policy` 外，其余参数沿用各自主站点现有的配置。
 - nahook 会把 `/api/status` 透传给 NewAPI，所以健康检查对两个上游都有效。
 - 在 LT 上由 T9 加入；在生产主机上由阶段 1（T11）加入。
@@ -280,4 +280,5 @@ WantedBy=multi-user.target
 | h3 对照实例用 `-p 3002:3000` | 监听 0.0.0.0，暴露到公网 | `-p 127.0.0.1:3002:3000`（§6.3） |
 | 阶段 3 不备份就换镜像，或者换成没在 LT 上验证过的版本 | 回退时可能碰到表结构不兼容 | 先备份 MySQL；用和 LT 相同的 digest。rc.45 比 h3 的官方基线旧 4 个提交，表结构是 h3 的子集，LT 换镜像时启动迁移没有改表（`specaudit.md` §7.11） |
 | 改完 Caddyfile 用 restart | 现有连接会被断开 | `systemctl reload caddy`（优雅重载） |
+| 照抄主站点，在 nahook 路由里写 `flush_interval -1` | 客户端断开传不到 nahook，nahook 会在客户端走后继续等待和重试，直到用完上限 | 不写（§6.1；T0 实测） |
 | 生产的 3000 端口对公网开放 | 客户端直连就绕过了 nahook | 在安全组或防火墙上关掉 3000 的公网入口（`01-nahook/audit.md` §5 K5） |

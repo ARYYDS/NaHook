@@ -16,7 +16,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 | 编号 | 根因 | 大类·小类 | 类别 | 严重度 | 涉及 SPEC | 状态 |
 |---|---|---|---|---|---|---|
-| Q1 | R3 | 入口·Caddy 断开传递 | 不明 | P1 | 00、01 | 待 T0 / T-C1 / T-C2 实测 |
+| Q1 | R3 | 入口·Caddy 断开传递 | 不明 | P1 | 00、01 | 已关闭（T0，2026-10-21）：nahook 路由不写 `flush_interval -1`；T-C1、T-C2 用 HTTP/2 复测 |
 | Q2 | R3 | 判定·真实帧形态 | 不明 | P1 | 01 | 待 K2（阶段 2 确认）；message 兜底规则已覆盖大多数情况 |
 | Q3 | R3 | 部署·生产主机的 3000 端口暴露在公网 | 脆弱 | P1 | 00 | 待 K5（生产主机） |
 | Q4 | R4 | 部署·换镜像后数据库回退 | 脆弱 | P1 | 00 | 正向已在 LT 上验证（2026-10-21）；回退方向待 T10 在 LT 上演练（K4） |
@@ -43,9 +43,11 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
   - LT 的生产站点配置了 `flush_interval -1`（2026-10-20 读过 Caddyfile）。
 - 影响：如果断开传不到 nahook，客户端走了以后 nahook 还会按上限继续重试。
 - 处理：T0 先按 `docs/T0/测试方案.md` 做最小实验（4 种组合各跑 3 次），T-C1/T-C2 再在完整链路上复测。
-- 结论：待 T0 实测后回填到这里。
-
-  > 推论：2.6.2 发布于 2022 年 10 月，#4952 在那之前合入，所以大概率受影响。
+- 结论（T0，2026-10-21，详见 §7.12）：
+  - 等待响应头阶段：写了 `-1`，客户端断开后后端连接一直开着（3/3，测到 18s）；不写，后端在 1ms 内看到连接关闭（3/3）。
+  - 原因在源码：caddy v2.6.2 `reverseproxy.go:802-803` 在 `FlushInterval == -1` 时把请求上下文换成 `ignoreClientGoneContext`，客户端断开不会取消后端请求。判断依据只是配置值，和 HTTP/1.1 还是 HTTP/2 无关。
+  - 流式阶段：两种配置都会传递。写了 `-1` 时 Caddy 靠"写给客户端失败"才发现，约 5s；不写约 2s。
+  - 落点：nahook 路由不写 `flush_interval`（00 design §6.1）；SSE 本来就会立即 flush（`streaming.go:133-137`）；nahook 不加单请求总时限（01 design §4）。
 
 ### Q2 真实中转站的流内限流帧
 
@@ -122,7 +124,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 | 编号 | 内容 | 来源 | 对应任务 |
 |---|---|---|---|
-| K1 | Caddy 是否传递客户端断开 | 01 audit §5 | 01:T0、T10 |
+| K1 | Caddy 是否传递客户端断开 | 01 audit §5 | 已查清（01:T0）；01:T10 的 T-C1、T-C2 用 HTTP/2 复测 |
 | K2 | 真实中转站的限流帧形态 | 01 audit §5 | 01:T12 |
 | K3 | 官方镜像要固定的 digest | 01 audit §5 | 已定：rc.45 `sha256:6c63c7ee…87bc3f9` |
 | K4 | h3 与 rc.45 来回切换的数据库兼容性 | 01 audit §5 | 正向已验证；回退方向在 01:T10 演练 |
@@ -373,3 +375,49 @@ SPEC 落点：
 | K3 定为 rc.45 的 digest；K4 记录正向已验证、回退方向在 T10 演练 | 01 audit §5；00 design §7、§8 |
 | rc.45 的终态错误不带 `data:`，nahook 会放行并计 `released`；T-F17 按版本写预期 | 01 design §1.6、§8；01 audit T-F17 |
 | `mockrelay.service` 写全，依赖 `docker.service` | 00 design §6.4 |
+
+### 7.12 T0：Caddy 2.6.2 断开传递实验（2026-10-21）
+
+执行：用户批准后，由执行子代理（DSH）按 `docs/T0/测试方案.md` 和 `测试要求.md`（文档提交 `1a1b60d`，脚本提交 `ea98b84`）在 LT 上执行，14:09:07–14:17:05 CST，没有重跑，没有偏离。架构侧随后在 LT 上只读复核了原始日志。
+
+原始证据（`/root/nahook-t0/client.log`、`backend.log`；`delta_s` = 后端事件时间 − curl 断开时间）：
+
+| 组合 | 3 次的后端事件 | delta_s | 后端写出的帧数 | 结论 |
+|---|---|---|---|---|
+| hold-default | `peer_closed` × 3 | −0.001 ～ −0.003 | — | 传递，立即 |
+| hold-neg1 | `timeout_still_open` × 3 | +18.01 ～ +18.02（从收到请求起整 20s 没断） | — | 不传递 |
+| stream-default | `write_failed` × 3 | +2.00 | 4 | 传递 |
+| stream-neg1 | `write_failed` × 3 | +5.00 | 7 | 传递（慢） |
+
+三次结果在毫秒级上一致，没有抖动。
+
+解释（对照 caddy v2.6.2 源码）：
+
+| 现象 | 机制 |
+|---|---|
+| hold-default 立即关闭 | 客户端断开 → Go 的 HTTP 服务器取消请求上下文 → transport 中止 RoundTrip、关闭到后端的连接 |
+| hold-neg1 一直不关 | `reverseproxy.go:802-803`：`FlushInterval == -1` 时用 `ignoreClientGoneContext`（`:1423-1434`），它的 `Done()` 换成了 Caddy 模块自己的上下文。等待响应头时 Caddy 不往客户端写任何东西，也就没有写失败可以发现断开 |
+| stream-default 2s | Caddy 立即关闭后端连接；后端下一次写进了内核缓冲区并引来 RST，再下一次写才失败：正好两个写周期 |
+| stream-neg1 5s | 上下文被忽略；Caddy 把下一帧写给已断开的客户端时失败（同样要两个写周期），才返回并关闭后端响应体；后端再经过两个写周期才看到 |
+| 去掉 `-1` 不影响流式 | `streaming.go:133-137`：上游是 `text/event-stream` 时一律立即 flush |
+
+对 nahook 的结论：nahook 在等待冷却门和重试期间不向 Caddy 写任何字节，正好对应 hold 这一行。所以 nahook 路由必须不写 `flush_interval`，写了的话客户端走后 nahook 会继续重试到用完上限。不写时断开立即传递，不需要给 nahook 加单请求总时限。
+
+复核：
+- `t0_report.py` 在 LT 上重跑，结果和回报一致。
+- 两次 `systemctl reload caddy` 在 14:09:55 和 14:16:50，都是 `load complete`。
+- Caddyfile 已恢复，sha256 `c688d03e…` 和备份一致；19444、19082、19083 已释放；后端进程已退出。
+
+局限：只测了 HTTP/1.1 回环。源码表明 `-1` 的行为只看配置值、和协议无关，T-C1、T-C2 在 `lt.xhub.chat` 上用 `curl --http2` 复测。
+
+顺带观察（不在 NaHook 范围内，交给用户决定）：生产主站点的所有路径都写了 `-1`。没走 nahook 的请求（非流式请求、nahook 不可用时的回落）如果在 NewAPI 回出第一个字节之前客户端就断开了，NewAPI 会一直执行到结束，上游费用照样产生。
+
+SPEC 落点：
+
+| 改动 | 落点 |
+|---|---|
+| nahook 路由不写 `flush_interval`，写明原因和源码出处 | 00 design §6.1、§8 |
+| 不设单请求总时限 | 01 design §4 |
+| K1 销项；T-C1、T-C2 改用 HTTP/2，并写明两者的预期 | 01 audit §2、§5 |
+| G1、T0 完成；T5 的前置满足 | 00 tasks G1；01 tasks T0、T5 |
+| 补上 `cmd/nahook` 的规定（启动顺序、SIGHUP 日志、SIGTERM 时 Shutdown、退出码），T5 开工前补全 | 01 design §6.8；01 tasks T5 |

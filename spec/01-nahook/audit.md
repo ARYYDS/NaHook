@@ -18,8 +18,8 @@ T-C、T-F 都在测试机 LT 上做（00-总体架构 §2）：经 `lt.xhub.chat
 
 | 编号 | 对应 design | 检查方法 | 通过判据 |
 |---|---|---|---|
-| T-C1 | 00 §6.1 | LT 的 nahook 路由**写上** `flush_interval -1`；mockrelay 设为 `hold:30`；`curl --max-time 2` 经 `lt.xhub.chat` 发请求 | 实测记录 nahook 的 `r.Context()` 是否在 2s 左右被取消（看 nahook 日志里的 `client_gone` 计数，以及 `ss -tn` 里 nahook 到 `127.0.0.1:3000` 的连接是否关闭） |
-| T-C2 | 00 §6.1 | 同上，但去掉 `flush_interval -1` 后 reload | 约 2s 内被取消；nahook 不再重试；到 3000 的连接被关闭 |
+| T-C1 | 00 §6.1 | LT 的 nahook 路由临时**写上** `flush_interval -1`；mockrelay 设为 `hold:30`；`curl --http2 --max-time 2` 经 `lt.xhub.chat` 发请求（T0 只测了 HTTP/1.1，这里补上 HTTP/2） | 实测记录 nahook 的 `r.Context()` 是否在 2s 左右被取消（看 nahook 日志里的 `client_gone` 计数，以及 `ss -tn` 里 nahook 到 `127.0.0.1:3000` 的连接是否关闭） |
+| T-C2 | 00 §6.1 | 同上，但去掉 `flush_interval -1` 后 reload（这是正式配置） | 约 2s 内被取消；nahook 不再重试；到 3000 的连接被关闭。T-C1 预期相反：按 T0 的结论，2s 时不会取消 |
 | T-C3 | 00 §3.3 | mockrelay 设为 `slow:30`；进入流式阶段后断开 | LT 的 NewAPI 日志里这次流的结束原因是 `client_gone` |
 | T-C4 | 00 §3.2 | `systemctl stop nahook` 后发请求 | 请求由 3000 正常完成；10s 内 Caddy 把 19080 标为不健康；启动 nahook 后流量自动回来 |
 | T-F1 | §1.4 | 同一条 `rate_limit` 脚本：先经 LT 的 nahook（上限设为 0），再直连 h3 对照实例 3002（护栏打开，`RetryTimes=0`），分别抓客户端拿到的完整响应 | 状态码、`Content-Type`、响应体逐字节一致（`X-Oneapi-Request-Id` 的值除外） |
@@ -103,7 +103,7 @@ $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -tr
 
 | 编号 | 要查的点 | 现状 | 影响 |
 |---|---|---|---|
-| K1 | Caddy 2.6.2 加上 `flush_interval -1` 时，客户端断开会不会传到后端 | 文档写的是"不取消"；#4952 引入了这个行为，2024 年 11 月回退了（`自动调度/06-community.md` §3）。2.6.2 很可能受影响 | 决定 nahook 路由（00 §6.1）写不写 `flush_interval -1`。如果不写也传不到，就要另外评估 nahook 是否需要一个单请求的总时限。由 T0 在 LT 上实测（`docs/T0/测试方案.md`） |
+| K1 | Caddy 2.6.2 加上 `flush_interval -1` 时，客户端断开会不会传到后端 | **已查清**（2026-10-21 T0）：写了 `-1` 不传递，等待响应头阶段客户端走了 18s 后端连接仍开着；不写时 1ms 内传递。原因是 caddy v2.6.2 `reverseproxy.go:802-803` 的 `ignoreClientGoneContext`，和 HTTP 版本无关。流式阶段两种配置都会传递（写了 `-1` 时靠写失败发现，约 5s；不写约 2s） | nahook 路由不写 `flush_interval`（00 §6.1）；nahook 不加单请求总时限（design §4）；T-C1、T-C2 用 HTTP/2 在完整链路上复测 |
 | K2 | 真实中转站 api21 在流里报限流时帧长什么样：错误在 `error` 事件里还是 `response.failed` 里，前面有没有 `response.created` | 只知道 message 原文和 `type=tokens`、`code=rate_limit_exceeded`（`429-vs-quota.md`），没见过原始帧 | 影响 `upstreamError` 能不能取到错误。message 兜底规则能覆盖大多数形态。可以在阶段 2 开始后，让 nahook 把前几次拦截的原始帧截断后记日志来确认（这些帧里没有密钥） |
 | K3 | 阶段 3 要固定的官方镜像 digest | **已定**：`calciumion/new-api@sha256:6c63c7ee9cd5bf7880df3984e99dd3ef07992d7a97538cfb2719adf9d87bc3f9`（`v1.0.0-rc.45`，源码 `6cf0d90b`），2026-10-21 起在 LT 上运行 | 生产阶段 3 用同一个 digest。要换别的版本，先在 LT 上重做 K4 并通过 T10 的相关审计项 |
 | K4 | h3 和官方 rc.45 之间来回切换时，数据库兼不兼容 | 正向已验证：h3 `38e69e3` = 官方 `32e587406` + 护栏提交，护栏没改表；rc.45 比 `32e587406` 旧 4 个提交，表结构上只差 `audit_logs` 的一个复合索引（`058c823`），启动迁移只建不删。2026-10-21 在 LT 上换镜像，启动迁移没有报错，渠道和设置都正常读到。回退方向（rc.45 → h3）从代码看兼容，还没在 LT 上实际切换过 | 生产阶段 3 的回退方案依赖它。T10 期间在 LT 上演练一次回退再切回来（各需用户同意） |

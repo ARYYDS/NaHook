@@ -34,14 +34,14 @@ L-DOC                                                                           
 
 ## 2. 任务
 
-- [ ] **T0 Caddy 2.6.2 断开传播实验（开工第一步，风险验证）**（L-OPS）
+- [x] **T0 Caddy 2.6.2 断开传播实验（开工第一步，风险验证）**（L-OPS；2026-10-21 完成，specaudit §7.12）
   - 前置：无
   - 改动：测试方案见 `docs/T0/测试方案.md`，执行要求、红线和回报模板见 `docs/T0/测试要求.md`。在 LT（2026-10-21 起只做测试）的 Caddyfile 末尾临时追加一个只监听本机回环的站点 `http://127.0.0.1:19444`，下面四个路径分别对应"不回响应头 / 已开始流式输出"和"写 / 不写 `flush_interval -1`"的组合。后端是 `ops/t0/t0_backend.py`，监听 19082 和 19083；脚本从 GitHub 按固定提交下载，并用 sha256 校验。由用户和执行子代理配合执行，架构侧审回报
   - 依据：audit K1、T-C1、T-C2
   - 完成判据：
-    - [ ] 四种组合各跑 3 次，`t0_report.py` 的 12 行明细都有结果（`hold` 行是 `peer_closed`、`peer_reset` 或 `timeout_still_open`；`stream` 行是 `write_failed` 或 `completed`）
-    - [ ] 按测试方案第 8 节的判定表得出结论；架构侧写进 specaudit §3 的 Q1，并回写到 00 §6.1 和 audit K1
-    - [ ] 临时站点已删除，Caddyfile 的 sha256 和实验前一致，`lt.xhub.chat` 的健康检查返回 200，后端进程已停止
+    - [x] 四种组合各跑 3 次，`t0_report.py` 的 12 行明细都有结果（`hold` 行是 `peer_closed`、`peer_reset` 或 `timeout_still_open`；`stream` 行是 `write_failed` 或 `completed`）
+    - [x] 按测试方案第 8 节的判定表得出结论；架构侧写进 specaudit §3 的 Q1，并回写到 00 §6.1 和 audit K1
+    - [x] 临时站点已删除，Caddyfile 的 sha256 和实验前一致，`lt.xhub.chat` 的健康检查返回 200，后端进程已停止
   - 冲突：`/etc/caddy/Caddyfile`（见 §3）
 
 - [ ] **T1 仓库骨架和 config 包**（L-GO）
@@ -84,11 +84,11 @@ L-DOC                                                                           
   - 冲突：无
 
 - [ ] **T5 proxy 包和 nahook 入口（分类、转发、放行、透传、拦截主循环；main 和信号处理）**（L-GO）
-  - 前置：T2、T3、T4、T6（`obs`）；00 G1（T0 的结论。需要单请求总时限时，先改 design §4 和 §1.6，再开工）
+  - 前置：T2、T3、T4、T6（`obs`）；00 G1（已完成：不需要单请求总时限）
   - 改动：
     - `internal/proxy`：`NewHandler`、`ServeHTTP`、`classify`、`forward`、`serveIntercept`、`release`、`passthrough`、`copyFlush`、`writeBadGateway`
     - `cmd/nahook`：main（`config.Load` → `Validate` → `NewStore` → `obs.NewLogger`、`obs.NewStats` → `gate.NewRegistry` → `proxy.NewHandler` 和 `control.Serve`，两者传入同一个 logger）、信号处理（SIGHUP → `Store.Reload`；SIGTERM → `Server.Shutdown`）
-  - 依据：design §1.2、§1.6、§1.8、§5（日志）、§6.1；interface §1、2.5 ｜ audit T-F2、T-F5、T-F6、T-F7、T-F10、T-F16
+  - 依据：design §1.2、§1.6、§1.8、§4、§5（日志）、§6.1、§6.8；interface §1、2.5 ｜ audit T-F2、T-F5、T-F6、T-F7、T-F10、T-F16
   - 完成判据：
     - [ ] 用 httptest 起一个假 NewAPI，覆盖：重试到上限后返回代 429、重试中途成功、HTTP 429 透传、非流式透传、超大请求体透传、ctx 取消
     - [ ] 断言：判定之前对 `w` 没有任何写入
@@ -98,7 +98,7 @@ L-DOC                                                                           
     - [ ] 断言：假 NewAPI 先发 `: PING`，再发消息以 ` (request id: <本次响应头的 id>)` 结尾的限流帧时，原样放行，只转发 1 次；id 不同时照常拦截
     - [ ] 断言：每个场景结束后的 `Snapshot` 与 design §6.7 一致，且 `rate_limited = retries + gave_up`
     - [ ] 断言：日志是 JSON，一行一条；`intercept`、`wait`、`release`、`give_up` 的字段与 design §5 一致
-    - [ ] `cmd/nahook` 的信号处理在 T10 里于 Linux 上实测（Windows 收不到 SIGHUP）
+    - [ ] `cmd/nahook` 按 design §6.8：启动顺序、同一个 logger 传给 proxy 和 control、SIGHUP 的日志、SIGTERM 时 `Shutdown`、启动失败退出码 1。用进程内测试覆盖 SIGHUP 以外的部分；SIGHUP 在 T10 里于 Linux 上实测（T-F8）
   - 冲突：无
 
 - [ ] **T6 obs 包、control 包和 nahookctl**（L-GO）
