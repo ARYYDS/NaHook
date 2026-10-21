@@ -265,7 +265,18 @@ func TestWaitReturnsImmediatelyWhenCool(t *testing.T) {
 	}
 }
 
+// longestJitter pins the draw to the end of the window, so a test that ends
+// the context early always finds the timer still running. With the real draw
+// a wait shorter than the test's 20ms is a 1% event that fails the test.
+func longestJitter(t *testing.T) {
+	t.Helper()
+	orig := jitter
+	jitter = func(remain time.Duration) time.Duration { return remain - 1 }
+	t.Cleanup(func() { jitter = orig })
+}
+
 func TestWaitReturnsOnContextCancel(t *testing.T) {
+	longestJitter(t)
 	g := &Gate{}
 	g.OnRateLimit(2*time.Second, 2*time.Second, 3)
 
@@ -287,6 +298,7 @@ func TestWaitReturnsOnContextCancel(t *testing.T) {
 }
 
 func TestWaitReturnsOnContextDeadline(t *testing.T) {
+	longestJitter(t)
 	g := &Gate{}
 	g.OnRateLimit(2*time.Second, 2*time.Second, 3)
 
