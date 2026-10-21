@@ -55,6 +55,8 @@ func TestValidate(t *testing.T) {
 		{name: "body limit zero", mutate: func(c *Config) { c.BodyLimit = 0 }, wantErr: ErrInvalidConfig},
 		{name: "body limit negative", mutate: func(c *Config) { c.BodyLimit = -1 }, wantErr: ErrInvalidConfig},
 		{name: "negative base floor", mutate: func(c *Config) { c.Gate.BaseFloorMS = -1 }, wantErr: ErrInvalidConfig},
+		{name: "base floor at the 30m bound", mutate: func(c *Config) { c.Gate.BaseFloorMS = maxBaseFloorMS }},
+		{name: "base floor past the 30m bound", mutate: func(c *Config) { c.Gate.BaseFloorMS = maxBaseFloorMS + 1 }, wantErr: ErrInvalidConfig},
 		{name: "streak cap zero", mutate: func(c *Config) { c.Gate.StreakCap = 0 }, wantErr: ErrInvalidConfig},
 		{name: "streak cap at the overflow bound", mutate: func(c *Config) { c.Gate.StreakCap = maxStreakCap }},
 		{name: "streak cap past the overflow bound", mutate: func(c *Config) { c.Gate.StreakCap = maxStreakCap + 1 }, wantErr: ErrInvalidConfig},
