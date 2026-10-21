@@ -44,9 +44,9 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 
 | nahook 接口 | 签名 | 对照的现有函数 | 和对照函数的差异 |
 |---|---|---|---|
-| `Read` | `func Read(body io.Reader) Result` | `H3/relay/channel/openai/responses_startup_error.go:94` `func readResponsesStartupStream(body io.Reader) responsesStartupReadResult` | 缓冲超限、事件数超限、EOF、读错误时返回 `VerdictRelease` 并带上已读的全部字节，包括没收尾的最后一个事件（h3 是返回 502 错误）；单行读取不超过剩余字节预算（`readLine`），h3 的 `ReadString` 没有这个上限 |
+| `Read` | `func Read(body io.Reader) Result` | `H3/relay/channel/openai/responses_startup_error.go:94` `func readResponsesStartupStream(body io.Reader) responsesStartupReadResult` | 缓冲超限、事件数超限、EOF、读错误时返回 `VerdictRelease` 并带上已读的全部字节，包括没收尾的最后一个事件（h3 是返回 502 错误）；单行读取不超过剩余字节预算（`readLine`），h3 的 `ReadString` 没有这个上限；判定为限流时另外给出 `HeartbeatOnly` 和 `Untyped`（design §1.3），h3 没有这两项 |
 | `readLine` | `func readLine(r *bufio.Reader, limit int) (line []byte, overflow bool, err error)` | `bufio.Reader.ReadSlice` | 读到超过 `limit` 时立即返回 `overflow=true`，已读的字节都在 `line` 里 |
-| `inspect` | `func inspect(eventName, data string) (decision, UpstreamError)` | 同文件 `:171` `func inspectResponsesStartupEvent(eventName, data string) (bool, *types.NewAPIError)` | JSON 解析失败时放行（h3 返回 502）；判定结果有三种：继续 / 放行 / 限流 |
+| `inspect` | `func inspect(eventName, data string) (decision, UpstreamError, bool)` | 同文件 `:171` `func inspectResponsesStartupEvent(eventName, data string) (bool, *types.NewAPIError)` | JSON 解析失败时放行（h3 返回 502）；判定结果有三种：继续 / 放行 / 限流；第三个返回值表示这个事件有没有 type（`type` 字段或 `event:` 行），h3 没有 |
 | `upstreamError` | `func upstreamError(eventType string, f *frame) (UpstreamError, bool)` | 同文件 `:205` `func responsesStartupFrameError(eventType string, frame *responsesStartupFrame) *types.NewAPIError`，以及 `NEWAPI/relaykit/dto/openai_response.go:605` `func GetOpenAIError(errorField any) *types.OpenAIError` | 逐行等同 h3 `:205-245`：取错误的顺序是 `error` → `response.error` → `type=="error"` 时用顶层的 code/message（Type、Param 留空）；事件是 `response.failed`、`response.error`，或 `response.status=="failed"` 时，没取到错误就用顶层字段兜底，message 为空时填 `Responses startup event reported failure`（`:220-232`）。只返回字段，不做状态码映射 |
 | `errorValue` | `func errorValue(raw json.RawMessage) UpstreamError` | `NEWAPI/relaykit/dto/openai_response.go:605` `GetOpenAIError` | 对象按 `map[string]any` 解，type、message、param 只在值是字符串时才取；字符串 → `type:"error"`；其他 → `type:"unknown_error"` |
 | `canonical` / `codeText` | `func canonical(raw json.RawMessage) json.RawMessage`；`func codeText(raw json.RawMessage) string` | h3 的 `OpenAIError.Code` 类型是 `any`：输出时由 encoding/json 编码，判定时用 `fmt.Sprint` | `canonical` 先解成 any 再编回去（`429.0` → `429`）；`codeText` 遇到字符串取原值，其他值用 `fmt.Sprint` |
@@ -96,6 +96,7 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 | `classify` | `func (h *Handler) classify(r *http.Request, cfg *config.Config) ([]byte, reqMeta, bool, io.Reader, error)` | — | design §1.2；只有读请求体出错时返回 error |
 | `forward` | `func (h *Handler) forward(ctx context.Context, r *http.Request, body io.Reader) (*http.Response, error)` | 对照 NewAPI 的接收端：`NEWAPI/relay/responses_handler.go:18` `ResponsesHelper`，它只认 `:66` 的状态码判断 | 不改 XFF；`Host = r.Host`；设置 `Accept-Encoding: identity`；URL、请求体长度和 `GetBody` 的规则见 design §6.1 |
 | `serveIntercept` | `func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []byte, meta reqMeta)` | 对照的是这个循环要弥补的行为：`NEWAPI/relay/channel/openai/relay_responses.go:70` `OaiResponsesStreamHandler`（`:92` 逐帧转发，`:98` 返回 nil）；`NEWAPI/controller/relay.go:72` `Relay`（`:172`/`:177` 每个请求重新计数） | design §1.6 |
+| `newAPIFinalError` | `func newAPIFinalError(res startup.Result, requestID string) bool` | 对照它要识别的写法：h3 `controller/relay.go:96-99`（`MessageWithRequestId` 加后缀）、`:242-258` `writeRelayStreamError`；`relaykit/types/error.go:184` `ToOpenAIError`（上游的 OpenAI 错误原样返回，不带后缀） | design §1.6 的两条规则，满足任一条为真 |
 | `release` / `passthrough` / `copyFlush` | `release(w, resp, prefix []byte, rest io.Reader)`；`passthrough(w, resp)`；`copyFlush(w, src io.Reader)` | flush 写法参照 `NEWAPI/relay/helper/common.go:138` `FlushWriter`；`http.NewResponseController` 的用法参照 `NEWAPI/relay/helper/stream_scanner.go:80` | — |
 | 注释帧 | 透传 `: PING` | `NEWAPI/relay/helper/common.go:231` `PingData` 写出的是 `": PING\n\n"` | 启动阶段把它当注释事件，留在前缀里 |
 
@@ -122,9 +123,9 @@ cmd/nahookctl.main ─► 通过 unix socket 发 HTTP 请求到 control
 | 接口 | 前置条件 | 不变量 | 失败路径 |
 |---|---|---|---|
 | `classify` | `r.Body` 没被读过 | 判定为不拦截时，转发给 NewAPI 的请求体和原始请求体逐字节一致 | 读请求体出错 → 返回 error；`ServeHTTP` 在 ctx 已取消时不写响应，否则回 502 |
-| `startup.Read` | 响应是 200 且为 `text/event-stream` | `Prefix` 是已读字节的完整前缀；`Prefix` 加 `Rest` 正好等于原始流 | 任何异常都放行，不会凭空造出错误 |
+| `startup.Read` | 响应是 200 且为 `text/event-stream` | `Prefix` 是已读字节的完整前缀；`Prefix` 加 `Rest` 正好等于原始流；`HeartbeatOnly` 为真时，判定帧之前的每个事件都只有注释行 | 任何异常都放行，不会凭空造出错误 |
 | `IsRateLimit` | `e` 来自 `upstreamError` | 同一个输入，结果和 h3 的 429 分支一致（只除了 `insufficient_quota`） | — |
-| `serveIntercept` | `body` 是完整缓存下来的请求体 | 在 `release` 或 `proxy429.Write` 之前 `w` 没有被写过；每次尝试只发一次上游请求；`n ≤ RetryMax`；NewAPI 自己的终态错误（消息末尾是本次的 request id）不重试 | ctx 被取消（转发、读启动帧、等待时）→ 不写响应、不 `ResetModel`，计 `client_gone`，直接返回；其他转发错误 → 计 `bad_gateway`，回 502 |
+| `serveIntercept` | `body` 是完整缓存下来的请求体 | 在 `release` 或 `proxy429.Write` 之前 `w` 没有被写过；每次尝试只发一次上游请求；`n ≤ RetryMax`；NewAPI 自己的终态错误（消息末尾是本次的 request id；或者判定帧之前只有心跳、判定帧不带 type）不重试 | ctx 被取消（转发、读启动帧、等待时）→ 不写响应、不 `ResetModel`，计 `client_gone`，直接返回；其他转发错误 → 计 `bad_gateway`，回 502 |
 | `(*Gate).Wait` | — | 等待时长 < `until - now`；只用自己的计时器 | ctx 被取消 → 返回 `ctx.Err()` |
 | `(*Gate).OnRateLimit` | `elapsed ≥ 0` | `until` 只增不减；存下来的 `streak` 始终 ≤ `streakCap`；`base ≤ maxBase`，所以 `base << (s-1)` 不会溢出 | — |
 | `(*Store).SetRetryMax` | `n ≥ 0`，scope 不为空 | 文件内容和内存快照一致；数据面读不到中间状态 | 校验失败，或 rename 之前写盘失败 → 快照不变，返回错误；rename 之后目录 fsync 失败 → 快照切换，返回 `ErrDirSync` |

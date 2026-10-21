@@ -78,11 +78,15 @@ const MaxBytes  = 256 << 10    # H3 responses_startup_error.go:24
 
 type Verdict int               # VerdictRelease | VerdictRateLimit
 type UpstreamError struct { Message, Type, Param string; Code json.RawMessage }
-type Result struct { Verdict Verdict; Prefix []byte; Rest *bufio.Reader; Err UpstreamError }
+type Result struct { Verdict Verdict; Prefix []byte; Rest *bufio.Reader; Err UpstreamError
+                     HeartbeatOnly bool   # 判定帧之前至少有一个事件，并且每一个都只由注释行组成（例如 ": PING"）
+                     Untyped bool }       # 判定帧既没有 type 字段，也没有 event: 行
+                                          # 这两项只在 VerdictRateLimit 时有意义，供 §1.6 的 newAPIFinalError 使用
 
 func Read(body io.Reader) Result
   reader := bufio.NewReader(body); prefix, event := bytes.Buffer{}
   eventName := ""; dataLines := nil; events := 0
+  commentOnly := true; heartbeats := 0; dataSeen := false   # 当前事件是否只有注释行；之前的纯注释事件数；之前是否出现过别的事件
   loop:
     line, overflow, readErr := readLine(reader, MaxBytes - prefix.Len() - event.Len())
         # readLine 用 ReadSlice 逐块拼一行，一旦超过给定上限就立即返回，
@@ -91,30 +95,33 @@ func Read(body io.Reader) Result
         return release(prefix+event+line, reader)          # 超限：原样放行（h3 在这里回 502）
     event.Write(line)
     switch trim(line):
-      前缀 "event:" → eventName = 去掉前缀后的值
-      前缀 "data:"  → dataLines = append(dataLines, 去掉前缀后的值)
+      前缀 "event:" → eventName = 去掉前缀后的值；commentOnly = false
+      前缀 "data:"  → dataLines = append(dataLines, 去掉前缀后的值)；commentOnly = false
       前缀 ":"      → 注释（例如 ": PING"），只留在 event 里
+      其他非空行     → commentOnly = false
     if trim(line) == "" || readErr == io.EOF:
       if event.Len() > 0:
         events++
         if events > MaxEvents: return release(prefix+event, reader)
-        d, e := inspect(eventName, join(dataLines, "\n"))
+        d, e, typed := inspect(eventName, join(dataLines, "\n"))
         prefix.Write(event)
         switch d:
-          decisionContinue  → 继续读下一个事件
+          decisionContinue  → if commentOnly { heartbeats++ } else { dataSeen = true }；继续读下一个事件
           decisionRelease   → return Result{VerdictRelease, prefix, reader}
-          decisionRateLimit → return Result{VerdictRateLimit, prefix, reader, e}
-      event.Reset(); dataLines = nil; eventName = ""
+          decisionRateLimit → return Result{VerdictRateLimit, prefix, reader, e,
+                                            HeartbeatOnly: heartbeats > 0 && !dataSeen, Untyped: !typed}
+      event.Reset(); dataLines = nil; eventName = ""; commentOnly = true
     if readErr != nil:
       return Result{VerdictRelease, prefix+event, reader}   # EOF 或读错：原样放行；没收尾的最后一个事件也并进 Prefix，
                                                             # 保证 Prefix+Rest == 原始字节
 
-func inspect(eventName, data string) (decision, UpstreamError)
+func inspect(eventName, data string) (decision, UpstreamError, bool)   # 第三个返回值 typed：type 字段或 event: 行有值
   if data == "": return decisionContinue                    # 纯注释事件
   var f struct { Type string; Code json.RawMessage; Message string; Param json.RawMessage
                  Error json.RawMessage; Response *struct{ Status json.RawMessage; Error json.RawMessage } }
   if json.Unmarshal(data, &f) != nil: return decisionRelease # 例如 "[DONE]"：放行（h3 在这里回 502）
   typ := f.Type; if typ == "" { typ = eventName }
+  typed := trim(typ) != ""                                 # 下面每个 return 都把 typed 一起带出去
   e, ok := upstreamError(typ, &f)
   if ok:
       if IsRateLimit(e): return decisionRateLimit, e
@@ -225,10 +232,9 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
     if resp.StatusCode != 200 || !isEventStream(resp):
         h.st.Inc(obs.Passthrough); passthrough(w, resp); return   # 包括 NewAPI 自己的 429：它已按 RetryTimes 重试过
     res := startup.Read(resp.Body)
-    if res.Verdict == startup.VerdictRateLimit && newAPIFinalError(res.Err.Message, rid):
-        # NewAPI 自己的终态错误：心跳先提交了 200，它按 RetryTimes 重试完以后把错误写进了流里，
-        # 消息末尾带着本次请求的 id（NEWAPI controller/relay.go:96、:99-101、:242；common/utils.go:269）。
-        # 和非 200 一样原样透传，不叠加重试（R2）
+    if res.Verdict == startup.VerdictRateLimit && newAPIFinalError(res, rid):
+        # NewAPI 自己的终态错误：心跳先提交了 200，它按 RetryTimes 重试完以后把错误写进了流里。
+        # 两条识别规则见下面 newAPIFinalError。和非 200 一样原样透传，不叠加重试（R2）
         # 官方 rc.45（LT 当前版本）还没有 writeRelayStreamError：心跳提交 200 后，终态错误由 c.JSON 直接追加在流后面，
         # 不带 data:（NEWAPI v1.0.0-rc.45 controller/relay.go:102-107）。startup.Read 读不出事件，读到 EOF 放行，
         # 同样不会叠加重试，只是走下面的 VerdictRelease 分支、计 Released
@@ -259,7 +265,12 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
   }
 ```
 
-`newAPIFinalError(msg, rid) = rid != "" && strings.HasSuffix(strings.TrimSpace(msg), " (request id: "+rid+")")`。`rid` 必须和本次响应头里的 `X-Oneapi-Request-Id` 完全相同：上游原样转发的帧不会带这个 id；中转站自己如果也跑 NewAPI，它的 id 和本站的不同，所以不会误判。
+`newAPIFinalError(res, rid)` 满足下面任一条就为真：
+
+1. `rid != "" && strings.HasSuffix(strings.TrimSpace(res.Err.Message), " (request id: "+rid+")")`：NewAPI 自己生成的错误（例如 `model_not_found`）。`Relay` 的 defer 用 `MessageWithRequestId` 给消息加后缀（h3 `controller/relay.go:96-99`、`common/utils.go:269`）。`rid` 必须和本次响应头里的 `X-Oneapi-Request-Id` 完全相同：上游原样转发的帧不会带这个 id；中转站自己如果也跑 NewAPI，它的 id 和本站的不同，所以不会误判。
+2. `res.HeartbeatOnly && res.Untyped`：NewAPI 转发的上游错误。心跳先提交了 200，NewAPI 按 RetryTimes 重试完以后，由 `writeRelayStreamError` 写出 `data: {"error":…}` 和 `data: [DONE]`（h3 `controller/relay.go:242-258`，`#7857` 起的官方版本相同）。这种错误的类型是 `ErrorTypeOpenAIError`，`ToOpenAIError` 直接返回上游原来的错误对象，`SetMessage` 加上的后缀不会出现在输出里（h3 `relaykit/types/error.go:178-190`），所以第 1 条认不出来。T10 在关掉护栏的 h3 上实测：只有第 1 条时，nahook 又重试了 3 轮，上游一共被调用 4 次，客户端 35.9s 后才拿到代 429。判定帧之前只有心跳、没有任何上游数据，并且判定帧不带 type，就是这种情况。
+
+第 2 条只会往一个方向误判：上游很慢、心跳已经发出，而上游的第一帧恰好就是不带 type 的限流错误（例如 Chat 格式）。这时 nahook 放行，客户端看到的和官方行为一样（§8：不能比官方更差）。反方向的误判（把 NewAPI 的终态错误当成上游限流，再重试一轮）会把上游调用放大到 (1 + `retry.max`) × (1 + RetryTimes) 倍，所以选这个方向。上游的 Responses 格式限流（`type` 是 `error` 或 `response.failed`，或者前面有 `response.created`）不受影响，照常拦截（T10 T-F15）。
 
 `ServeHTTP` 的不拦截分支处理 `forward` 错误的方式相同：ctx 已取消时只计 `ClientGone`，否则计 `BadGateway` 并回 502；成功时计 `Passthrough`。日志事件和字段见 §5，计数器见 §6.7。
 
@@ -714,3 +725,4 @@ GitHub Release（公开）
 | 处理函数不读请求体，就开始等待（mockrelay 的 `hold`、`slow`、`stall`） | 请求带请求体时，net/http 要等请求体读完才启动检测断开的后台读，所以对端断开后 `r.Context()` 不会被取消，等待会一直持续到结束 | 等待之前先 `io.Copy(io.Discard, r.Body)`（Go 源码 `net/http/server.go` 里 `startBackgroundRead` 的注释：请求带请求体时，要等请求体全部读完才启动后台读）。nahook 的 `classify` 会先把请求体读进缓存，所以不受影响 |
 | 一直不读完、不关闭被拦截的那次响应体 | 连接泄漏 | 被拦截后立即 `resp.Body.Close()` |
 | 只要 200 SSE 里出现限流帧就重试 | 打开心跳时，NewAPI 会先提交 200，按 RetryTimes 重试完以后再把自己的终态错误写进流里；nahook 再重试一轮，两层重试就叠加了 | 消息以 ` (request id: <本次的 X-Oneapi-Request-Id>)` 结尾时原样放行（§1.6；`NEWAPI/controller/relay.go:99-101`）。rc.45 把这个错误写成不带 `data:` 的裸 JSON，本来就会被放行（§1.6 注释） |
+| 只按消息末尾的 request id 识别 NewAPI 的终态错误 | NewAPI 转发上游的 OpenAI 格式错误时不加这个后缀；心跳打开时，nahook 会把 NewAPI 重试用完后的终态错误当成上游限流，再重试一轮，上游调用被放大（T10 T-F17，h3 关护栏） | 再加一条：判定帧之前只有心跳、判定帧不带 type（§1.6 第 2 条） |

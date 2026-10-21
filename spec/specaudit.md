@@ -30,10 +30,11 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q12 | R5 | 转发·`forward` 没写 Host、URL 和请求体长度的规则 | 未细分 | P2 | 01 | 已关闭：design §6.1 |
 | Q13 | R5 | 排期·T6 漏了对 T5 的依赖；T5 要等 G1，但排在 T7 前面 | 耦合 | P2 | 01 | 已关闭：`obs` 放进 T6，`cmd/nahook` 放进 T5；顺序改为 T7 → T6 → T5，T6 不依赖 T0（§7.9） |
 | Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
-| Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 已关闭：消息末尾是本次 request id 时原样放行（design §1.6、§8；T-F17）；生产上的心跳设置待 K7 |
+| Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 重新打开，见 Q20：request id 规则只认得 NewAPI 自己生成的错误；生产上的心跳设置待 K7 |
 | Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 待 K8（用户告知主机并批准只读核查） |
 | Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 设计已改（00 §3.2、§6.1、§8：`fail_duration 10s`，不写 `lb_try_duration`）；LT 待用户装上 `Caddyfile.final2` 后复测 T-C4 |
 | Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
+| Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 设计已改（01 design §1.3、§1.6、§8；interface 2.1、2.5）；待 T15 实现，并在 LT 上用关护栏的 h3 复测 T-F17 |
 | Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 待实测（K9，需要首帧超过 512 字节的 mockrelay 脚本项）和用户决定（§4 D1、D2） |
 
 ## 3. 逐项说明
@@ -103,6 +104,12 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 - 证据：T10 T-F15，脚本 `hold_rate_limit:5, hold:3`：客户端 11.9s 内没有收到任何字节，放行时 3 行 `: PING` 和 `response.created` 同时到达。nahook 在判定之前不写 `w`，这是能返回 429 的前提（01 audit §1 第一条要点）。
 - 影响：直连官方 NewAPI 并打开心跳时，客户端每隔几秒就能收到 `: PING`；经过 nahook 时，整个启动阶段（上游迟迟不回、每次重试、冷却等待）都是静默的，空闲超时比这段时间短的客户端或中间层会断开。常见情况下静默很短：LT 上真实的限流帧约 1.3s 就到（01 design §3）；上游一直不回响应头时，最长到 Caddy 的 30m。
 - 处理：这是"先判定、后写出"这个设计固有的代价，不改；已写进 01 design §1.8。生产阶段 1、2 观察有没有客户端在启动阶段断开（`client_gone` 计数和 NewAPI 日志），和 K7（心跳设置）一起看。
+
+### Q20 心跳之后 NewAPI 转发的上游错误
+
+- 证据：T10 在关掉护栏的 h3（`38e69e3`）上跑 T-F17（心跳打开、间隔 1s，`RetryTimes=0`，脚本 `hold_http429:3`）。直连时 h3 回 200：3 行 `: PING`，然后是 `data: {"error":{"message":"Rate limit reached … Please try again in 28ms.",…}}` 和 `data: [DONE]`，消息末尾**没有** request id。经过 nahook 时，nahook 把它当成上游限流，重试了 3 次（mockrelay 共收到 4 次，冷却等待 2195ms、10254ms、11397ms），客户端 35.9s 后拿到代 429。原因在 h3 源码：`Relay` 的 defer 先 `SetMessage(MessageWithRequestId(…))`（`controller/relay.go:96-99`），再由 `writeRelayStreamError` 输出 `ToOpenAIError(…)`（`:242-258`）；而 `SetMessage` 只改 `e.Err`，`ToOpenAIError` 遇到 `ErrorTypeOpenAIError` 时直接返回上游原来的错误对象（`relaykit/types/error.go:178-190`）。所以只有 NewAPI 自己生成的错误带后缀，转发上游的 OpenAI 错误不带。rc.45 没有 `writeRelayStreamError`，错误由 `c.JSON` 直接追加（没有 `data:`），nahook 读到 EOF 放行，不受影响（T10 T-F17 rc.45 部分）。
+- 影响：生产阶段 2（h3 关护栏）和阶段 3（如果换成带 `#7857` 的官方版本）上，只要心跳打开、上游的 HTTP 错误回得比心跳间隔慢（或者 NewAPI 的几次重试加起来比心跳间隔长），每个这样的请求对上游的调用会放大到 (1 + `retry.max`) × (1 + RetryTimes) 倍，客户端还要多等几轮冷却。护栏开着时（阶段 1）心跳在启动阶段不发出，h3 直接回 HTTP 429，不受影响（T10 实测）。
+- 处理：01 design §1.6 增加第 2 条规则：判定帧之前只有心跳（至少一个纯注释事件，没有别的事件），并且判定帧不带 type，就认定是 NewAPI 的终态错误，原样透传。只会往放行的方向误判（上游很慢、心跳已发出、上游第一帧就是不带 type 的限流错误时，客户端看到的和官方一样）。由 T15 实现，部署到 LT 后用关护栏的 h3 复测 T-F17；T11 之前完成。K7（生产的心跳设置）仍要查：心跳关着时不会走到这条路径。
 
 ### Q6 被拦截那几次尝试的计费
 
@@ -580,3 +587,20 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 新增的 Caddy 候选文件 `/root/nahook-t10/Caddyfile.final2`：由 `Caddyfile.final` 去掉 nahook 路由的 `lb_try_duration 5s`，`caddy validate` 通过，sha256 `40093312f74e4e2d5602fc8b99d66aef2da10a03abab5c73175af05ecc43fa9a`；`caddy adapt` 确认 nahook 路由只剩 `first` 策略和 `fail_duration 10s`，默认路由不变。
 
 还没做：T-C4 第三次（装上 `Caddyfile.final2` 以后）；LT 面板改回原值（用户）；T-F1 和 h3 上的 T-F17（等用户初始化 3002）；K4（D 组）；K9 的大首帧实测（待用户决定 D2）。
+
+第三轮：用户在 TDSQL-C 上新拍了快照，面板设为失败重试次数 0、心跳打开（间隔 1）；Caddy 已装上 `Caddyfile.final2`。
+
+| 项 | 方法要点 | 结果 | 结论 |
+|---|---|---|---|
+| T-C4（第三次） | `Caddyfile.final2`（`fail_duration 10s`，不写 `lb_try_duration`）；停掉 nahook 后连发 5 个请求，12s 后再发；然后启动 | 请求 1：14ms 后 502（Caddy 只记了一条 `dial tcp 127.0.0.1:19080: connect: connection refused`）；请求 2–5：200，由 NewAPI 完成（mockrelay 4 次）；12s 时 200；启动后 4s 流量回到 nahook | 通过（Q17 关闭） |
+| T-C2（final2 上复测） | 同 T-C2 | 2.5s 时 `client_gone` +1，mockrelay 1 次 | 通过 |
+| K4 | 先备份 rc.45 的编排（`compose.yaml.bak.20261021232403.rc45`），再用上午的 h3 编排备份生成 `compose.h3.yaml`（镜像从 `new-api-h3:latest` 改成固定 digest `6249f475…`；其他行和当前文件相同，密钥 6 行的哈希一致），`docker compose up -d new-api`；之后改成护栏关闭再重建一次；最后恢复 rc.45 的编排 | rc.45 → h3：31s healthy，`main-20261020-38e69e3`，迁移正常、`already initialized`、渠道已同步，ERR/panic 0。h3 关护栏：31s healthy，ERR 0。h3 → rc.45：30s healthy，`v1.0.0-rc.45`，编排哈希回到 `8d3b40f3…`，ERR/panic/迁移报错 0；切回后 `ok`、`rate_limit, ok`、`rate_limit` 三个脚本经 nahook 都正常 | 通过：两个方向的切换都没有数据库问题（K4 关闭，Q4 的回退方向已演练） |
+| T-F1 | nahook 一侧：`retry set 0`，`rate_limit` 直接请求 19080；h3 一侧：K4 期间 LT 主实例是 h3（开护栏、`RetryTimes=0`），`rate_limit` 直接请求 3000。没有用 3002 的对照实例 | 两边都是 `HTTP/1.1 429`、`Content-Type: application/json; charset=utf-8`、`Content-Length: 238`，响应体逐字节相同（sha256 `78e3993361b6c5d6…`），只有 `X-New-Api-Version` 和 request id 不同 | 通过。顺带确认：这个响应体和 rc.45 自己回 429 时（T-F7）也相同 |
+| 阶段 1 预演 | h3 开护栏，经 nahook 发 `rate_limit` | h3 自己回 HTTP 429；nahook `passthrough` +1，`rate_limited` 不变；mockrelay 1 次 | 符合 P-1 的预期：护栏开着时 nahook 只透传 |
+| T-F17（h3 开护栏） | 心跳打开、`RetryTimes=0`，`hold_http429:3`，经 nahook | 客户端直接拿到 HTTP 429（3.0s），没有 `: PING`；nahook 透传；mockrelay 1 次 | 护栏让心跳在启动阶段不发出，这条路径测不到；改在关护栏的 h3 上测 |
+| T-F17（h3 关护栏） | 同上，h3 护栏关闭 | nahook 拦截 4 次、重试 3 次，mockrelay 4 次，客户端 35.9s 后拿到代 429；直连时 h3 回 200：`: PING` ×3、`data: {"error":…}`（没有 request id）、`data: [DONE]` | **不通过**，见 Q20。设计已改，待 T15 |
+| 阶段 2 预演 | h3 关护栏，经 nahook：`rate_limit, ok` 和一直 `rate_limit` | 前者 200（拦截、等待、重试后放行）；后者 4 次尝试后代 429 | 符合 P-2 的预期 |
+
+收尾：面板由用户改回（失败重试次数 3、心跳间隔 1）。3002 的 h3 对照实例没有用上，按 00 design §6.3 由用户删除（`docker rm -f nahook-h3-ref`，再删 `/root/container/nahook-h3-ref/data`）。
+
+还没做：T15 实现、发布、在 LT 上替换 nahook 后用关护栏的 h3 复测 T-F17（切换方法同 K4，需要用户同意）；K9 的大首帧实测（待用户决定 D2）。

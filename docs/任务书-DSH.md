@@ -133,6 +133,7 @@ Set-Location O:\NaHook; $env:PATH = 'O:\WinCache\tools\go\bin;O:\WinCache\tools\
 | T6 | `internal/obs`、`internal/control`、`cmd/nahookctl` | 计数器只用原子操作，`Snapshot` 列出全部 8 个键（design §6.7）；socket 权限 0600；退出码 0/1/2；支持 `--socket` 参数（design §6.4、§6.5） |
 | T7 | `cmd/mockrelay` | 脚本项要齐全（design §6.6）；`rate_limit` 的文案和 `429-vs-quota.md` 的原文一致；要能记录每次请求到达的时间 |
 | T8 | `scripts/build.ps1`、`scripts/release.ps1`、`deploy/*.service`、配置样例；构建后发布第一个 Release | 输出目录 `O:\WinCache\nahook\dist\<8位提交号>\`，里面有三个二进制、`BUILDINFO.txt`（提交号、`go version`）和 `SHA256SUMS`。Release 的 tag 是 `build-<8位提交号>`，标为 prerelease，`--target` 用完整提交号；发完后把附件下载到一个新的空目录，用 Git Bash 跑 `sha256sum -c SHA256SUMS` 验证 |
+| T15 | `internal/startup`、`internal/proxy`：识别心跳之后的 NewAPI 终态错误 | 只加 design §1.3、§1.6 写的两个字段和第 2 条规则，request id 后缀规则原样保留；"纯注释事件"只指每个非空行都以 `:` 开头的事件，只有 `event:` 行的事件不算；误判只能往放行的方向（design §1.6）。不改 gate、proxy429、obs 的任何行为 |
 
 ## 7. 交付回报模板
 

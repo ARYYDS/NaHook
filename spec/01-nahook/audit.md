@@ -38,7 +38,7 @@ T-C、T-F 都在测试机 LT 上做（00-总体架构 §2）：经 `lt.xhub.chat
 | T-F14 | §1.3 | 脚本 `rate_limit_failed_only` | 被拦截 |
 | T-F15 | §1.3、2.5 | LT NewAPI 临时打开保活、间隔设到最小（测完改回）；脚本 `hold_rate_limit:5` 和 `stall_rate_limit:5` 各跑一次（PING 的两个来源：等上游响应头时，以及流式阶段） | 能正确拦截；放行的流里保留了 `: PING` |
 | T-F16 | §1.2 | 请求体大于 64MiB | 透传，不拦截，NewAPI 正常处理（或按它自己的限制拒绝） |
-| T-F17 | §1.6 | NewAPI 临时打开心跳、间隔调到最小，`RetryTimes=0`（测完改回）；脚本 `hold_http429:3`。LT 的 rc.45 和 h3 对照实例（3002）各跑一次 | mockrelay 只收到 1 次请求；客户端拿到 200，`: PING` 之后是 NewAPI 写的错误；nahook 的 `rate_limited` 不变。rc.45 用 `c.JSON` 把错误直接追加在流后面（没有 `data:`，消息末尾也没有 request id），nahook 读到 EOF 放行，`released` 加 1；h3（带 `writeRelayStreamError`，`#7857` 起）写成 SSE 错误帧、消息末尾是本次的 request id，按 request id 规则放行，`passthrough` 加 1 |
+| T-F17 | §1.6 | NewAPI 临时打开心跳、间隔调到最小，`RetryTimes=0`（测完改回）；脚本 `hold_http429:3`。分别在 LT 的 rc.45 和关掉护栏的 h3 上各跑一次（h3 的切换方法同 K4；开着护栏时心跳在启动阶段不发出，客户端直接拿到 HTTP 429，测不到这条路径） | mockrelay 只收到 1 次请求；客户端拿到 200，`: PING` 之后是 NewAPI 写的错误；nahook 的 `rate_limited` 不变。rc.45：错误由 `c.JSON` 直接追加在流后面（没有 `data:`，消息末尾也没有 request id），nahook 读到 EOF 放行，`released` 加 1。h3：`data: {"error":…}`（消息末尾没有 request id）再加 `data: [DONE]`，按 §1.6 第 2 条放行，`passthrough` 加 1 |
 | P-1 | 00 §1.2 阶段 1 | 在生产主机上，护栏还开着时上线 nahook；观察 30 分钟 | nahook 只有透传、没有拦截；`/v1/responses` 的 p50 延迟和上线前比较（实测记录）；停掉 nahook 后请求不中断 |
 | P-2 | 00 §1.2 阶段 2 | 在生产主机上关掉护栏，等下一次限流 | journal 里出现 intercept 并接着 release 或 give_up；客户端拿到的要么是成功的流，要么是 HTTP 429，不会是 SSE 错误 |
 | P-3 | 00 §1.2 阶段 3 | 在生产主机上换成和 LT 相同 digest 的官方镜像 | 同 P-2；面板登录、渠道列表、日志页正常 |
@@ -88,6 +88,7 @@ $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -tr
 |---|---|
 | 直接用 `httputil.ReverseProxy` | 自己写 `forward`（design §6.1、§8） |
 | "顺手"把 HTTP 429 也重试了 | 非 200 一律透传（design §1.6） |
+| 以为 NewAPI 的终态错误消息末尾一定带 request id | 只有 NewAPI 自己生成的错误才带；转发上游的 OpenAI 错误不带，要靠"之前只有心跳、判定帧不带 type"来认（design §1.6 第 2 条；h3 `relaykit/types/error.go:184`） |
 | 把 h3 在缓冲超限、坏 JSON、EOF 时回 502 的逻辑照搬过来 | 一律放行（interface 2.1） |
 | 给冷却门加一把全局锁或者一个队列 | 只用原子变量和 CAS，每个等待者自己的计时器（design §1.5、§4） |
 | 用 `time.Sleep` | 计时器 + `ctx.Done()`（design §8） |

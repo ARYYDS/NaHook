@@ -21,7 +21,7 @@
           阶段 A：风险验证     阶段 B：开发                           阶段 C：测试环境（LT）  阶段 D：生产（生产主机）
 L-OPS  │ T0 Caddy 断开实验 │                                      │ T9 搭测试环境          │ K8 → T11 → T12 → T13
        │（在 LT 上）       │                                      │ T10 跑审计清单          │
-L-GO   │                  │ T1 → T2 → T3 → T4 → T7 → T6 → T5 → T8 │                        │
+L-GO   │                  │ T1 → T2 → T3 → T4 → T7 → T6 → T5 → T8 │ T15                    │
                             （T5 开工前要等 00 G1，也就是 T0 的结论）
                             （Win11 上的 DSH 串行执行；每个任务交付后，由开发机另派审计）
 L-DOC                                                                                         │ T14 运维手册
@@ -30,7 +30,8 @@ L-DOC                                                                           
 - L-OPS 只改主机上的配置和 Caddyfile，不碰 Go 代码；L-GO 只改 nahook 仓库。两条车道可以并行。
 - 阶段 A、C 在测试机 LT 上做；阶段 D 在生产主机上做，开工前先完成 K8。
 - T7、T6 不依赖 T0，排在 T5 前面，用来填 T0 结论出来之前的空档；T5 要等 G1，并依赖 T6 的 `obs`。
-- T9 依赖 T8 的产物和 G1；T11 依赖 T10 全部通过和 K8。
+- T9 依赖 T8 的产物和 G1；T11 依赖 T10 全部通过、T15 已部署到 LT 并复测 T-F17，以及 K8。
+- T15 是 T10 里发现的设计缺陷（specaudit Q20）的修复，在阶段 C 里插进 L-GO 车道。
 
 ## 2. 任务
 
@@ -161,8 +162,25 @@ L-DOC                                                                           
     - [ ] K4 的回退方向在 LT 上演练过一次：rc.45 → h3 → rc.45（各需用户同意）
   - 冲突：LT `/etc/caddy/Caddyfile`（切换 T-C1/T-C2 时）
 
+- [ ] **T15 识别心跳之后的 NewAPI 终态错误**（L-GO）
+  - 前置：T8；specaudit Q20 的设计已写进 design §1.3、§1.6
+  - 改动：
+    - `internal/startup/startup.go`：`Result` 增加 `HeartbeatOnly`、`Untyped`；`Read` 记录当前事件是否只有注释行、之前的纯注释事件数、之前是否出现过别的事件；`inspect` 增加第三个返回值 `typed`（design §1.3）
+    - `internal/proxy/intercept.go`：`newAPIFinalError(res startup.Result, rid string) bool`，按 design §1.6 的两条规则判断；调用处改成传 `res`
+    - 测试：`internal/startup` 和 `internal/proxy` 的单测
+  - 依据：design §1.3、§1.6、§8 ｜ audit T-F15、T-F17；interface 2.1、2.5、§3
+  - 完成判据：
+    - [ ] startup 单测：`: PING` ×2 → `data: {"error":{限流}}` → `data: [DONE]`，得到 `VerdictRateLimit`、`HeartbeatOnly=true`、`Untyped=true`，`Prefix+Rest` 等于原始字节
+    - [ ] startup 单测：没有注释、第一帧就是 `data: {"error":{限流}}` → `HeartbeatOnly=false`
+    - [ ] startup 单测：`: PING` → `event: response.created` → 限流 → `HeartbeatOnly=false`；`: PING` → `{"type":"error",…限流}` → `Untyped=false`；`: PING` → `event: error` + `data: {"error":…}` → `Untyped=false`；只有 `event:` 行、没有 data 的事件不算纯注释事件
+    - [ ] proxy 单测（假 NewAPI）：心跳 + 不带 type 的限流错误 + `[DONE]` → 客户端拿到 200 和逐字节相同的流，上游只被请求 1 次，`passthrough` +1、`rate_limited` 不变
+    - [ ] proxy 单测：心跳 + `response.created` + 限流 → 照常拦截并重试；没有心跳的 Chat 限流帧 → 照常拦截并重试；request id 后缀规则的原有测试仍然通过
+    - [ ] audit §3 的门禁全部通过
+    - [ ] 审计合并到 main 之后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
+  - 冲突：只改 L-GO 车道的文件；LT 上的替换属于 T10（需要用户同意）
+
 - [ ] **T11 生产阶段 1：部署 nahook + Caddy 路由（护栏仍开着）**（L-OPS，在生产主机上，**需要用户同意**）
-  - 前置：T10 全部通过；K8 已核对
+  - 前置：T10 全部通过；T15 已部署到 LT 并复测 T-F17；K8 已核对
   - 改动：从同一个 Release 安装 `nahook.service` 和 `/etc/nahook/config.json`（`retry.max=3`）；备份 Caddyfile 后加 nahook 路由（00 §6.1，`flush_interval` 按 LT 上 T-C1/T-C2 的结论），reload
   - 依据：00 §1.2 阶段 1 ｜ audit P-1
   - 完成判据：
