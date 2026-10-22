@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ARYYDS/NaHook/internal/startup"
 )
@@ -90,7 +91,7 @@ func TestWriteGolden(t *testing.T) {
 			if tt.requestID != "" {
 				upstream = http.Header{"X-Oneapi-Request-Id": {tt.requestID}}
 			}
-			Write(rec, upstream, tt.upstream)
+			Write(rec, upstream, tt.upstream, 0)
 
 			if rec.Code != http.StatusTooManyRequests {
 				t.Fatalf("status = %d, want 429", rec.Code)
@@ -99,7 +100,7 @@ func TestWriteGolden(t *testing.T) {
 				t.Fatalf("Content-Type = %q", got)
 			}
 			if got := rec.Header().Get("Retry-After"); got != "" {
-				t.Fatalf("Retry-After = %q, the response must not carry one", got)
+				t.Fatalf("Retry-After = %q, want none when no cooldown is left", got)
 			}
 
 			if tt.requestID == "" {
@@ -159,7 +160,7 @@ func TestWriteFieldOrder(t *testing.T) {
 		Type:    "t",
 		Param:   "p",
 		Code:    json.RawMessage(`"c"`),
-	})
+	}, 0)
 
 	body := rec.Body.String()
 	want := `{"error":{"message":"m","type":"t","param":"p","code":"c"}}`
@@ -176,7 +177,7 @@ func TestWriteFieldOrder(t *testing.T) {
 // JSON, so this path is unreachable in production (design §1.4).
 func TestWriteInvalidCodeFallsBackToNull(t *testing.T) {
 	rec := httptest.NewRecorder()
-	Write(rec, nil, startup.UpstreamError{Message: "m", Type: "t", Code: json.RawMessage(`{"bad`)})
+	Write(rec, nil, startup.UpstreamError{Message: "m", Type: "t", Code: json.RawMessage(`{"bad`)}, 0)
 
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", rec.Code)
@@ -216,7 +217,7 @@ func TestWriteCopiesAllowlistedHeaders(t *testing.T) {
 		"X-Ratelimit-Remaining-Tokens": {"0"},
 	}
 	rec := httptest.NewRecorder()
-	Write(rec, upstream, startup.UpstreamError{Message: "m"})
+	Write(rec, upstream, startup.UpstreamError{Message: "m"}, 0)
 
 	want := http.Header{
 		"X-Oneapi-Request-Id":              {"req-cors"},
@@ -236,5 +237,63 @@ func TestWriteCopiesAllowlistedHeaders(t *testing.T) {
 	upstream["Vary"][0] = "changed"
 	if got := rec.Header()["Vary"][0]; got != "Origin" {
 		t.Fatalf("Vary aliases the upstream header: %q", got)
+	}
+}
+
+// TestWriteRetryAfter pins the Retry-After rule of design §1.4: the delay is the
+// remaining cooldown, rounded up to whole seconds, never 0, and capped at 1800.
+// The rest of the answer must stay exactly what it is without the header.
+func TestWriteRetryAfter(t *testing.T) {
+	tests := []struct {
+		name       string
+		retryAfter time.Duration
+		want       string
+	}{
+		{name: "no cooldown left", retryAfter: 0, want: ""},
+		{name: "negative is no cooldown either", retryAfter: -time.Second, want: ""},
+		{name: "1ns rounds up to one second", retryAfter: time.Nanosecond, want: "1"},
+		{name: "999ms rounds up", retryAfter: 999 * time.Millisecond, want: "1"},
+		{name: "exactly one second", retryAfter: time.Second, want: "1"},
+		{name: "1.2s rounds up to two", retryAfter: 1200 * time.Millisecond, want: "2"},
+		{name: "exactly two seconds", retryAfter: 2 * time.Second, want: "2"},
+		{name: "28ms of a real window", retryAfter: 28 * time.Millisecond, want: "1"},
+		{name: "30m is the cap", retryAfter: 30 * time.Minute, want: "1800"},
+		{name: "2h is capped", retryAfter: 2 * time.Hour, want: "1800"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			Write(rec, http.Header{"X-Oneapi-Request-Id": {"req-1"}}, startup.UpstreamError{
+				Message: ltMessage,
+				Type:    "tokens",
+				Code:    json.RawMessage(`"rate_limit_exceeded"`),
+			}, tt.retryAfter)
+
+			if got := rec.Header().Get("Retry-After"); got != tt.want {
+				t.Fatalf("Retry-After = %q, want %q", got, tt.want)
+			}
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429", rec.Code)
+			}
+			wantBody := `{"error":{"message":"` + ltMessage + `","type":"tokens","param":"","code":"rate_limit_exceeded"}}`
+			if got := rec.Body.String(); got != wantBody {
+				t.Fatalf("body = %q, want %q", got, wantBody)
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+				t.Fatalf("Content-Type = %q", got)
+			}
+			if got := rec.Header().Get("X-Oneapi-Request-Id"); got != "req-1" {
+				t.Fatalf("X-Oneapi-Request-Id = %q", got)
+			}
+		})
+	}
+
+	// An upstream Retry-After is not copied; the header always carries nahook's
+	// own value for the cooldown this attempt just set.
+	rec := httptest.NewRecorder()
+	Write(rec, http.Header{"Retry-After": {"30"}}, startup.UpstreamError{Message: "m"}, 1200*time.Millisecond)
+	if got := rec.Header()["Retry-After"]; len(got) != 1 || got[0] != "2" {
+		t.Fatalf("Retry-After = %v, want exactly [2]", got)
 	}
 }

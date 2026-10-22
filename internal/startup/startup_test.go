@@ -390,18 +390,124 @@ func TestReadHeartbeatFlags(t *testing.T) {
 	}
 }
 
-// TestReadRawJSONAfterHeartbeatIsReleased is rc.45's terminal error after a
-// heartbeat: c.JSON appends the error with no data: line, so no event can be
-// decided and the whole stream is released at EOF (design §1.6).
-func TestReadRawJSONAfterHeartbeatIsReleased(t *testing.T) {
-	stream := ": PING\n\n: PING\n\n" +
-		`{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"` + ltMessage + `"}}`
+// TestReadRawJSONAfterHeartbeatIsRateLimit is rc.45's terminal error after a
+// heartbeat: Relay's defer writes the error object with c.JSON, so it arrives
+// without a data: line and without a trailing newline, and only the raw JSON
+// rule can recognise it (design §1.3, measured by T10 T-F17).
+func TestReadRawJSONAfterHeartbeatIsRateLimit(t *testing.T) {
+	raw := `{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"` + ltMessage + `"}}`
+	stream := ": PING\n\n: PING\n\n" + raw
 	res := Read(strings.NewReader(stream))
 
-	if res.Verdict != VerdictRelease {
-		t.Fatalf("Verdict = %d, want release", res.Verdict)
+	if res.Verdict != VerdictRateLimit {
+		t.Fatalf("Verdict = %d, want rate limit", res.Verdict)
+	}
+	if !res.HeartbeatOnly || !res.Untyped {
+		t.Fatalf("HeartbeatOnly = %v, Untyped = %v, want both true", res.HeartbeatOnly, res.Untyped)
+	}
+	if res.Err.Message != ltMessage {
+		t.Fatalf("Err.Message = %q, want the upstream text", res.Err.Message)
+	}
+	if got, want := string(res.Err.Code), `"rate_limit_exceeded"`; got != want {
+		t.Fatalf("Err.Code = %s, want %s", got, want)
 	}
 	if got := string(res.Prefix) + string(drain(res.Rest)); got != stream {
 		t.Fatalf("Prefix+Rest != original stream:\n got %q\nwant %q", got, stream)
+	}
+}
+
+// TestReadRawJSONRule covers every condition of the rule one by one: the line
+// must follow heartbeats only, must be the only such line of its event, must not
+// sit next to an event: or data: line, and must start with '{'. Relaxing any of
+// them would let a stray non-field line of an upstream stream become an error
+// frame (design §1.3, §8).
+func TestReadRawJSONRule(t *testing.T) {
+	ping := ": PING\n\n"
+	rawRateLimit := `{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"` + ltMessage + `"}}`
+	rawOtherError := `{"error":{"type":"bad_response_status_code","code":"bad_response_status_code","message":"upstream said no"}}`
+	created := sse("response.created", `{"type":"response.created"}`)
+
+	tests := []struct {
+		name          string
+		stream        string
+		verdict       Verdict
+		heartbeatOnly bool
+		untyped       bool
+	}{
+		{
+			name:          "heartbeats then the raw JSON, no trailing newline",
+			stream:        ping + ping + rawRateLimit,
+			verdict:       VerdictRateLimit,
+			heartbeatOnly: true,
+			untyped:       true,
+		},
+		{
+			name:          "heartbeats then the raw JSON and one newline",
+			stream:        ping + ping + rawRateLimit + "\n",
+			verdict:       VerdictRateLimit,
+			heartbeatOnly: true,
+			untyped:       true,
+		},
+		{
+			name:          "heartbeats then the raw JSON and a blank line",
+			stream:        ping + ping + rawRateLimit + "\n\n",
+			verdict:       VerdictRateLimit,
+			heartbeatOnly: true,
+			untyped:       true,
+		},
+		{
+			name:    "the raw JSON is not a rate limit",
+			stream:  ping + rawOtherError,
+			verdict: VerdictRelease,
+		},
+		{
+			name:    "the raw JSON comes without a heartbeat",
+			stream:  rawRateLimit,
+			verdict: VerdictRelease,
+		},
+		{
+			name:    "an upstream startup event came before the raw JSON",
+			stream:  ping + created + rawRateLimit,
+			verdict: VerdictRelease,
+		},
+		{
+			name:    "two raw lines in the same event",
+			stream:  ping + rawRateLimit + "\n" + `{"a":1}` + "\n\n",
+			verdict: VerdictRelease,
+		},
+		{
+			name:    "the raw JSON sits next to an event: line",
+			stream:  ping + "event: response.ping\n" + rawRateLimit + "\n\n",
+			verdict: VerdictRelease,
+		},
+		{
+			name:    "the raw JSON sits next to a data: line",
+			stream:  ping + "data:\n" + rawRateLimit + "\n\n",
+			verdict: VerdictRelease,
+		},
+		{
+			name:    "a non-JSON line after a heartbeat",
+			stream:  ping + "hello\n\n",
+			verdict: VerdictRelease,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := Read(strings.NewReader(tt.stream))
+			if got := string(res.Prefix) + string(drain(res.Rest)); got != tt.stream {
+				t.Fatalf("Prefix+Rest != original stream:\n got %q\nwant %q", got, tt.stream)
+			}
+			if res.Verdict != tt.verdict {
+				t.Fatalf("Verdict = %d, want %d", res.Verdict, tt.verdict)
+			}
+			if res.Verdict != VerdictRateLimit {
+				return
+			}
+			if res.HeartbeatOnly != tt.heartbeatOnly || res.Untyped != tt.untyped {
+				t.Fatalf("HeartbeatOnly/Untyped = %v/%v, want %v/%v",
+					res.HeartbeatOnly, res.Untyped, tt.heartbeatOnly, tt.untyped)
+			}
+		})
 	}
 }

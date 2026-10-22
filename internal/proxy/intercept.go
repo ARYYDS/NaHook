@@ -47,12 +47,25 @@ func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []
 
 		res := startup.Read(resp.Body)
 		if res.Verdict == startup.VerdictRateLimit && newAPIFinalError(res, rid) {
-			// NewAPI's own terminal error: it committed 200 with its heartbeat,
-			// exhausted RetryTimes and wrote the error into the stream (the two
-			// ways to recognise it are on newAPIFinalError). Retrying here would
-			// stack two retry loops.
-			h.st.Inc(obs.Passthrough)
-			release(w, resp, res.Prefix, res.Rest)
+			// NewAPI's own terminal rate limit: it committed 200 with its
+			// heartbeat, exhausted RetryTimes and wrote the limit into the
+			// stream (the two ways to recognise it are on newAPIFinalError).
+			// Retrying here would stack two retry loops, so this is a 429
+			// answered from the bytes read so far, with Retry-After carrying
+			// the cooldown the attempt just set (design §1.6, specaudit Q23).
+			// n is untouched: this attempt is not one of our retries.
+			_ = resp.Body.Close()
+			h.st.Inc(obs.RateLimited)
+
+			cfg := h.store.Current()
+			key := gate.Key(meta.Model, res.Err.Message)
+			g := h.gates.Get(key)
+			elapsed := time.Since(t0) // includes NewAPI's own attempts and the heartbeat
+			g.OnRateLimit(elapsed, time.Duration(cfg.Gate.BaseFloorMS)*time.Millisecond, cfg.Gate.StreakCap)
+
+			h.st.Inc(obs.Final429)
+			h.log.Info("final_429", "request_id", rid, "key", key, "attempt", n, "elapsed_ms", elapsed.Milliseconds())
+			proxy429.Write(w, resp.Header, res.Err, g.Remaining())
 			return
 		}
 		if res.Verdict == startup.VerdictRelease {
@@ -86,7 +99,7 @@ func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []
 		if n >= max {
 			h.st.Inc(obs.GaveUp)
 			h.log.Info("give_up", "request_id", rid, "key", key, "attempts", n+1)
-			proxy429.Write(w, resp.Header, res.Err)
+			proxy429.Write(w, resp.Header, res.Err, g.Remaining()) // OnRateLimit just ran, so the window is still open
 			return
 		}
 
@@ -122,9 +135,12 @@ func isEventStream(resp *http.Response) bool {
 //     forwarded upstream error with writeRelayStreamError. That error keeps the
 //     upstream object unchanged, so rule 1 cannot see it.
 //
-// Rule 2 can only misjudge towards passing the stream through (a slow upstream
-// whose first frame is an untyped rate limit, e.g. the Chat shape); the client
-// then sees exactly what the official behaviour would deliver (design §8).
+// Rule 2 can only misjudge towards answering the rate limit sooner (a slow
+// upstream whose first frame is an untyped rate limit, e.g. the Chat shape): the
+// client then gets a 429 with Retry-After instead of the official 200, without
+// this loop's extra retries. The other direction would multiply upstream calls
+// by 1+retry.max on top of NewAPI's 1+RetryTimes, so it is chosen deliberately
+// (design §1.6, §8).
 func newAPIFinalError(res startup.Result, requestID string) bool {
 	if requestID != "" && strings.HasSuffix(strings.TrimSpace(res.Err.Message), " (request id: "+requestID+")") {
 		return true

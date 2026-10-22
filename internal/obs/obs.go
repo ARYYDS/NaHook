@@ -22,14 +22,15 @@ const (
 	RateLimited                // rate_limited: one attempt was judged a rate limit
 	Retries                    // retries: decided to wait and try again
 	Released                   // released: the intercepted stream was released
-	GaveUp                     // gave_up: the stand-in 429 was returned
+	GaveUp                     // gave_up: our own retries were used up, the stand-in 429 was returned
+	Final429                   // final_429: NewAPI's terminal rate limit became the stand-in 429, no retry
 	Passthrough                // passthrough: forwarded without interception, or a non-200/non-SSE reply
 	BadGateway                 // bad_gateway: NewAPI was unreachable, answered 502
 	ClientGone                 // client_gone: the client's context ended the forward or the wait
 )
 
 // numCounters is how many counters exist. Snapshot always lists all of them.
-const numCounters = 8
+const numCounters = 9
 
 // counterNames is the GET /v1/stats key of each counter, in constant order.
 var counterNames = [numCounters]string{
@@ -38,6 +39,7 @@ var counterNames = [numCounters]string{
 	Retries:     "retries",
 	Released:    "released",
 	GaveUp:      "gave_up",
+	Final429:    "final_429",
 	Passthrough: "passthrough",
 	BadGateway:  "bad_gateway",
 	ClientGone:  "client_gone",

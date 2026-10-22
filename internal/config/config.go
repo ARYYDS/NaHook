@@ -20,14 +20,20 @@ import (
 
 // Sentinel errors. The control plane maps them to status codes (design §6.4):
 // ErrInvalidRetry and ErrInvalidConfig to 400, ErrRetryNotSet to 404,
-// ErrRestartRequired to 409, ErrDirSync to 200 with a warning (the change is in
-// effect), and any other error out of a persist step to 500.
+// ErrRestartRequired and ErrFileChanged to 409, ErrDirSync to 200 with a warning
+// (the change is in effect), and any other error out of a persist step to 500.
 var (
 	ErrInvalidConfig   = errors.New("config: invalid configuration")
 	ErrInvalidRetry    = errors.New("config: invalid retry max")
 	ErrRetryNotSet     = errors.New("config: model has no per-model retry max")
 	ErrRestartRequired = errors.New("config: change takes effect only after a restart")
 	ErrDirSync         = errors.New("config: renamed into place but directory fsync failed")
+	// ErrFileChanged refuses a write when the file on disk is not what this
+	// process last loaded: the file was edited by hand and the change was not
+	// reloaded, or it cannot be read or parsed at all. Writing the snapshot
+	// back would silently drop those edits, so the operator has to reload first
+	// (design §1.7, specaudit Q22).
+	ErrFileChanged = errors.New("config: file changed on disk; run nahookctl reload first")
 )
 
 // maxStreakCap bounds gate.streak_cap so that the deadline

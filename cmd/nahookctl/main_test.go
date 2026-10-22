@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"os"
@@ -33,8 +34,9 @@ func testConfig() *config.Config {
 }
 
 // startControl runs a real control server on a short unix socket path (sun_path
-// is 108 bytes, so t.TempDir() is not always short enough).
-func startControl(t *testing.T) string {
+// is 108 bytes, so t.TempDir() is not always short enough). It also returns the
+// configuration file, so a test can edit it the way an operator would.
+func startControl(t *testing.T) (socket, configPath string) {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("", "nctl")
@@ -42,14 +44,14 @@ func startControl(t *testing.T) string {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	socket := filepath.Join(dir, "s")
+	socket = filepath.Join(dir, "s")
 
-	path := filepath.Join(t.TempDir(), "config.json")
+	configPath = filepath.Join(t.TempDir(), "config.json")
 	cfg := testConfig()
-	if err := config.Persist(path, cfg); err != nil {
+	if err := config.Persist(configPath, cfg); err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
-	store := config.NewStore(path, cfg)
+	store := config.NewStore(configPath, cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
@@ -80,7 +82,7 @@ func startControl(t *testing.T) string {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	return socket
+	return socket, configPath
 }
 
 func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
@@ -91,7 +93,7 @@ func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
 }
 
 func TestRetryRoundTrip(t *testing.T) {
-	socket := startControl(t)
+	socket, _ := startControl(t)
 
 	code, stdout, stderr := runCLI(t, "retry", "get", "--socket", socket)
 	if code != 0 {
@@ -135,7 +137,7 @@ func TestRetryRoundTrip(t *testing.T) {
 }
 
 func TestGlobalSetWithoutModel(t *testing.T) {
-	socket := startControl(t)
+	socket, _ := startControl(t)
 
 	code, stdout, stderr := runCLI(t, "retry", "set", "0", "--socket", socket)
 	if code != 0 {
@@ -147,7 +149,7 @@ func TestGlobalSetWithoutModel(t *testing.T) {
 }
 
 func TestStatsAndReload(t *testing.T) {
-	socket := startControl(t)
+	socket, _ := startControl(t)
 
 	code, stdout, stderr := runCLI(t, "stats", "--socket", socket)
 	if code != 0 {
@@ -170,7 +172,7 @@ func TestStatsAndReload(t *testing.T) {
 }
 
 func TestSocketFlagForms(t *testing.T) {
-	socket := startControl(t)
+	socket, _ := startControl(t)
 
 	if code, _, stderr := runCLI(t, "--socket="+socket, "stats"); code != 0 {
 		t.Fatalf("--socket=path before the command: code = %d, stderr = %s", code, stderr)
@@ -194,6 +196,9 @@ func TestUsageErrors(t *testing.T) {
 		{"retry", "unset", "--model="},
 		{"stats", "extra"},
 		{"reload", "extra"},
+		{"config"},
+		{"config", "bogus"},
+		{"config", "show", "extra"},
 		{"--socket"},
 		{"--bogus", "stats"},
 	}
@@ -228,7 +233,7 @@ func TestHelp(t *testing.T) {
 
 func TestControlErrors(t *testing.T) {
 	t.Run("rejected value", func(t *testing.T) {
-		socket := startControl(t)
+		socket, _ := startControl(t)
 		code, stdout, stderr := runCLI(t, "retry", "set", "-1", "--socket", socket)
 		if code != 1 {
 			t.Fatalf("code = %d, want 1 (stdout %q)", code, stdout)
@@ -239,7 +244,7 @@ func TestControlErrors(t *testing.T) {
 	})
 
 	t.Run("nothing to unset", func(t *testing.T) {
-		socket := startControl(t)
+		socket, _ := startControl(t)
 		code, _, stderr := runCLI(t, "retry", "unset", "--model", "gpt-6-lunna", "--socket", socket)
 		if code != 1 {
 			t.Fatalf("code = %d, want 1", code)
@@ -259,4 +264,79 @@ func TestControlErrors(t *testing.T) {
 			t.Fatalf("stderr = %q", stderr)
 		}
 	})
+}
+
+// TestConfigShow prints the control plane's answer verbatim: the effective
+// configuration plus whether the file still matches it (design §5, §6.5).
+func TestConfigShow(t *testing.T) {
+	socket, _ := startControl(t)
+
+	code, stdout, stderr := runCLI(t, "config", "show", "--socket", socket)
+	if code != 0 {
+		t.Fatalf("code = %d, stderr = %s", code, stderr)
+	}
+	if !strings.HasSuffix(stdout, "\n") {
+		t.Fatalf("stdout = %q, want the JSON line as the server sent it", stdout)
+	}
+
+	var answer struct {
+		Config json.RawMessage `json:"config"`
+		File   string          `json:"file"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &answer); err != nil {
+		t.Fatalf("stdout is not JSON: %v (%q)", err, stdout)
+	}
+	if answer.File != "in_sync" {
+		t.Fatalf("file = %q, want in_sync", answer.File)
+	}
+	if got := string(answer.Config); !strings.Contains(got, `"max":3`) || !strings.Contains(got, `"listen"`) {
+		t.Fatalf("config = %s, want the effective configuration", got)
+	}
+}
+
+// TestConfigConflict is the operator workflow of T-F18: a hand edit that was not
+// reloaded makes retry set exit 1 with 409, config show reports "changed", and
+// after a reload the same write succeeds without losing the edit.
+func TestConfigConflict(t *testing.T) {
+	socket, path := startControl(t)
+
+	edited, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	edited.Match.Models = append(edited.Match.Models, "gpt-6-lunna")
+	if err := config.Persist(path, edited); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	code, _, stderr := runCLI(t, "retry", "set", "3", "--socket", socket)
+	if code != 1 {
+		t.Fatalf("retry set with a changed file: code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "409") || !strings.Contains(stderr, "reload") {
+		t.Fatalf("stderr = %q, want the 409 and the reload hint", stderr)
+	}
+
+	code, stdout, stderr := runCLI(t, "config", "show", "--socket", socket)
+	if code != 0 {
+		t.Fatalf("config show: code = %d, stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stdout, `"file":"changed"`) {
+		t.Fatalf("stdout = %q, want file changed", stdout)
+	}
+
+	if code, _, stderr := runCLI(t, "reload", "--socket", socket); code != 0 {
+		t.Fatalf("reload: code = %d, stderr = %s", code, stderr)
+	}
+	if code, _, stderr := runCLI(t, "retry", "set", "3", "--socket", socket); code != 0 {
+		t.Fatalf("retry set after reload: code = %d, stderr = %s", code, stderr)
+	}
+
+	after, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(after.Match.Models) != 2 || after.Match.Models[1] != "gpt-6-lunna" {
+		t.Fatalf("models = %v, want the hand-added model to survive", after.Match.Models)
+	}
 }

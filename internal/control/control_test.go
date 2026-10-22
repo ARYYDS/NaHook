@@ -316,20 +316,25 @@ func TestDeleteRetry(t *testing.T) {
 	}
 }
 
-func TestPutRetryWriteError(t *testing.T) {
-	// The store points into a directory that does not exist, so Persist fails
-	// before the rename: the answer is 500 and the snapshot stays untouched.
+// TestPutRetryRefusesUnreadableFile: the store points into a directory that does
+// not exist, so checkFile cannot read the file at all. A write against a
+// configuration this process cannot see is refused with 409, not attempted
+// (design §1.7, §6.4).
+func TestPutRetryRefusesUnreadableFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "config.json")
 	store := config.NewStore(path, validConfig())
 	socket, _, _ := startControl(t, store)
 	client := newClient(socket)
 
 	status, body := request(t, client, http.MethodPut, "/v1/retry", `{"scope":"*","n":5}`)
-	if status != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500 (body %s)", status, body)
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body %s)", status, body)
+	}
+	if !strings.Contains(body, "reload") {
+		t.Fatalf("body = %s, want the reload hint", body)
 	}
 	if got := store.RetryMax("gpt-6-astra"); got != 3 {
-		t.Fatalf("RetryMax after a failed write = %d, want 3", got)
+		t.Fatalf("RetryMax after a refused write = %d, want 3", got)
 	}
 }
 
@@ -398,8 +403,8 @@ func TestStats(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &view); err != nil {
 		t.Fatalf("decode: %v (body %s)", err, body)
 	}
-	if len(view.Counters) != 8 {
-		t.Fatalf("counters = %v, want 8 keys", view.Counters)
+	if len(view.Counters) != 9 {
+		t.Fatalf("counters = %v, want 9 keys", view.Counters)
 	}
 	if view.Counters["retries"] != 2 || view.Counters["intercepted"] != 0 {
 		t.Fatalf("counters = %v", view.Counters)
@@ -444,6 +449,7 @@ func TestErrorMapping(t *testing.T) {
 		{err: config.ErrInvalidConfig, want: http.StatusBadRequest},
 		{err: config.ErrRetryNotSet, want: http.StatusNotFound},
 		{err: config.ErrRestartRequired, want: http.StatusConflict},
+		{err: config.ErrFileChanged, want: http.StatusConflict},
 		{err: errors.New("disk on fire"), want: http.StatusInternalServerError},
 	}
 	for _, tt := range tests {
@@ -563,5 +569,171 @@ func TestSocketMode(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("socket mode = %o, want 600", got)
+	}
+}
+
+// configAnswer is the decoded body of GET /v1/config.
+type configAnswer struct {
+	Config    json.RawMessage `json:"config"`
+	File      string          `json:"file"`
+	FileError string          `json:"file_error"`
+}
+
+// TestGetConfig covers the three file states of GET /v1/config and pins the shape
+// of the config half: empty collections are written as [] and {}, exactly as
+// Persist writes them, so the answer can be compared with the file (design §5).
+func TestGetConfig(t *testing.T) {
+	cfg := validConfig()
+	cfg.Match.Paths = nil  // Persist writes []
+	cfg.Match.Models = nil // every streaming request
+	cfg.Retry.PerModel = nil
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Persist(path, cfg); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	store := config.NewStore(path, cfg)
+	socket, _, _ := startControl(t, store)
+	client := newClient(socket)
+
+	status, body := request(t, client, http.MethodGet, "/v1/config", "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", status, body)
+	}
+	want := `{"config":{"listen":"127.0.0.1:19080","control_socket":"/run/nahook/ctl.sock",` +
+		`"newapi":"http://127.0.0.1:3000","body_limit":67108864,` +
+		`"match":{"paths":[],"models":[]},"retry":{"max":3,"per_model":{}},` +
+		`"gate":{"base_floor_ms":50,"streak_cap":3}},"file":"in_sync"}`
+	if body != want {
+		t.Fatalf("body:\n got %s\nwant %s", body, want)
+	}
+
+	// A hand edit that was not reloaded is reported, while the config half keeps
+	// showing what is actually in effect.
+	edited := validConfig()
+	edited.Match.Models = []string{"gpt-6-lunna"}
+	if err := config.Persist(path, edited); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	status, body = request(t, client, http.MethodGet, "/v1/config", "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", status, body)
+	}
+	var view configAnswer
+	if err := json.Unmarshal([]byte(body), &view); err != nil {
+		t.Fatalf("decode: %v (body %s)", err, body)
+	}
+	if view.File != "changed" {
+		t.Fatalf("file = %q, want changed", view.File)
+	}
+	if view.FileError != "" {
+		t.Fatalf("file_error = %q, want none", view.FileError)
+	}
+	if got := string(view.Config); !strings.Contains(got, `"models":[]`) {
+		t.Fatalf("config = %s, want the snapshot that is in effect", got)
+	}
+
+	// A file that cannot be read is reported with the reason.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	status, body = request(t, client, http.MethodGet, "/v1/config", "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", status, body)
+	}
+	view = configAnswer{}
+	if err := json.Unmarshal([]byte(body), &view); err != nil {
+		t.Fatalf("decode: %v (body %s)", err, body)
+	}
+	if view.File != "unreadable" {
+		t.Fatalf("file = %q, want unreadable", view.File)
+	}
+	if view.FileError == "" {
+		t.Fatalf("body = %s, want a file_error for an unreadable file", body)
+	}
+	if len(view.Config) == 0 || string(view.Config) == "null" {
+		t.Fatalf("config = %s, want the snapshot that is still in effect", view.Config)
+	}
+}
+
+// TestRetryChangeRefusedWhenFileChanged: PUT and DELETE answer 409 with the reload
+// hint, and neither the file nor the snapshot moves (design §1.7, §6.4; T-F18).
+func TestRetryChangeRefusedWhenFileChanged(t *testing.T) {
+	store, path := newStore(t)
+	socket, _, _ := startControl(t, store)
+	client := newClient(socket)
+
+	// One per-model value first, so DELETE has something to remove.
+	if status, body := request(t, client, http.MethodPut, "/v1/retry", `{"scope":"gpt-6-astra","n":1}`); status != http.StatusOK {
+		t.Fatalf("PUT status = %d, body = %s", status, body)
+	}
+
+	// The operator adds a model to the file and does not reload.
+	edited := validConfig()
+	edited.Match.Models = append(edited.Match.Models, "gpt-6-lunna")
+	edited.Retry.PerModel = map[string]int{"gpt-6-astra": 1}
+	if err := config.Persist(path, edited); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	fileBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	before := store.Current()
+
+	tests := []struct {
+		name   string
+		method string
+		target string
+		body   string
+	}{
+		{name: "PUT", method: http.MethodPut, target: "/v1/retry", body: `{"scope":"*","n":5}`},
+		{name: "DELETE", method: http.MethodDelete, target: "/v1/retry?model=gpt-6-astra"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, body := request(t, client, tt.method, tt.target, tt.body)
+			if status != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body %s)", status, body)
+			}
+			var e errorBody
+			if err := json.Unmarshal([]byte(body), &e); err != nil {
+				t.Fatalf("decode: %v (body %s)", err, body)
+			}
+			if !strings.Contains(e.Error, "reload") {
+				t.Fatalf("error = %q, want the reload hint", e.Error)
+			}
+		})
+	}
+
+	if store.Current() != before {
+		t.Fatal("a refused change replaced the snapshot")
+	}
+	if got := store.RetryMax("gpt-6-astra"); got != 1 {
+		t.Fatalf("RetryMax = %d, want the unchanged 1", got)
+	}
+	fileAfter, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(fileBefore, fileAfter) {
+		t.Fatal("a refused change rewrote the file")
+	}
+}
+
+// A write that fails before the rename with an ordinary error is a 500: the
+// change did not happen (design §6.4).
+func TestWriteErrorsOtherThanDirSyncAre500(t *testing.T) {
+	boom := errors.New("disk on fire")
+
+	rec := newRecorder()
+	writeRetryChange(rec, "*", 3, 5, boom)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT status = %d, want 500", rec.Code)
+	}
+
+	rec = newRecorder()
+	writeRemoved(rec, "gpt-6-astra", boom)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("DELETE status = %d, want 500", rec.Code)
 	}
 }

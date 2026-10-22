@@ -11,13 +11,23 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/textproto"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ARYYDS/NaHook/internal/startup"
 )
 
-// contentType is what NEWAPI controller/relay.go:105 sets before c.JSON.
-const contentType = "application/json; charset=utf-8"
+const (
+	// contentType is what NEWAPI controller/relay.go:105 sets before c.JSON.
+	contentType = "application/json; charset=utf-8"
+
+	// maxRetryAfter bounds Retry-After to the same 30m as gate.maxBase
+	// (design §1.4): the base of a cooldown window never exceeds it, so a
+	// remaining time above the bound can only come from a streak widening the
+	// window, and 1800 seconds is still a sane thing to ask a client to wait.
+	maxRetryAfter = 30 * time.Minute
+)
 
 // copied lists the headers taken from the last upstream attempt, besides every
 // Access-Control-* header: NewAPI's middleware adds them to every response, so
@@ -49,9 +59,15 @@ type openAIError struct {
 // upstream is the response header of the last upstream attempt. Only the
 // request id, X-New-Api-Version, Vary and the Access-Control-* headers are
 // copied; SSE, hop-by-hop, Content-* and forwarded headers are not. The message
-// is never rewritten and no Retry-After is added, so the response stays
-// consistent with what NewAPI itself would have produced.
-func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError) {
+// is never rewritten, so besides Retry-After the response stays byte-for-byte
+// what NewAPI itself would have produced.
+//
+// retryAfter is what is left of the cooldown window of this key
+// (gate.(*Gate).Remaining). When it is positive the answer carries
+// Retry-After, the only header nahook adds on its own (design §1.4): NewAPI's
+// relay errors never have one, and a client that backs off for less than the
+// window would run into the same limit again.
+func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError, retryAfter time.Duration) {
 	oe := openAIError{
 		Message: e.Message,
 		Type:    e.Type,
@@ -75,6 +91,22 @@ func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError)
 		}
 	}
 	h.Set("Content-Type", contentType)
+	if retryAfter > 0 {
+		h.Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
+	}
 	w.WriteHeader(http.StatusTooManyRequests)
 	_, _ = w.Write(body)
+}
+
+// retryAfterSeconds renders the remaining window as the delay-seconds value of
+// RFC 9110 §10.2.3: a decimal integer, rounded up so that a client which waits
+// exactly that long is past the window, never 0, and capped at 1800 (design
+// §1.4). Rounding down would let the client retry inside the window; writing 0
+// would tell it to retry at once.
+func retryAfterSeconds(remain time.Duration) int {
+	secs := (min(remain, maxRetryAfter) + time.Second - 1) / time.Second
+	if secs < 1 {
+		secs = 1
+	}
+	return int(secs)
 }

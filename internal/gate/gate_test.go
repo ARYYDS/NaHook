@@ -314,6 +314,42 @@ func TestWaitReturnsOnContextDeadline(t *testing.T) {
 	}
 }
 
+// TestRemaining covers the T16 criterion for the value behind Retry-After: it is
+// positive right after an interception, never above the window, and exactly zero
+// once the window has passed (design §1.5).
+func TestRemaining(t *testing.T) {
+	g := &Gate{}
+	if got := g.Remaining(); got != 0 {
+		t.Fatalf("Remaining on a fresh gate = %v, want 0", got)
+	}
+
+	const window = 40 * time.Millisecond
+	g.OnRateLimit(window, window, 3)
+	if got := g.Remaining(); got <= 0 || got > window {
+		t.Fatalf("Remaining after OnRateLimit = %v, want within (0, %v]", got, window)
+	}
+
+	time.Sleep(2 * window)
+	if got := g.Remaining(); got != 0 {
+		t.Fatalf("Remaining after the window = %v, want 0, never negative", got)
+	}
+}
+
+// The header value is derived from the whole window, not from a jittered draw:
+// otherwise the client could be told to retry inside the window.
+func TestRemainingIsNotJittered(t *testing.T) {
+	g := &Gate{}
+	const window = time.Second
+	g.OnRateLimit(window, window, 3)
+
+	// A jittered draw would land at remain/2 on average and fall below this
+	// bound most of the time.
+	remain := g.Remaining()
+	if remain < window-50*time.Millisecond || remain > window {
+		t.Fatalf("Remaining = %v, want about the whole window %v", remain, window)
+	}
+}
+
 func TestOnReleasedResetsStreak(t *testing.T) {
 	g := &Gate{}
 	for i := 0; i < 3; i++ {

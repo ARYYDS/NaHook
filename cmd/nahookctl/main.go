@@ -31,6 +31,7 @@ commands:
   retry unset --model M        drop the per-model value
   stats                        counters and gate states
   reload                       re-read the configuration file
+  config show                  effective configuration, and whether the file differs
 
 exit codes: 0 success, 2 bad arguments, 1 control plane error
 `
@@ -45,7 +46,7 @@ func main() {
 type command struct {
 	socket string
 	model  string
-	verb   string // get, set, unset, stats, reload
+	verb   string // get, set, unset, stats, reload, config
 	value  int
 }
 
@@ -159,6 +160,14 @@ func parseArgs(args []string) (command, error) {
 			return cmd, errors.New("reload takes no arguments")
 		}
 		cmd.verb = "reload"
+	case "config":
+		if len(positional) != 2 {
+			return cmd, errors.New("config needs show")
+		}
+		if positional[1] != "show" {
+			return cmd, fmt.Errorf("unknown config command %q", positional[1])
+		}
+		cmd.verb = "config"
 	default:
 		return cmd, fmt.Errorf("unknown command %q", positional[0])
 	}
@@ -235,6 +244,8 @@ func buildRequest(cmd command) (*http.Request, error) {
 		return http.NewRequest(http.MethodGet, base+"/v1/stats", nil)
 	case "reload":
 		return http.NewRequest(http.MethodPost, base+"/v1/reload", nil)
+	case "config":
+		return http.NewRequest(http.MethodGet, base+"/v1/config", nil)
 	default:
 		return nil, fmt.Errorf("unknown command %q", cmd.verb)
 	}

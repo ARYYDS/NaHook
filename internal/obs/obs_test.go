@@ -8,11 +8,11 @@ import (
 	"testing"
 )
 
-// designKeys are the eight keys of design §6.7, spelled out so a rename in the
+// designKeys are the nine keys of design §6.7, spelled out so a rename in the
 // package shows up here.
 var designKeys = []string{
-	"intercepted", "rate_limited", "retries", "released",
-	"gave_up", "passthrough", "bad_gateway", "client_gone",
+	"intercepted", "rate_limited", "retries", "released", "gave_up",
+	"final_429", "passthrough", "bad_gateway", "client_gone",
 }
 
 func TestSnapshotListsEveryCounter(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,18 @@ func untypedRateLimitFrames(message string) string {
 	return `data: {"error":{"type":"tokens","code":"rate_limit_exceeded","message":"` + message + `"}}` + "\n\n" +
 		"data: [DONE]\n\n"
 }
+
+// rawJSONRateLimit is rc.45's terminal error: the same error object written
+// straight into the stream, without a data: line and without a trailing newline
+// (design §1.3; T10 T-F17 measured it).
+func rawJSONRateLimit(message string) string {
+	return `{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"` + message + `"}}`
+}
+
+// otherErrorFrames is a terminal upstream error that is not a rate limit: it must
+// be released unchanged whatever committed the response (design §1.3, §1.6).
+const otherErrorFrames = "event: error\n" +
+	`data: {"type":"error","error":{"type":"bad_response_status_code","code":"bad_response_status_code","message":"upstream said no"}}` + "\n\n"
 
 // upstreamRecord is one request the fake NewAPI received.
 type upstreamRecord struct {
@@ -125,6 +138,18 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		h.Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, http429Body)
+	case "ping_raw_json_rate_limit":
+		h.Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, ": PING\n\n: PING\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		_, _ = io.WriteString(w, rawJSONRateLimit(rateLimitMessage))
+	case "ping_other_error":
+		h.Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, ": PING\n\n"+otherErrorFrames)
 	case "ping_untyped_rate_limit", "chat_rate_limit":
 		h.Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -261,14 +286,36 @@ func streamBody(model string, stream bool) string {
 
 func assertCounters(t *testing.T, got map[string]int64, want map[string]int64) {
 	t.Helper()
-	for _, key := range []string{"intercepted", "rate_limited", "retries", "released", "gave_up", "passthrough", "bad_gateway", "client_gone"} {
+	for _, key := range []string{"intercepted", "rate_limited", "retries", "released", "gave_up", "final_429", "passthrough", "bad_gateway", "client_gone"} {
 		if got[key] != want[key] {
 			t.Errorf("counter %s = %d, want %d", key, got[key], want[key])
 		}
 	}
-	if got["rate_limited"] != got["retries"]+got["gave_up"] {
-		t.Errorf("invariant broken: rate_limited=%d retries=%d gave_up=%d", got["rate_limited"], got["retries"], got["gave_up"])
+	// Every attempt judged a rate limit goes down exactly one of three paths
+	// (design §6.7): it waits for a retry (retries), our ceiling is reached
+	// (gave_up), or NewAPI's terminal limit is answered at once (final_429).
+	if got["rate_limited"] != got["retries"]+got["gave_up"]+got["final_429"] {
+		t.Errorf("invariant broken: rate_limited=%d retries=%d gave_up=%d final_429=%d",
+			got["rate_limited"], got["retries"], got["gave_up"], got["final_429"])
 	}
+}
+
+// wantRetryAfter checks the header the proxy adds to its own 429s: a whole number
+// of seconds, at least 1 and at most 1800 (design §1.4).
+func wantRetryAfter(t *testing.T, h http.Header) int {
+	t.Helper()
+	raw := h.Get("Retry-After")
+	if raw == "" {
+		t.Fatalf("Retry-After is missing from the stand-in 429")
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("Retry-After = %q, want whole seconds", raw)
+	}
+	if secs < 1 || secs > 1800 {
+		t.Fatalf("Retry-After = %d, want within 1..1800", secs)
+	}
+	return secs
 }
 
 func TestInterceptGivesUpWithProxy429(t *testing.T) {
@@ -298,6 +345,7 @@ func TestInterceptGivesUpWithProxy429(t *testing.T) {
 	if got := spy.rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("Access-Control-Allow-Origin = %q, want *", got)
 	}
+	wantRetryAfter(t, spy.rec.Header())
 	if len(spy.headerAt) != 1 {
 		t.Fatalf("WriteHeader calls = %d, want 1", len(spy.headerAt))
 	}
@@ -357,6 +405,11 @@ func TestInterceptPassesThroughHTTP429(t *testing.T) {
 	}
 	if spy.rec.Body.String() != http429Body {
 		t.Errorf("body = %q, want the upstream body unchanged", spy.rec.Body.String())
+	}
+	// NewAPI's own 429 is passed through as it is: no Retry-After from nahook
+	// (design §1.4, §1.6).
+	if got := spy.rec.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q, want none on a passed-through NewAPI 429", got)
 	}
 	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "passthrough": 1})
 }
@@ -444,7 +497,10 @@ func TestForwardPreservesHeadersHostAndBody(t *testing.T) {
 	}
 }
 
-func TestNewAPIFinalErrorIsPassedThrough(t *testing.T) {
+// TestNewAPIFinalLimitBecomes429: the request-id suffix identifies NewAPI's own
+// terminal rate limit (design §1.6 rule 1). T16 answers it with the stand-in 429
+// instead of passing it through, and does not retry (specaudit Q23).
+func TestNewAPIFinalLimitBecomes429(t *testing.T) {
 	up := newFakeUpstream(t, "final")
 	c := testConfig(t, up.server.URL, 3)
 	h, stats, _, _ := newTestHandler(t, c)
@@ -453,15 +509,26 @@ func TestNewAPIFinalErrorIsPassedThrough(t *testing.T) {
 	h.ServeHTTP(spy, postRequest(context.Background(), streamBody("gpt-6-astra", true)))
 
 	if up.count() != 1 {
-		t.Fatalf("upstream calls = %d, want 1 (NewAPI's own final error must not be retried)", up.count())
+		t.Fatalf("upstream calls = %d, want 1 (NewAPI's own terminal limit must not be retried)", up.count())
 	}
-	if spy.rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", spy.rec.Code)
+	if spy.rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", spy.rec.Code)
 	}
-	if !strings.Contains(spy.rec.Body.String(), " (request id: req-1)") {
-		t.Errorf("body does not carry the original final error: %q", spy.rec.Body.String())
+	wantBody := `{"error":{"message":"` + rateLimitMessage + ` (request id: req-1)","type":"tokens","param":"","code":"rate_limit_exceeded"}}`
+	if got := spy.rec.Body.String(); got != wantBody {
+		t.Fatalf("body = %q, want %q", got, wantBody)
 	}
-	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "passthrough": 1})
+	if got := spy.rec.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if got := spy.rec.Header().Get("X-Oneapi-Request-Id"); got != "req-1" {
+		t.Errorf("X-Oneapi-Request-Id = %q, want req-1", got)
+	}
+	wantRetryAfter(t, spy.rec.Header())
+	if len(spy.headerAt) != 1 || spy.headerAt[0] != 1 {
+		t.Errorf("WriteHeader at %v, want exactly one after the only upstream call", spy.headerAt)
+	}
+	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "rate_limited": 1, "final_429": 1})
 }
 
 func TestForeignRequestIDIsStillIntercepted(t *testing.T) {
@@ -498,7 +565,9 @@ func TestPingIsKeptInReleasedStream(t *testing.T) {
 	}
 }
 
-func TestPingWithFinalErrorIsPassedThrough(t *testing.T) {
+// TestPingWithFinalLimitBecomes429: same rule 1, but NewAPI's heartbeat came
+// first. The answer is still the stand-in 429, with the cooldown in Retry-After.
+func TestPingWithFinalLimitBecomes429(t *testing.T) {
 	up := newFakeUpstream(t, "ping_final")
 	c := testConfig(t, up.server.URL, 3)
 	h, stats, _, _ := newTestHandler(t, c)
@@ -509,11 +578,15 @@ func TestPingWithFinalErrorIsPassedThrough(t *testing.T) {
 	if up.count() != 1 {
 		t.Fatalf("upstream calls = %d, want 1", up.count())
 	}
-	body := spy.rec.Body.String()
-	if !strings.HasPrefix(body, ": PING\n\n") || !strings.Contains(body, " (request id: req-1)") {
-		t.Errorf("final error was not passed through unchanged: %q", body)
+	if spy.rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", spy.rec.Code)
 	}
-	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "passthrough": 1})
+	wantBody := `{"error":{"message":"` + rateLimitMessage + ` (request id: req-1)","type":"tokens","param":"","code":"rate_limit_exceeded"}}`
+	if got := spy.rec.Body.String(); got != wantBody {
+		t.Fatalf("body = %q, want %q", got, wantBody)
+	}
+	wantRetryAfter(t, spy.rec.Header())
+	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "rate_limited": 1, "final_429": 1})
 }
 
 func TestForwardFailureWritesBadGateway(t *testing.T) {
@@ -799,11 +872,12 @@ func TestNewAPIFinalErrorRules(t *testing.T) {
 	}
 }
 
-// TestHeartbeatUntypedFinalErrorIsPassedThrough is the T15 case of Q20: NewAPI
-// committed 200 with its heartbeat and then wrote a forwarded upstream error
-// with no type. Retrying would stack a second retry loop on top of RetryTimes,
-// so the stream must reach the client unchanged after one upstream call.
-func TestHeartbeatUntypedFinalErrorIsPassedThrough(t *testing.T) {
+// TestHeartbeatUntypedFinalLimitBecomes429 is the T15 case of Q20 with the T16
+// answer: NewAPI committed 200 with its heartbeat and then wrote a forwarded
+// upstream error with no type. It is not retried, and because nahook has written
+// no byte yet the client gets a 429 with the cooldown in Retry-After (design
+// §1.6, specaudit Q23).
+func TestHeartbeatUntypedFinalLimitBecomes429(t *testing.T) {
 	up := newFakeUpstream(t, "ping_untyped_rate_limit")
 	c := testConfig(t, up.server.URL, 3)
 	h, stats, _, _ := newTestHandler(t, c)
@@ -812,22 +886,75 @@ func TestHeartbeatUntypedFinalErrorIsPassedThrough(t *testing.T) {
 	h.ServeHTTP(spy, postRequest(context.Background(), streamBody("gpt-6-astra", true)))
 
 	if up.count() != 1 {
-		t.Fatalf("upstream calls = %d, want 1 (the forwarded final error must not be retried)", up.count())
+		t.Fatalf("upstream calls = %d, want 1 (the forwarded terminal limit must not be retried)", up.count())
+	}
+	if spy.rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", spy.rec.Code)
+	}
+	if got := spy.rec.Body.String(); got != http429Body {
+		t.Fatalf("body = %q, want %q", got, http429Body)
+	}
+	if got := spy.rec.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if got := spy.rec.Header().Get("X-Oneapi-Request-Id"); got != "req-1" {
+		t.Errorf("X-Oneapi-Request-Id = %q, want req-1", got)
+	}
+	wantRetryAfter(t, spy.rec.Header())
+	if len(spy.headerAt) != 1 || spy.headerAt[0] != 1 {
+		t.Errorf("WriteHeader at %v, want exactly one after the only upstream call", spy.headerAt)
+	}
+	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "rate_limited": 1, "final_429": 1})
+}
+
+// TestHeartbeatRawJSONFinalLimitBecomes429 is rc.45's shape: the terminal limit is
+// written straight into the stream with no data: line and no trailing newline
+// (design §1.3). It ends in the same 429, without a retry.
+func TestHeartbeatRawJSONFinalLimitBecomes429(t *testing.T) {
+	up := newFakeUpstream(t, "ping_raw_json_rate_limit")
+	c := testConfig(t, up.server.URL, 3)
+	h, stats, _, _ := newTestHandler(t, c)
+
+	spy := &spyWriter{rec: httptest.NewRecorder(), forwards: up.count}
+	h.ServeHTTP(spy, postRequest(context.Background(), streamBody("gpt-6-astra", true)))
+
+	if up.count() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (rc.45's terminal limit must not be retried)", up.count())
+	}
+	if spy.rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", spy.rec.Code)
+	}
+	if got := spy.rec.Body.String(); got != http429Body {
+		t.Fatalf("body = %q, want %q", got, http429Body)
+	}
+	wantRetryAfter(t, spy.rec.Header())
+	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "rate_limited": 1, "final_429": 1})
+}
+
+// TestHeartbeatThenOtherErrorIsReleased: a terminal error that is not a rate
+// limit is released unchanged, heartbeat included, after a single request
+// (design §1.6: only rate limits are answered by nahook).
+func TestHeartbeatThenOtherErrorIsReleased(t *testing.T) {
+	up := newFakeUpstream(t, "ping_other_error")
+	c := testConfig(t, up.server.URL, 3)
+	h, stats, _, _ := newTestHandler(t, c)
+
+	spy := &spyWriter{rec: httptest.NewRecorder(), forwards: up.count}
+	h.ServeHTTP(spy, postRequest(context.Background(), streamBody("gpt-6-astra", true)))
+
+	if up.count() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", up.count())
 	}
 	if spy.rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", spy.rec.Code)
+		t.Fatalf("status = %d, want 200 with the released stream", spy.rec.Code)
 	}
-	wantBody := ": PING\n\n: PING\n\n" + untypedRateLimitFrames(rateLimitMessage)
-	if got := spy.rec.Body.String(); got != wantBody {
-		t.Fatalf("body = %q, want %q", got, wantBody)
+	if wantBody := ": PING\n\n" + otherErrorFrames; spy.rec.Body.String() != wantBody {
+		t.Fatalf("body = %q, want %q", spy.rec.Body.String(), wantBody)
 	}
-	if got := spy.rec.Header().Get("Content-Type"); got != "text/event-stream" {
-		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	if got := spy.rec.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q: a released stream carries no cooldown header", got)
 	}
-	if len(spy.headerAt) != 1 || spy.headerAt[0] != 1 {
-		t.Errorf("WriteHeader calls at %v, want exactly one after the only upstream call", spy.headerAt)
-	}
-	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "passthrough": 1})
+	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "released": 1})
 }
 
 // TestHeartbeatThenCreatedIsStillIntercepted: once a real startup event arrived,

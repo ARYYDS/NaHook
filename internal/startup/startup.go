@@ -107,6 +107,8 @@ func Read(body io.Reader) Result {
 	events := 0
 	commentOnly := true // every non-empty line of the current event is a comment
 	hasComment := false // the current event has at least one comment line
+	rawLine := ""       // last non-empty line of the current event that is neither a field nor a comment
+	rawLines := 0       // how many such lines the current event has
 	heartbeats := 0     // comment-only events seen before the deciding frame
 	dataSeen := false   // an earlier event carried more than comments
 
@@ -140,7 +142,11 @@ func Read(body io.Reader) Result {
 				hasComment = true
 			case trimmed != "":
 				// Some other non-empty line still means upstream data started.
+				// One of them may be rc.45's terminal error, which is only
+				// recognisable further down (design §1.3).
 				commentOnly = false
+				rawLines++
+				rawLine = trimmed
 			}
 		}
 
@@ -155,7 +161,22 @@ func Read(body io.Reader) Result {
 					}
 				}
 
-				d, e, typed := inspect(eventName, strings.Join(dataLines, "\n"))
+				data := strings.Join(dataLines, "\n")
+				// rc.45's terminal error: the heartbeat already committed 200
+				// and Relay's defer wrote the error object into the stream with
+				// c.JSON, so there is no data: line and no trailing newline
+				// (NEWAPI v1.0.0-rc.45 controller/relay.go:92-110; T10 T-F17
+				// measured it, T16 turns it into the stand-in 429). Every
+				// condition is required: only in this position is such a line
+				// NewAPI's own error, and relaxing one would make a stray
+				// non-field line of an upstream stream look like an error frame
+				// (design §1.3, §8).
+				if heartbeats > 0 && !dataSeen && eventName == "" && len(dataLines) == 0 &&
+					rawLines == 1 && strings.HasPrefix(rawLine, "{") {
+					data = rawLine
+				}
+
+				d, e, typed := inspect(eventName, data)
 				prefix.Write(event.Bytes())
 				switch d {
 				case decisionRelease:
@@ -185,6 +206,8 @@ func Read(body io.Reader) Result {
 			eventName = ""
 			commentOnly = true
 			hasComment = false
+			rawLine = ""
+			rawLines = 0
 		}
 
 		if readErr != nil {

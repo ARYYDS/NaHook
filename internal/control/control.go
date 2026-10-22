@@ -89,6 +89,7 @@ func (h *handler) mux() http.Handler {
 	mux.HandleFunc("DELETE /v1/retry", h.deleteRetry)
 	mux.HandleFunc("GET /v1/stats", h.getStats)
 	mux.HandleFunc("POST /v1/reload", h.reload)
+	mux.HandleFunc("GET /v1/config", h.getConfig)
 	return mux
 }
 
@@ -223,10 +224,47 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, config.ErrRetryNotSet):
 		status = http.StatusNotFound
-	case errors.Is(err, config.ErrRestartRequired):
+	case errors.Is(err, config.ErrRestartRequired), errors.Is(err, config.ErrFileChanged):
 		status = http.StatusConflict
 	}
 	writeError(w, status, err.Error())
+}
+
+// GET /v1/config → {"config":{…},"file":"in_sync"|"changed"} or, when the file
+// cannot be read, the same with "file":"unreadable" and "file_error" (design §5).
+// The snapshot and the file are observed one after the other, not atomically: a
+// write that lands between the two calls can make "file" one step behind.
+func (h *handler) getConfig(w http.ResponseWriter, r *http.Request) {
+	view := configView{Config: persistedShape(h.store.Current())}
+	inSync, err := h.store.FileStatus()
+	switch {
+	case err != nil:
+		view.File = "unreadable"
+		view.FileError = err.Error()
+	case inSync:
+		view.File = "in_sync"
+	default:
+		view.File = "changed"
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// persistedShape returns c shaped the way Persist writes it, so the config in
+// the answer can be compared with the file directly (design §5): an empty
+// collection is encoded as [] or {} rather than null. The snapshot itself is
+// never modified.
+func persistedShape(c *config.Config) *config.Config {
+	out := *c
+	if out.Match.Paths == nil {
+		out.Match.Paths = []string{}
+	}
+	if out.Match.Models == nil {
+		out.Match.Models = []string{}
+	}
+	if out.Retry.PerModel == nil {
+		out.Retry.PerModel = map[string]int{}
+	}
+	return &out
 }
 
 type retryView struct {
@@ -246,6 +284,14 @@ type removedView struct {
 	Scope   string `json:"scope"`
 	Removed bool   `json:"removed"`
 	Warning string `json:"warning,omitempty"`
+}
+
+// configView is the answer of GET /v1/config (design §5). File is "in_sync",
+// "changed" or "unreadable"; FileError is only present for "unreadable".
+type configView struct {
+	Config    *config.Config `json:"config"`
+	File      string         `json:"file"`
+	FileError string         `json:"file_error,omitempty"`
 }
 
 type errorBody struct {

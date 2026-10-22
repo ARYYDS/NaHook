@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -348,4 +350,234 @@ func TestConcurrentReadersAndWriters(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// readFile is os.ReadFile with the test's error handling.
+func readFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	return b
+}
+
+// writeFile replaces the configuration file behind the store's back, the way an
+// operator editing it by hand would.
+func writeFile(t *testing.T, path string, b []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// TestSameConfig covers the content comparison behind checkFile (design §1.7):
+// nil and an empty collection are the same configuration, and every field that
+// can differ is detected.
+func TestSameConfig(t *testing.T) {
+	base := validConfig()
+	if !sameConfig(base, clone(base)) {
+		t.Fatal("a clone differs from its original")
+	}
+
+	empty := validConfig()
+	empty.Match.Paths = []string{}
+	empty.Match.Models = nil
+	empty.Retry.PerModel = nil
+	nilish := validConfig()
+	nilish.Match.Paths = nil
+	nilish.Match.Models = []string{}
+	nilish.Retry.PerModel = map[string]int{}
+	if !sameConfig(empty, nilish) {
+		t.Fatal("nil and an empty collection must compare equal")
+	}
+
+	diffs := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "listen", mutate: func(c *Config) { c.Listen = "127.0.0.1:19181" }},
+		{name: "control_socket", mutate: func(c *Config) { c.ControlSocket = "/run/other/ctl.sock" }},
+		{name: "newapi", mutate: func(c *Config) { c.NewAPI = "http://127.0.0.1:3001" }},
+		{name: "body_limit", mutate: func(c *Config) { c.BodyLimit++ }},
+		{name: "paths", mutate: func(c *Config) { c.Match.Paths = append(c.Match.Paths, "/v1/other") }},
+		{name: "models", mutate: func(c *Config) { c.Match.Models = append(c.Match.Models, "gpt-6-lunna") }},
+		{name: "retry.max", mutate: func(c *Config) { c.Retry.Max++ }},
+		{name: "per_model", mutate: func(c *Config) { c.Retry.PerModel["gpt-6-astra"] = 1 }},
+		{name: "base_floor_ms", mutate: func(c *Config) { c.Gate.BaseFloorMS++ }},
+		{name: "streak_cap", mutate: func(c *Config) { c.Gate.StreakCap++ }},
+	}
+	for _, tt := range diffs {
+		other := validConfig()
+		tt.mutate(other)
+		if sameConfig(base, other) {
+			t.Errorf("%s: sameConfig = true, want false", tt.name)
+		}
+	}
+}
+
+// TestSetRetryMaxRejectsChangedFile is the Q22 guard: a hand edit that was not
+// reloaded must not be overwritten by a write built from the snapshot (design
+// §1.7).
+func TestSetRetryMaxRejectsChangedFile(t *testing.T) {
+	s, path := newTestStore(t, validConfig())
+	before := s.Current()
+
+	edited := mustLoad(t, path)
+	edited.Match.Models = append(edited.Match.Models, "gpt-6-lunna")
+	if err := Persist(path, edited); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	editedBytes := readFile(t, path)
+
+	old, err := s.SetRetryMax("*", 9)
+	if !errors.Is(err, ErrFileChanged) {
+		t.Fatalf("SetRetryMax = %v, want ErrFileChanged", err)
+	}
+	if old != 0 {
+		t.Fatalf("old = %d, want 0 on a refused write", old)
+	}
+	if s.Current() != before {
+		t.Fatal("a refused write replaced the snapshot")
+	}
+	if got := readFile(t, path); !bytes.Equal(got, editedBytes) {
+		t.Fatal("a refused write changed the file")
+	}
+	if got := s.RetryMax("gpt-6-astra"); got != 3 {
+		t.Fatalf("RetryMax = %d, want the snapshot value 3", got)
+	}
+}
+
+// TestSetRetryMaxAcceptsCosmeticDifference: a file that only differs in layout,
+// or whose empty collections came back as [] and {}, still holds the snapshot and
+// is written back as usual (design §1.7).
+func TestSetRetryMaxAcceptsCosmeticDifference(t *testing.T) {
+	// Persist writes [] and {} while the snapshot keeps nil, which is exactly the
+	// state every start-up leaves behind.
+	c := validConfig()
+	c.Match.Paths = nil
+	c.Match.Models = nil
+	c.Retry.PerModel = nil
+	s, path := newTestStore(t, c)
+
+	if _, err := s.SetRetryMax("gpt-6-astra", 2); err != nil {
+		t.Fatalf("SetRetryMax right after Persist = %v, want success", err)
+	}
+	if got := mustLoad(t, path).Retry.PerModel["gpt-6-astra"]; got != 2 {
+		t.Fatalf("file per_model = %d, want 2", got)
+	}
+
+	// Re-encoding the same content without the indentation changes nothing.
+	compact, err := json.Marshal(mustLoad(t, path))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	writeFile(t, path, compact)
+	if _, err := s.SetRetryMax("*", 4); err != nil {
+		t.Fatalf("SetRetryMax after a cosmetic rewrite = %v, want success", err)
+	}
+	if got := s.RetryMax("anything"); got != 4 {
+		t.Fatalf("RetryMax = %d, want 4", got)
+	}
+}
+
+// TestSetRetryMaxRejectsUnreadableFile: a file this process cannot parse or
+// cannot read at all is refused instead of overwritten (design §1.7).
+func TestSetRetryMaxRejectsUnreadableFile(t *testing.T) {
+	t.Run("not valid JSON", func(t *testing.T) {
+		s, path := newTestStore(t, validConfig())
+		before := s.Current()
+		writeFile(t, path, []byte("{ broken"))
+
+		if _, err := s.SetRetryMax("*", 5); !errors.Is(err, ErrFileChanged) {
+			t.Fatalf("SetRetryMax = %v, want ErrFileChanged", err)
+		}
+		if s.Current() != before {
+			t.Fatal("a refused write replaced the snapshot")
+		}
+		if got := readFile(t, path); string(got) != "{ broken" {
+			t.Fatalf("a refused write changed the file: %q", got)
+		}
+	})
+
+	t.Run("deleted", func(t *testing.T) {
+		s, path := newTestStore(t, validConfig())
+		before := s.Current()
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+
+		if _, err := s.SetRetryMax("*", 5); !errors.Is(err, ErrFileChanged) {
+			t.Fatalf("SetRetryMax = %v, want ErrFileChanged", err)
+		}
+		if s.Current() != before {
+			t.Fatal("a refused write replaced the snapshot")
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatal("a refused write created the file again")
+		}
+	})
+}
+
+// TestUnsetRetryMaxRejectsChangedFile is the same guard on the delete path.
+func TestUnsetRetryMaxRejectsChangedFile(t *testing.T) {
+	s, path := newTestStore(t, validConfig())
+	if _, err := s.SetRetryMax("gpt-6-astra", 1); err != nil {
+		t.Fatalf("SetRetryMax: %v", err)
+	}
+
+	edited := mustLoad(t, path)
+	edited.Match.Models = append(edited.Match.Models, "gpt-6-lunna")
+	if err := Persist(path, edited); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	editedBytes := readFile(t, path)
+	before := s.Current()
+
+	if err := s.UnsetRetryMax("gpt-6-astra"); !errors.Is(err, ErrFileChanged) {
+		t.Fatalf("UnsetRetryMax = %v, want ErrFileChanged", err)
+	}
+	if s.Current() != before {
+		t.Fatal("a refused unset replaced the snapshot")
+	}
+	if got := readFile(t, path); !bytes.Equal(got, editedBytes) {
+		t.Fatal("a refused unset changed the file")
+	}
+	if got := s.RetryMax("gpt-6-astra"); got != 1 {
+		t.Fatalf("RetryMax = %d, want 1", got)
+	}
+
+	// A model without a per-model value has nothing to write, so the file is not
+	// touched and the answer is ErrRetryNotSet even while the file differs.
+	if err := s.UnsetRetryMax("gpt-6-lunna"); !errors.Is(err, ErrRetryNotSet) {
+		t.Fatalf("UnsetRetryMax of an unset model = %v, want ErrRetryNotSet", err)
+	}
+	if got := readFile(t, path); !bytes.Equal(got, editedBytes) {
+		t.Fatal("an ErrRetryNotSet answer changed the file")
+	}
+}
+
+// TestFileStatus backs GET /v1/config: in sync after a write, changed after a
+// hand edit, and an error when the file cannot be read (design §5).
+func TestFileStatus(t *testing.T) {
+	s, path := newTestStore(t, validConfig())
+	if inSync, err := s.FileStatus(); err != nil || !inSync {
+		t.Fatalf("FileStatus = %v, %v, want true and no error", inSync, err)
+	}
+
+	edited := mustLoad(t, path)
+	edited.Retry.Max = 7
+	if err := Persist(path, edited); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if inSync, err := s.FileStatus(); err != nil || inSync {
+		t.Fatalf("FileStatus after a hand edit = %v, %v, want false and no error", inSync, err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if inSync, err := s.FileStatus(); err == nil || inSync {
+		t.Fatalf("FileStatus of a missing file = %v, %v, want false and an error", inSync, err)
+	}
 }

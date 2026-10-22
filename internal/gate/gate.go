@@ -82,6 +82,19 @@ func (g *Gate) OnReleased() {
 	g.streak.Store(0)
 }
 
+// Remaining reports how much of the cooldown window of this key is left, and 0
+// once the deadline has passed. It is the value the stand-in 429 puts into
+// Retry-After (design §1.4, §1.5): a client that waits exactly this long is
+// past the end of the window. No jitter is applied here, unlike Wait: the
+// header must cover the whole window, not a random part of it.
+func (g *Gate) Remaining() time.Duration {
+	remain := time.Duration(g.until.Load() - time.Now().UnixNano())
+	if remain <= 0 {
+		return 0
+	}
+	return remain
+}
+
 // jitter draws the full-jitter wait from [0, remain). Tests replace it to pin
 // the draw; production always uses rand.N.
 var jitter = rand.N[time.Duration]
