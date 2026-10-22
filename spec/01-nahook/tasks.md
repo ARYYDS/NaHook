@@ -21,7 +21,7 @@
           阶段 A：风险验证     阶段 B：开发                           阶段 C：测试环境（LT）  阶段 D：生产（生产主机）
 L-OPS  │ T0 Caddy 断开实验 │                                      │ T9 搭测试环境          │ K8 → T11 → T12 → T13
        │（在 LT 上）       │                                      │ T10 跑审计清单          │
-L-GO   │                  │ T1 → T2 → T3 → T4 → T7 → T6 → T5 → T8 │ T15                    │
+L-GO   │                  │ T1 → T2 → T3 → T4 → T7 → T6 → T5 → T8 │ T15 → T16              │
                             （T5 开工前要等 00 G1，也就是 T0 的结论）
                             （Win11 上的 DSH 串行执行；每个任务交付后，由开发机另派审计）
 L-DOC                                                                                         │ T14 运维手册
@@ -32,6 +32,7 @@ L-DOC                                                                           
 - T7、T6 不依赖 T0，排在 T5 前面，用来填 T0 结论出来之前的空档；T5 要等 G1，并依赖 T6 的 `obs`。
 - T9 依赖 T8 的产物和 G1；T11 依赖 T10 全部通过、T15 已部署到 LT 并复测 T-F17，以及 K8。
 - T15 是 T10 里发现的设计缺陷（specaudit Q20）的修复，在阶段 C 里插进 L-GO 车道。
+- T16 是用户拍板的 D5（NewAPI 的终态限流改成代 429、代 429 带 `Retry-After`）加上 Q22（写回配置前比对文件、`nahookctl config show`），排在 T15 之后，同样在阶段 C。
 
 ## 2. 任务
 
@@ -179,6 +180,34 @@ L-DOC                                                                           
     - [x] 审计合并到 main 之后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
   - 冲突：只改 L-GO 车道的文件；LT 上的替换属于 T10（需要用户同意）
 
+- [ ] **T16 NewAPI 的终态限流改成代 429、代 429 带 Retry-After；写回配置前比对文件**（L-GO）
+  - 前置：T15（`build-bd6fad86`）；specaudit D5 已拍板，Q22 并入（用户 2026-10-22）；design §1.3–§1.7、§5、§6、§8 已改写
+  - 改动：
+    - `internal/startup/startup.go` `Read`：裸 JSON 规则（design §1.3）。只在 `heartbeats > 0 && !dataSeen`、当前事件没有 `event:` 和 `data:`、只有一行 `{…}` 时，把这一行当作 data 交给 `inspect`
+    - `internal/gate/gate.go`：新增 `(*Gate).Remaining() time.Duration`（design §1.5）
+    - `internal/proxy429/proxy429.go` `Write`：加参数 `retryAfter time.Duration`，按 design §1.4 写 `Retry-After`
+    - `internal/proxy/intercept.go` `serveIntercept`：终态限流分支改成"关闭响应体 → `RateLimited` → `OnRateLimit` → `Final429` → 日志 `final_429` → `proxy429.Write(…, g.Remaining())`"；放弃分支传 `g.Remaining()`（design §1.6）
+    - `internal/obs/obs.go`：新增 `Final429`，键名 `final_429`，`numCounters` 改为 9（design §6.7）
+    - `internal/config`：`ErrFileChanged`；`checkFile`、`sameConfig`、`FileStatus`；`SetRetryMax`、`UnsetRetryMax` 写盘前调 `checkFile`（design §1.7）
+    - `internal/control/control.go`：`GET /v1/config`；`writeStoreError` 把 `ErrFileChanged` 映射成 409（design §5、§6.4）
+    - `cmd/nahookctl/main.go`：`config show`；usage 同步（design §6.5）
+    - 测试：上面每个包的单测
+  - 依据：design §1.3、§1.4、§1.5、§1.6、§1.7、§5、§6.3、§6.4、§6.5、§6.7、§8 ｜ audit §1、T-F1、T-F2、T-F17、T-F18；interface 2.1–2.7、§3
+  - 完成判据：
+    - [ ] startup 单测：`: PING` ×2 → 裸 `{"error":{限流}}`（不带换行，紧接 EOF）→ `VerdictRateLimit`、`HeartbeatOnly=true`、`Untyped=true`，`Prefix+Rest` 等于原始字节。原来的 `TestReadRawJSONAfterHeartbeatIsReleased` 按这个改名并改断言
+    - [ ] startup 单测：裸 JSON 后面带 `\n` 或 `\n\n` 时结果相同；裸 JSON 是非限流错误（例如 `bad_response_status_code`）→ 放行；之前没有心跳的裸 JSON → 放行，`Prefix+Rest` 等于原始字节；`: PING` → `event: response.created` → 裸 JSON → 放行（`dataSeen`）；同一事件里两行 `{…}` → 放行
+    - [ ] gate 单测：`Remaining` 在 `OnRateLimit` 之后 > 0，到期后为 0，不会是负数
+    - [ ] proxy429 单测：`retryAfter` 为 0 时没有 `Retry-After`；1ns → `1`；1.2s → `2`；2h → `1800`；其他头、状态码、响应体和原来逐字节相同
+    - [ ] proxy 单测（假 NewAPI）：心跳 + `data:{"error":限流}` + `[DONE]` → 客户端拿到 429 + `Retry-After`，上游只被请求 1 次，`rate_limited` +1、`final_429` +1、`passthrough` 不变；心跳 + 裸 JSON 限流 → 同样结果；request id 后缀规则 → 同样结果；心跳 + 非限流的终态错误 → 原样放行
+    - [ ] proxy 单测：重试用完的代 429 带 `Retry-After`，值 ≥ 1；`rate_limited = retries + gave_up + final_429` 在每个场景后都成立
+    - [ ] config 单测：文件和快照内容相同（包括 nil 和 `[]`、`{}` 的差别、缩进不同）→ 写入成功；手工加了模型 → `ErrFileChanged`，文件字节不变、快照不变；文件不是合法 JSON 或被删了 → `ErrFileChanged`；`Persist` 之后紧接着再 `SetRetryMax` → 成功；`UnsetRetryMax` 同样检查
+    - [ ] control 单测：`PUT`、`DELETE` 遇到 `ErrFileChanged` 回 409，错误信息提到 reload；`GET /v1/config` 三种 `file` 状态；`config` 的写法和 `Persist` 一致
+    - [ ] nahookctl 单测：`config show` 发 `GET /v1/config`，原样打印；409 时退出码 1
+    - [ ] audit §3 的门禁全部通过
+    - [ ] 架构侧审计通过、合并到 main 以后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
+    - [ ] （LT，需要用户同意）部署新版本后跑 T-F1、T-F2、T-F17、T-F18，以及冒烟三项；README §1.5.4、§3、§4.2、§5.6、§5.8、§6.2、§6.4、§6.5 由架构侧同步
+  - 冲突：只改 L-GO 车道的文件；和 T15 改的是同一批文件，T15 已合入，没有并行任务
+
 - [ ] **T11 生产阶段 1：部署 nahook + Caddy 路由（护栏仍开着）**（**暂停**：用户 2026-10-22 决定先不上生产；K8 发现生产基线不同，T11–T13 的写法待 specaudit D3 重定）（L-OPS，在生产主机上，**需要用户同意**）
   - 前置：T10 全部通过；T15 已部署到 LT 并复测 T-F17；K8 已核对
   - 改动：从同一个 Release 安装 `nahook.service` 和 `/etc/nahook/config.json`（`retry.max=3`）；备份 Caddyfile 后加 nahook 路由（00 §6.1：不写 `flush_interval`、写 `fail_duration 10s`、不写 `lb_try_duration`）；主站点默认路由如果有 `flush_interval -1`、站点层如果有 `encode`，一并去掉（00 §6.1；用户告知生产没有，K8 核对）；reload
@@ -223,7 +252,7 @@ L-DOC                                                                           
 | 生产 `/etc/caddy/Caddyfile` | T11 | 改之前先备份，`caddy validate` 通过后再 reload |
 | 生产 `/root/container/luna-task/compose.yaml` | T12、T13 | T12 → T13 |
 | 生产 `/etc/nahook/config.json` | T11；运行期间由 nahookctl 写入 | 部署之后只允许通过 nahookctl 修改 |
-| nahook 仓库 | T1–T8 | 车道内串行 |
+| nahook 仓库 | T1–T8、T15、T16 | 车道内串行；T16 在 `dev` 上开发，审计通过后由架构侧合并到 `main` |
 
 全局锁表以 `00-总体架构/tasks.md` §3 为准。
 

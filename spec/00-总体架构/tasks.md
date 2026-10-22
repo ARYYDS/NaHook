@@ -15,7 +15,7 @@
 ```text
 阶段     A 风险验证        B 开发                C 测试环境（LT）        D 生产（生产主机）
 L-OPS   01:T0            ·                     01:T9 → 01:T10          K8 → 01:T11 → 01:T12 → 01:T13
-L-GO    ·                01:T1 → … → T8        01:T15                  ·
+L-GO    ·                01:T1 → … → T8        01:T15 → T16            ·
 L-DOC   ·                ·                     ·                       01:T14
 ```
 
@@ -53,7 +53,7 @@ L-DOC   ·                ·                     ·                       01:T14
 | 生产 `/root/container/luna-task/compose.yaml` | 01:T12、T13 | 改前备份成 `compose.yaml.bak.<时间戳>`；需要用户同意 |
 | 生产 `/etc/nahook/`、systemd 单元 | 01:T11；运行期间是 nahookctl | 部署之后只允许通过 nahookctl 修改配置 |
 | 生产 MySQL | 01:T13 之前做备份（用户操作） | 本 SPEC 不直接读写 |
-| nahook 仓库 | 01:T1–T8 | 一次只有一个 Go 开发子代理 |
+| nahook 仓库 | 01:T1–T8、T15、T16 | 一次只有一个 Go 开发子代理 |
 
 ## 4. 完成定义
 

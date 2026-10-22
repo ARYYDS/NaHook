@@ -6,11 +6,14 @@
 |---|---|---|
 | 要点 | 在 `release` 或 `proxy429.Write` 之前绝不写 `w`。这是能回 429 的前提 | design §1.6 |
 | 要点 | 不拦截的请求要逐字节透传，不缓冲；放行后的流必须和直连 NewAPI 逐字节一致（计费依赖它） | design §1.8 |
-| 要点 | 遇到任何异常都放行，不能比官方行为更差 | design §1.3、§8 |
+| 要点 | 遇到任何异常都放行，不能比官方行为更差。认出 NewAPI 的终态限流时改成代 429、不重试，这是用户拍板的行为变化（specaudit D5），不属于异常处理 | design §1.3、§1.6、§8 |
 | 难点 | 冷却门的抖动必须真正分散：没有队列，等待时长和排第几个无关 | design §1.5、§4 |
 | 难点 | Caddy 2.6.2 加上 `flush_interval -1` 时，客户端断开是否会传到 nahook | 00-总体架构 §6.1；`自动调度/06-community.md` §3 |
-| 难点 | 代 429 要和 NewAPI（h3）返回的逐字节一致：状态码、`Content-Type`、响应体、不带换行、转义 HTML | design §1.4、§8 |
-| 审核指标 | 每个客户端请求打上游的次数 ≤ 1 + `RetryMax`；热修改在下一次判定时就生效 | design §1.6、§1.7 |
+| 难点 | 代 429 要和 NewAPI（h3）返回的逐字节一致：状态码、`Content-Type`、响应体、不带换行、转义 HTML。只多一个 nahook 自己加的 `Retry-After` | design §1.4、§8 |
+| 难点 | rc.45 的终态限流是心跳后面裸写的 JSON，不是 SSE 事件；只能在"之前只有心跳"的位置认它，不能放宽 | design §1.3、§8 |
+| 审核指标 | 每个客户端请求打上游的次数 ≤ 1 + `RetryMax`；NewAPI 的终态限流不增加任何上游调用；热修改在下一次判定时就生效 | design §1.6、§1.7 |
+| 审核指标 | 每个代 429 都带 `Retry-After`，值是 1–1800 的整数秒，不小于当时冷却门的剩余时间 | design §1.4 |
+| 审核指标 | `nahookctl retry set/unset` 不会覆盖还没 reload 的手工改动 | design §1.7 |
 
 ## 2. 审计清单
 
@@ -22,8 +25,8 @@ T-C、T-F 都在测试机 LT 上做（00-总体架构 §2）：经 `「LT 站点
 | T-C2 | 00 §6.1 | 同上，但去掉 `flush_interval -1` 后 reload（这是正式配置） | 约 2s 内被取消；nahook 不再重试；到 3000 的连接被关闭。T-C1 预期相反：按 T0 的结论，2s 时不会取消 |
 | T-C3 | 00 §3.3 | mockrelay 设为 `slow:30`；进入流式阶段后断开 | LT 的 NewAPI 日志里这次流的结束原因是 `client_gone` |
 | T-C4 | 00 §3.2 | `systemctl stop nahook` 后立即连发 3 个请求，12s 后再发一次；然后启动 nahook | 停掉后的第一个请求立即收到 502（不能等满 5s），之后的请求由 3000 完成（不能是 503）；10s 内 Caddy 把 19080 标为不健康；启动 nahook 后流量自动回来 |
-| T-F1 | §1.4 | 同一条 `rate_limit` 脚本：先经 LT 的 nahook（上限设为 0），再直连 h3 对照实例 3002（护栏打开，`RetryTimes=0`），分别抓客户端拿到的完整响应 | 状态码、`Content-Type`、响应体逐字节一致（`X-Oneapi-Request-Id` 的值除外） |
-| T-F2 | §1.6 | 上限设为 2；脚本是 `rate_limit` × 10 | mockrelay 恰好收到 3 次请求；客户端拿到代 429 |
+| T-F1 | §1.4 | 同一条 `rate_limit` 脚本：先经 LT 的 nahook（上限设为 0），再直连 h3 对照实例 3002（护栏打开，`RetryTimes=0`），分别抓客户端拿到的完整响应 | 状态码、`Content-Type`、响应体逐字节一致（`X-Oneapi-Request-Id` 的值，以及 T16 起 nahook 加的 `Retry-After` 除外） |
+| T-F2 | §1.4、§1.6 | 上限设为 2；脚本是 `rate_limit` × 10；响应结束后立刻 `nahookctl stats` | mockrelay 恰好收到 3 次请求；客户端拿到代 429；T16 起带 `Retry-After`，是 ≥ 1 的整数，并且不小于 `stats` 里这个 key 的 `until_ms` 减去收到响应时刻（向上取整到秒） |
 | T-F3 | §1.7 | 上限 3；脚本 `rate_limit` × 10；在第 1 次拦截后执行 `nahookctl retry set 1 --model gpt-6-astra` | 这个请求一共只打 2 次就拿到代 429；配置文件里是新值；日志里有一条 `config.retry_max_changed` |
 | T-F4 | §1.5 | 16 个并发请求，脚本是前 16 次 `rate_limit`、之后 `ok`；mockrelay 记下每次重试到达的时间 | 重试的到达时间分布在 `[t0, until]` 里；排序后第 k 个的到达时间和 k 没有线性关系（相关系数接近 0，实测记录）；没有任何一个超出 until |
 | T-F5 | §1.2、§1.8 | 非流式请求、不命中的模型、`stream=false`，分别经 nahook 和直连 3000，各 100 次 | 响应逐字节一致；延迟差值实测并记录 |
@@ -38,7 +41,8 @@ T-C、T-F 都在测试机 LT 上做（00-总体架构 §2）：经 `「LT 站点
 | T-F14 | §1.3 | 脚本 `rate_limit_failed_only` | 被拦截 |
 | T-F15 | §1.3、2.5 | LT NewAPI 临时打开保活、间隔设到最小（测完改回）；脚本 `hold_rate_limit:5` 和 `stall_rate_limit:5` 各跑一次（PING 的两个来源：等上游响应头时，以及流式阶段） | 能正确拦截；放行的流里保留了 `: PING` |
 | T-F16 | §1.2 | 请求体大于 64MiB | 透传，不拦截，NewAPI 正常处理（或按它自己的限制拒绝） |
-| T-F17 | §1.6 | NewAPI 临时打开心跳、间隔调到最小，`RetryTimes=0`（测完改回）；脚本 `hold_http429:3`。分别在 LT 的 rc.45 和关掉护栏的 h3 上各跑一次（h3 的切换方法同 K4；开着护栏时心跳在启动阶段不发出，客户端直接拿到 HTTP 429，测不到这条路径） | mockrelay 只收到 1 次请求；客户端拿到 200，`: PING` 之后是 NewAPI 写的错误；nahook 的 `rate_limited` 不变。rc.45：错误由 `c.JSON` 直接追加在流后面（没有 `data:`，消息末尾也没有 request id），nahook 读到 EOF 放行，`released` 加 1。h3：`data: {"error":…}`（消息末尾没有 request id）再加 `data: [DONE]`，按 §1.6 第 2 条放行，`passthrough` 加 1 |
+| T-F17 | §1.3、§1.6 | NewAPI 临时打开心跳、间隔调到最小，`RetryTimes=0`（测完改回）；脚本 `hold_http429:3`。在 LT 的 rc.45 上跑；关掉护栏的 h3 只在要切换镜像时才跑（h3 的切换方法同 K4，需要用户同意；开着护栏时心跳在启动阶段不发出，客户端直接拿到 HTTP 429，测不到这条路径） | T16 起：mockrelay 只收到 1 次请求（nahook 不重试）；客户端拿到 HTTP 429 + `Retry-After`，响应体是 NewAPI 写进流里的那个错误对象（`{"error":{…}}`），不再是 200；`rate_limited` +1、`final_429` +1，`released`、`passthrough` 不变；日志里有一条 `final_429`。T16 之前的预期（rc.45 读到 EOF 放行、h3 按第 2 条透传）见 specaudit §7.16、§7.17 |
+| T-F18 | §1.7、§5 | 手工在 `/etc/nahook/config.json` 的 `match.models` 里加一个模型，不 reload：先 `nahookctl config show`，再 `nahookctl retry set 3`；然后 `nahookctl reload`，再 `retry set 3`、`config show`；最后把文件改回原样再 reload | 第一次 `config show` 的 `file` 是 `changed`；第一次 `retry set` 回 409、退出码 1，文件的 sha256 不变，`retry get` 和改之前一样；reload 之后 `retry set` 成功，新加的模型还在文件里，`config show` 的 `file` 是 `in_sync`。把文件写坏（不是合法 JSON）时，`retry set` 同样回 409，`config show` 的 `file` 是 `unreadable` |
 | P-1 | 00 §1.2 阶段 1 | 在生产主机上，护栏还开着时上线 nahook；观察 30 分钟 | nahook 只有透传、没有拦截；`/v1/responses` 的 p50 延迟和上线前比较（实测记录）；停掉 nahook 后请求不中断 |
 | P-2 | 00 §1.2 阶段 2 | 在生产主机上关掉护栏，等下一次限流 | journal 里出现 intercept 并接着 release 或 give_up；客户端拿到的要么是成功的流，要么是 HTTP 429，不会是 SSE 错误 |
 | P-3 | 00 §1.2 阶段 3 | 在生产主机上换成和 LT 相同 digest 的官方镜像 | 同 P-2；面板登录、渠道列表、日志页正常 |
@@ -96,7 +100,11 @@ $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -tr
 | 以为 NewAPI 的 `RetryTimes` 会限制 nahook 的重试 | 两者无关；每个请求都从 0 开始计数（`NEWAPI/controller/relay.go:172`） |
 | 引入 YAML 库 | 配置是 JSON，只用标准库（design §7） |
 | 把 `insufficient_quota` 也算作限流 | 不算（design §1.3） |
-| 在代 429 里加上 `Retry-After` 头或改写 message | 和 NewAPI 保持一致，不加也不改（design §1.4） |
+| 在代 429 里改写 message | 原样保留（design §1.4、§8） |
+| `Retry-After` 用 `base`、向下取整，或者在 NewAPI 透传出来的非 200 上也补 | 只加在代 429 上，用 `Gate.Remaining()`，向上取整，1–1800（design §1.4） |
+| 认出 NewAPI 的终态限流以后照旧放行，或者顺手再重试一轮 | 不重试，代 429（design §1.6；specaudit Q23、D5） |
+| 为了认 rc.45 的裸 JSON，把"非字段行"一律当成 data | 只在之前只有心跳、事件里只有这一行 `{…}`、没有 `event:` 和 `data:` 时才这样认（design §1.3） |
+| 用文件的字节或哈希判断配置是否被改过 | 解析以后按内容比较，nil 和空集合视为相同（design §1.7 `sameConfig`）；否则只改了缩进也会被拒绝，或者 `Persist` 刚写出的文件就被判成"改过" |
 | mockrelay 监听 `127.0.0.1` | 监听 `172.17.0.1`（00 §8） |
 | 判断不出是否要拦截时就回 502 | 放行（design §1.3） |
 
@@ -110,6 +118,6 @@ $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -tr
 | K4 | h3 和官方 rc.45 之间来回切换时，数据库兼不兼容 | 正向已验证：h3 `38e69e3` = 官方 `32e587406` + 护栏提交，护栏没改表；rc.45 比 `32e587406` 旧 4 个提交，表结构上只差 `audit_logs` 的一个复合索引（`058c823`），启动迁移只建不删。2026-10-21 在 LT 上换镜像，启动迁移没有报错，渠道和设置都正常读到。回退方向（rc.45 → h3）从代码看兼容，还没在 LT 上实际切换过 | 生产阶段 3 的回退方案依赖它。T10 期间在 LT 上演练一次回退再切回来（各需用户同意） |
 | K5 | 生产主机的 3000 端口能不能从公网访问 | **已查清**（2026-10-22）：容器仍监听 `0.0.0.0:3000`，但从 LT 经公网请求 `http://「生产主机 IP」:3000/api/status` 6s 超时，安全组挡住了 | 目前直连的客户端绕不过 nahook。保护只靠安全组；以后可以把端口绑到 `127.0.0.1`，不属于 nahook 上线的前置 |
 | K6 | LT 上测试令牌所在分组对 `gpt-6-astra` 的定价 | **已查清**（2026-10-21，T9、T10）：测试令牌的 `/v1/models` 只返回 `gpt-6-astra`，请求没有因定价被拒；T-F6 经 nahook 和直连的消费日志都是 quota 125、prompt 10、completion 3；T-F9 被拦截的尝试 quota 0 | — |
-| K7 | 生产主机的 NewAPI 有没有打开心跳（`general_setting.ping_interval_enabled`），间隔是多少 | **LT 已查清**（2026-10-21，用户）：心跳一直开着，间隔 1s。生产和 LT 一样（用户告知），K8 核查时确认 | 心跳打开时，上游的 HTTP 错误只要比 1s 慢，NewAPI 就会先提交 200，终态错误以 200 SSE 的形式出现：rc.45 是裸 JSON（nahook 读到 EOF 放行）；h3 和 `#7857` 起的官方版本是 `data:` 帧，要靠 design §1.6 第 2 条识别（specaudit Q20，T15 必须在 T12 之前部署）。启动阶段的心跳被 nahook 攒到放行时才发出（Q19） |
+| K7 | 生产主机的 NewAPI 有没有打开心跳（`general_setting.ping_interval_enabled`），间隔是多少 | **LT 已查清**（2026-10-21，用户）：心跳一直开着，间隔 1s。生产和 LT 一样（用户告知），K8 核查时确认 | 心跳打开时，上游的 HTTP 错误只要比 1s 慢，NewAPI 就会先提交 200，终态错误以 200 SSE 的形式出现：rc.45 是裸 JSON；h3 和 `#7857` 起的官方版本是 `data:` 帧，要靠 design §1.6 第 2 条识别（specaudit Q20）。T16 起这两种写法的终态限流都改成代 429（design §1.3、§1.6；specaudit Q23）。启动阶段的心跳被 nahook 攒到放行时才发出（Q19） |
 | K8 | 生产主机是哪台、怎么访问；它的基线是否和 LT 在 2026-10-21 之前一致 | **已查清，基线不一致**（2026-10-22 只读核查）：主机 `「生产主机名」`（「生产主机 IP」，Debian 13，4 核 8G）。NewAPI 是官方 `calciumion/new-api@sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84`（`v1.0.0-rc.44`，源码 `633b4c5b`），容器 `api19`，没有护栏开关；编排 `/root/container/api19/compose.yaml`；数据库 `「生产数据库」`，和 LT 隔离；Caddy 官方构建 v2.11.4，站点 `「生产站点域名」`，`lb_policy least_conn`、`lb_try_duration 5s`、`response_header_timeout 30m`、`encode zstd gzip`，没有 `flush_interval -1`；19080 空闲，主机上没有 nahook；另有 `relayscope-agent-api19`（读 NewAPI 日志目录）和 `beszel-agent`（主机网络，上报外部 hub）。 | 原计划的阶段 2、3 不存在；LT 的 Caddy（2.6.2）和生产（2.11.4）不一致。上线路径待用户拍板（00 design §1.2 待拍板，specaudit D3、D4） |
 | K9 | 站点层的 `encode zstd gzip` 会不会憋住 SSE（包括 nahook 路由） | **已查清**（2026-10-22，D4）：Caddy 2.6.2 会（`modules/caddyhttp/encode/encode.go:88` 默认压缩 `text/*`；首次 Write 超过 512 字节才开始压缩，`:219-229`；`Flush()` 不冲刷压缩器，`:198-207`、`:380`；v2.9.0 起修复）。Caddy 2.11.4 不会：临时起一个只监听 127.0.0.1 的 SSE 服务（首帧 2KB、之后每秒一帧）和一个开 `encode` 的 Caddy 2.11.4，客户端带 zstd 或 gzip 时响应都被压缩，各帧仍在 0/1/2/3/4s 准时到达，和直连相同。nahook 放行时把启动帧一次写出（`internal/proxy/stream.go:19`）；mockrelay 的首次写入约 320 字节，在 LT 的完整链路上不会触发压缩 | 生产（2.11.4）的 `encode` 保留；LT 按生产加回 |

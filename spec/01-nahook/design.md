@@ -4,13 +4,14 @@
 
 ### 范围
 
-nahook 是一个独立的常驻进程，部署在 Caddy 和 NewAPI 所在的宿主机上（测试机 LT 和生产主机各一套，00-总体架构 §2），串在 Caddy 和 NewAPI 之间，只处理"流式 Responses / Chat Completions 在启动阶段被上游限流"这一种情况。它做五件事：
+nahook 是一个独立的常驻进程，部署在 Caddy 和 NewAPI 所在的宿主机上（测试机 LT 和生产主机各一套，00-总体架构 §2），串在 Caddy 和 NewAPI 之间，只处理"流式 Responses / Chat Completions 在启动阶段被上游限流"这一种情况。它做六件事：
 
 1. 识别 NewAPI 透传出来的 200 SSE 启动帧里的限流错误；
 2. 在客户端收到任何字节之前，把它换成一个和 NewAPI 格式一致的 HTTP 429（下称"代 429"）；
 3. 按冷却门加全抖动等待一段时间后，把原请求原样重新 POST 给 NewAPI，也就是同站重试；
-4. 重试用完后，把代 429 返回给客户端；
-5. 重试上限通过控制口函数热修改，一行命令就生效。
+4. 重试用完后，把代 429 返回给客户端，`Retry-After` 是冷却门的剩余时间；
+5. NewAPI 的心跳先提交了 200、它自己的重试用完后把限流写进流里时，不再重试，直接返回代 429；
+6. 重试上限通过控制口函数热修改，一行命令就生效；写回配置文件前先确认文件没被手工改过。
 
 ### 不在范围
 
@@ -51,6 +52,8 @@ nahook 是一个独立的常驻进程，部署在 Caddy 和 NewAPI 所在的宿�
 | 窗口基准用尝试耗时 | `自动调度/07-lt-measurements.md` §2（提示 3–28ms 拿到时已过期；被拦截的尝试耗时约 1288ms） |
 | hook 的重试次数和 NewAPI 不相关 | `NEWAPI/controller/relay.go:172`、`:177`；`自动调度/01-newapi-native.md` §1 |
 | 通过函数热修改上限、初始值 3 | 架构确认与用户拍板（见 `../specaudit.md` §7） |
+| NewAPI 的终态限流改成代 429、代 429 带 `Retry-After` | 用户拍板 D5（`../specaudit.md` Q23、§7.21）；`docs/analysis/hook-points.md` §3 S7、§9.1、§9.2；`Retry-After` 的秒数格式见 RFC 9110 §10.2.3 |
+| 写回配置前比对文件、查看生效配置 | 用户拍板（`../specaudit.md` Q22、§7.21） |
 
 ### 1.2 请求分类 `proxy.classify`
 
@@ -80,13 +83,14 @@ type Verdict int               # VerdictRelease | VerdictRateLimit
 type UpstreamError struct { Message, Type, Param string; Code json.RawMessage }
 type Result struct { Verdict Verdict; Prefix []byte; Rest *bufio.Reader; Err UpstreamError
                      HeartbeatOnly bool   # 判定帧之前至少有一个事件，并且每一个都只由注释行组成（例如 ": PING"；只有空行的不算事件）
-                     Untyped bool }       # 判定帧既没有 type 字段，也没有 event: 行
+                     Untyped bool }       # 判定帧既没有 type 字段，也没有 event: 行（rc.45 的裸 JSON 只有 {"error":…}，也算不带 type）
                                           # 这两项只在 VerdictRateLimit 时有意义，供 §1.6 的 newAPIFinalError 使用
 
 func Read(body io.Reader) Result
   reader := bufio.NewReader(body); prefix, event := bytes.Buffer{}
   eventName := ""; dataLines := nil; events := 0
   commentOnly := true; hasComment := false                  # 当前事件的非空行是否都是注释；当前事件有没有注释行
+  rawLine := ""; rawLines := 0                              # 当前事件里既不是字段、也不是注释的非空行（最后一行和行数）
   heartbeats := 0; dataSeen := false                        # 之前的纯注释事件数；之前是否出现过别的事件
   loop:
     line, overflow, readErr := readLine(reader, MaxBytes - prefix.Len() - event.Len())
@@ -99,12 +103,18 @@ func Read(body io.Reader) Result
       前缀 "event:" → eventName = 去掉前缀后的值；commentOnly = false
       前缀 "data:"  → dataLines = append(dataLines, 去掉前缀后的值)；commentOnly = false
       前缀 ":"      → 注释（例如 ": PING"），只留在 event 里；hasComment = true
-      其他非空行     → commentOnly = false
+      其他非空行     → commentOnly = false；rawLines++；rawLine = trim(line)
     if trim(line) == "" || readErr == io.EOF:
       if event.Len() > 0:
         events++
         if events > MaxEvents: return release(prefix+event, reader)
-        d, e, typed := inspect(eventName, join(dataLines, "\n"))
+        data := join(dataLines, "\n")
+        if eventName == "" && len(dataLines) == 0 && rawLines == 1 && hasPrefix(rawLine, "{") && heartbeats > 0 && !dataSeen:
+            data = rawLine
+            # rc.45 的终态错误：心跳先提交了 200，Relay 的 defer 再用 c.JSON 把错误裸写在流后面，
+            # 没有 "data:"，也没有换行（NEWAPI v1.0.0-rc.45 controller/relay.go:92-110；T10 T-F17 实测）。
+            # 只在"之前只有心跳"的位置这样认：上游的 SSE 不会出现这种行，NewAPI 转发上游帧时一律带 "data:"
+        d, e, typed := inspect(eventName, data)
         prefix.Write(event)
         switch d:
           decisionContinue  → if !commentOnly { dataSeen = true } else if hasComment { heartbeats++ }；继续读下一个事件
@@ -112,7 +122,7 @@ func Read(body io.Reader) Result
           decisionRelease   → return Result{VerdictRelease, prefix, reader}
           decisionRateLimit → return Result{VerdictRateLimit, prefix, reader, e,
                                             HeartbeatOnly: heartbeats > 0 && !dataSeen, Untyped: !typed}
-      event.Reset(); dataLines = nil; eventName = ""; commentOnly = true; hasComment = false
+      event.Reset(); dataLines = nil; eventName = ""; commentOnly = true; hasComment = false; rawLine = ""; rawLines = 0
     if readErr != nil:
       return Result{VerdictRelease, prefix+event, reader}   # EOF 或读错：原样放行；没收尾的最后一个事件也并进 Prefix，
                                                             # 保证 Prefix+Rest == 原始字节
@@ -164,7 +174,11 @@ func IsRateLimit(e UpstreamError) bool
 ### 1.4 代 429 `proxy429.Write`
 
 ```text
-func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError)
+const maxRetryAfter = 30 * time.Minute     # 和 gate.maxBase 相同（§1.5）：冷却窗口的 base 不超过它
+
+func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError, retryAfter time.Duration)
+  # retryAfter 是这个 key 的冷却门还剩多久（gate.(*Gate).Remaining，§1.5），由 serveIntercept 在判为限流、
+  # 调过 OnRateLimit 之后取。告诉客户端至少等这么久再重试，避免它的退避比上游 org 的冷却短、又撞上限流
   # upstream 是 NewAPI 最后一次尝试的响应头。h3 的 429 和这次尝试出自同一个 NewAPI 请求，
   # 中间件加的头它都有，所以按白名单把这些头抄过来：
   #   X-Oneapi-Request-Id（NEWAPI middleware/request-id.go:16）
@@ -179,9 +193,15 @@ func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError)
   # 字段顺序 message, type, param, code，和 NEWAPI relaykit/types/error.go:13-19 一致
   # 用 json.Marshal（会转义 HTML、不加换行），和 gin 的 c.JSON 一致
   复制白名单里的头; w.Header().Set("Content-Type", "application/json; charset=utf-8")   # NEWAPI controller/relay.go:105
+  if retryAfter > 0:
+      secs := ceil(min(retryAfter, maxRetryAfter) / time.Second)   # 向上取整：不足 1 秒也写 1，不能写 0（0 等于叫客户端立刻重试）
+      w.Header().Set("Retry-After", strconv.Itoa(secs))          # RFC 9110 §10.2.3 的 delay-seconds 写法：十进制整数秒
   w.WriteHeader(429)
   w.Write(body)
 ```
+
+- `Retry-After` 是 nahook 自己加的头。NewAPI 的中继错误从不带它（`NEWAPI/service/error.go:87`、`controller/relay.go:92-110`@rc.45，`docs/analysis/hook-points.md` §2.3）。所以除了这个头，状态码、`Content-Type`、响应体仍和 NewAPI 的 429 逐字节一致（audit T-F1）。
+- NewAPI 自己回的非 200（包括它的 429）仍然原样透传，nahook 不给它们补 `Retry-After`（§1.6）。
 
 ### 1.5 冷却门 `gate.Gate`
 
@@ -211,6 +231,11 @@ func (g *Gate) OnRateLimit(elapsed, floor time.Duration, streakCap int32)
 func (g *Gate) OnReleased()
   g.streak.Store(0)
 
+func (g *Gate) Remaining() time.Duration          # 给代 429 的 Retry-After 用（§1.4）
+  r := g.until.Load() - now
+  if r <= 0: return 0
+  return r                                        # 是整个冷却窗口的剩余时间，不抖动：客户端等满它，就一定落在冷却结束之后
+
 func (g *Gate) Wait(ctx context.Context) error
   remain := g.until.Load() - now
   if remain <= 0: return nil
@@ -235,12 +260,23 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
         h.st.Inc(obs.Passthrough); passthrough(w, resp); return   # 包括 NewAPI 自己的 429：它已按 RetryTimes 重试过
     res := startup.Read(resp.Body)
     if res.Verdict == startup.VerdictRateLimit && newAPIFinalError(res, rid):
-        # NewAPI 自己的终态错误：心跳先提交了 200，它按 RetryTimes 重试完以后把错误写进了流里。
-        # 两条识别规则见下面 newAPIFinalError。和非 200 一样原样透传，不叠加重试（R2）
-        # 官方 rc.45（LT 当前版本）还没有 writeRelayStreamError：心跳提交 200 后，终态错误由 c.JSON 直接追加在流后面，
-        # 不带 data:（NEWAPI v1.0.0-rc.45 controller/relay.go:102-107）。startup.Read 读不出事件，读到 EOF 放行，
-        # 同样不会叠加重试，只是走下面的 VerdictRelease 分支、计 Released
-        h.st.Inc(obs.Passthrough); release(w, resp, res.Prefix, res.Rest); return
+        # NewAPI 自己的终态限流（docs/analysis/hook-points.md 的 S7）：心跳先提交了 200，
+        # 它按 RetryTimes 重试完以后把限流写进了流里。两条识别规则见下面 newAPIFinalError。
+        # 不再重试，避免两层重试叠加（R2）；但 nahook 还没向客户端写过一个字节，所以改成代 429（specaudit Q23、D5）。
+        # 两种写法都走这里：h3 和 #7857 起的官方版本是 data: {"error":…} + data: [DONE]；
+        # rc.45 是心跳后面裸写的 JSON，由 startup.Read 的裸 JSON 规则认出来（§1.3）
+        resp.Body.Close()
+        h.st.Inc(obs.RateLimited)
+        cfg := h.store.Current()
+        key := gate.Key(meta.Model, res.Err.Message)
+        g := h.gates.Get(key)
+        elapsed := now - t0                              # 包含 NewAPI 自己那几次尝试和心跳的时间
+        g.OnRateLimit(elapsed, time.Duration(cfg.Gate.BaseFloorMS)*time.Millisecond, cfg.Gate.StreakCap)
+            # NewAPI 刚确认这个 key 被限流：同一个 key 上其他正在被拦截的请求也要避开；
+            # Retry-After 也从这里来。不调 ResetModel，也不动 n
+        h.st.Inc(obs.Final429)
+        log final_429{request_id: rid, key, attempt: n, elapsed_ms: elapsed}
+        proxy429.Write(w, resp.Header, res.Err, g.Remaining()); return
     if res.Verdict == startup.VerdictRelease:
         if r.Context().Err() != nil:                     # 读启动帧时客户端走了，Read 因读错误返回放行：
             resp.Body.Close(); h.st.Inc(obs.ClientGone); return   # 不写响应，也不能 ResetModel（没有真正放行）
@@ -258,7 +294,7 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
     log intercept{request_id: rid, key, attempt: n, elapsed_ms: elapsed, max}
     if n >= max:
         h.st.Inc(obs.GaveUp); log give_up{request_id: rid, key, attempts: n+1}
-        proxy429.Write(w, resp.Header, res.Err); return
+        proxy429.Write(w, resp.Header, res.Err, g.Remaining()); return   # 上面刚调过 OnRateLimit，剩余时间 > 0
     n++
     h.st.Inc(obs.Retries)
     w0 := now
@@ -272,7 +308,9 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
 1. `rid != "" && strings.HasSuffix(strings.TrimSpace(res.Err.Message), " (request id: "+rid+")")`：NewAPI 自己生成的错误（例如 `model_not_found`）。`Relay` 的 defer 用 `MessageWithRequestId` 给消息加后缀（h3 `controller/relay.go:96-99`、`common/utils.go:269`）。`rid` 必须和本次响应头里的 `X-Oneapi-Request-Id` 完全相同：上游原样转发的帧不会带这个 id；中转站自己如果也跑 NewAPI，它的 id 和本站的不同，所以不会误判。
 2. `res.HeartbeatOnly && res.Untyped`：NewAPI 转发的上游错误。心跳先提交了 200，NewAPI 按 RetryTimes 重试完以后，由 `writeRelayStreamError` 写出 `data: {"error":…}` 和 `data: [DONE]`（h3 `controller/relay.go:242-258`，`#7857` 起的官方版本相同）。这种错误的类型是 `ErrorTypeOpenAIError`，`ToOpenAIError` 直接返回上游原来的错误对象，`SetMessage` 加上的后缀不会出现在输出里（h3 `relaykit/types/error.go:178-190`），所以第 1 条认不出来。T10 在关掉护栏的 h3 上实测：只有第 1 条时，nahook 又重试了 3 轮，上游一共被调用 4 次，客户端 35.9s 后才拿到代 429。判定帧之前只有心跳、没有任何上游数据，并且判定帧不带 type，就是这种情况。
 
-第 2 条只会往一个方向误判：上游很慢、心跳已经发出，而上游的第一帧恰好就是不带 type 的限流错误（例如 Chat 格式）。这时 nahook 放行，客户端看到的和官方行为一样（§8：不能比官方更差）。反方向的误判（把 NewAPI 的终态错误当成上游限流，再重试一轮）会把上游调用放大到 (1 + `retry.max`) × (1 + RetryTimes) 倍，所以选这个方向。上游的 Responses 格式限流（`type` 是 `error` 或 `response.failed`，或者前面有 `response.created`）不受影响，照常拦截（T10 T-F15）。
+第 2 条只会往一个方向误判：上游很慢、心跳已经发出，而上游的第一帧恰好就是不带 type 的限流错误（例如 Chat 格式）。这时 nahook 不重试，直接代 429；客户端拿到的是限流，只是少了 nahook 自己的那几次重试。反方向的误判（把 NewAPI 的终态错误当成上游限流，再重试一轮）会把上游调用放大到 (1 + `retry.max`) × (1 + RetryTimes) 倍，所以选这个方向。上游的 Responses 格式限流（`type` 是 `error` 或 `response.failed`，或者前面有 `response.created`）不受影响，照常拦截（T10 T-F15）。
+
+两条规则认出来的都是 NewAPI 的终态**限流**：`startup.Read` 只在 `IsRateLimit` 成立时才给 `VerdictRateLimit`（§1.3）。NewAPI 写进流里的其他终态错误（例如 5xx）仍走 `VerdictRelease`，原样放行。
 
 `ServeHTTP` 的不拦截分支处理 `forward` 错误的方式相同：ctx 已取消时只计 `ClientGone`，否则计 `BadGateway` 并回 502；成功时计 `Passthrough`。日志事件和字段见 §5，计数器见 §6.7。
 
@@ -289,7 +327,9 @@ func (s *Store) RetryMax(model string) int
 func (s *Store) SetRetryMax(scope string, n int) (old int, err error)   # scope = "*" 或模型名
   if n < 0 || scope == "": return 0, ErrInvalidRetry
   s.wmu.Lock(); defer s.wmu.Unlock()        # 只把控制面的写入串行化；数据面只读 atomic，不经过这把锁
-  cur := s.p.Load(); next := clone(cur)     # clone 深拷贝 Match.Paths、Match.Models、Retry.PerModel：已发布的快照绝不就地修改
+  cur := s.p.Load()
+  if err := s.checkFile(cur); err != nil: return 0, err   # 文件被手工改过、还没 reload：拒绝写，文件和快照都不动（specaudit Q22）
+  next := clone(cur)                        # clone 深拷贝 Match.Paths、Match.Models、Retry.PerModel：已发布的快照绝不就地修改
   old = 修改前这个 scope 的生效值            # scope=="*" 取 cur.Retry.Max；模型名取 retryMaxFor(cur, scope)
   写入 next.Retry.Max 或 next.Retry.PerModel[scope]
   if err := next.Validate(); err != nil: return
@@ -299,7 +339,25 @@ func (s *Store) SetRetryMax(scope string, n int) (old int, err error)   # scope 
   return old, err                           # err 为 ErrDirSync 时表示"已生效，但目录 fsync 失败，掉电后不保证持久"
   # Store 不打日志：uid 是控制口请求才有的信息，日志由 control 打（§6.4）
 
-func (s *Store) UnsetRetryMax(model string) error         # 删除模型级配置，回到全局值。没有该模型的配置时返回 ErrRetryNotSet，不写盘；落盘的规则同上
+func (s *Store) UnsetRetryMax(model string) error         # 删除模型级配置，回到全局值。没有该模型的配置时返回 ErrRetryNotSet，不写盘；
+                                                          # 写盘之前同样先 checkFile；落盘的规则同上
+
+func (s *Store) checkFile(cur *Config) error              # 调用方持 wmu
+  disk, err := Load(s.path)
+  if err != nil: return fmt.Errorf("%w: %v", ErrFileChanged, err)   # 读不到或解析不了也拒绝：不覆盖一个自己看不懂的文件
+  if !sameConfig(disk, cur): return ErrFileChanged
+  return nil
+  # 按内容比较，不按字节：只改了缩进或键的顺序，写回不会丢任何东西，照常写
+
+func sameConfig(a, b *Config) bool
+  标量字段逐个比较；Match.Paths、Match.Models 用 slices.Equal；Retry.PerModel 用 maps.Equal
+  # nil 和空集合视为相同：Persist 把空集合写成 [] 和 {}，Load 读回来是空的非 nil 值，
+  # 而 clone 一个 nil 的 PerModel 仍是 nil（slices.Equal、maps.Equal 对 nil 和空集合本来就返回 true）
+
+func (s *Store) FileStatus() (inSync bool, err error)     # 给 GET /v1/config 用（§5）。持 wmu，避免和正在进行的写入交错
+  disk, err := Load(s.path)
+  if err != nil: return false, err
+  return sameConfig(disk, s.p.Load()), nil
 func (s *Store) Reload() error                            # 由 SIGHUP 和 POST /v1/reload 触发：持 wmu，Load → Validate → 检查只能重启才生效的字段 → Store
   # listen、control_socket、newapi 只在启动时生效（§6.1 的 Transport 在构造时就固定了）。
   # 这三项和当前快照不一样时，返回 ErrRestartRequired，快照不变
@@ -401,7 +459,7 @@ Caddy      nahook                        NewAPI                上游
 
 ```text
   … 第 3 次重试仍被拦截：n=3 ≥ max=3
-  │◄─429 {"error":{…}}─│ proxy429.Write（白名单头取自最后一次尝试，§1.4）
+  │◄─429 {"error":{…}} + Retry-After─│ proxy429.Write（白名单头取自最后一次尝试；Retry-After 是冷却门的剩余时间，§1.4）
 ```
 
 ### 3.4 热修改上限
@@ -409,8 +467,13 @@ Caddy      nahook                        NewAPI                上游
 ```text
 root$ nahookctl retry set 5 --model gpt-6-astra
 nahookctl ─PUT /v1/retry {"scope":"gpt-6-astra","n":5}─► control
-control ─► Store.SetRetryMax ─► Validate ─► Persist（临时文件 + fsync + 改名）─► atomic.Store
+control ─► Store.SetRetryMax ─► checkFile（文件和快照按内容比较）─► Validate ─► Persist（临时文件 + fsync + 改名）─► atomic.Store
 正在重试中的请求在下一次被拦截时读到 5
+
+文件被手工改过、还没 reload：
+control ─► Store.SetRetryMax ─► checkFile = ErrFileChanged ─► 409，文件和快照都不动
+root$ nahookctl config show      # 看内存里生效的配置，以及文件是否一致（"file":"changed"）
+root$ nahookctl reload           # 先让手工改动生效，再 retry set
 ```
 
 ### 3.5 nahook 宕机
@@ -421,7 +484,22 @@ Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康�
 （客户端看到的就是官方原样行为：流内限流照常以 SSE 错误送达）
 ```
 
-### 3.6 客户端断开
+### 3.6 NewAPI 的终态限流（心跳先提交了 200）
+
+```text
+Caddy      nahook                              NewAPI（心跳 1s，RetryTimes=3）      上游
+  │─POST──►│ classify=拦截                        │                                  │
+  │        │─forward（第 0 次）──────────────────►│─#1────────────────────────────────►│ 迟迟不回
+  │        │◄─200 ": PING"（攒着，不写给 Caddy）───│                                  │
+  │        │                                      │◄─429──── #1 … #4 都是 429 ────────│
+  │        │◄─终态限流：rc.45 是裸 JSON；#7857 起是 data:{"error"} + data:[DONE]
+  │        │ startup.Read = RateLimit，HeartbeatOnly、Untyped ─► newAPIFinalError 成立
+  │        │ 不重试；OnRateLimit；final_429 +1
+  │◄─429 {"error":{…}} + Retry-After─│ proxy429.Write
+  客户端拿到的是 429，不是 200 加流里的错误；上游一共被调用 4 次，全部来自 NewAPI 自己
+```
+
+### 3.7 客户端断开
 
 ```text
 客户端断开 ─► Caddy（不写 flush_interval，取消发往后端的请求；T0、T-C2，Caddy 2.6.2 和 2.11.4 都实测过）─► r.Context() 取消
@@ -461,6 +539,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康�
 请求：S0 分类 ─拦截─► S1 转发 ─200 SSE─► S2 读启动帧 ─限流─► S3 拦截
                          │非 200 → 透传        │放行 → release       │ n ≥ max → 代 429
                          │连不上 → 502          │ctx 取消 → 结束       │ 否则 Wait → S1
+                                               │NewAPI 终态限流 → 代 429（不重试，§1.6）
 冷却门（每个 key）：streak 0 ─拦截─► 1 ─► 2 ─► 3（封顶）；同一模型任意一次放行 → 0
                    until 只往后推，取最大值
 ```
@@ -495,16 +574,19 @@ Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康�
 | 方法与路径 | 请求 | 响应 |
 |---|---|---|
 | `GET /v1/retry?model=M` | — | `{"scope":"M"或"*","max":3,"source":"per_model"或"global"}` |
-| `PUT /v1/retry` | `{"scope":"*"或模型名,"n":3}`；`n` 必填，缺了回 400（否则会被当成 0） | `{"scope":…,"old":…,"new":…}` |
-| `DELETE /v1/retry?model=M` | — | `{"scope":"M","removed":true}` |
+| `PUT /v1/retry` | `{"scope":"*"或模型名,"n":3}`；`n` 必填，缺了回 400（否则会被当成 0） | `{"scope":…,"old":…,"new":…}`；文件被手工改过、还没 reload 时回 409（§1.7 `checkFile`） |
+| `DELETE /v1/retry?model=M` | — | `{"scope":"M","removed":true}`；409 的条件同上 |
 | `GET /v1/stats` | — | `{"counters":{…},"gates":[{"key","until_ms","streak","base_ms"}]}` |
 | `POST /v1/reload` | — | `{"ok":true}`；失败时状态码按 §6.4 映射，快照不变 |
+| `GET /v1/config` | — | `{"config":<内存里生效的配置>,"file":"in_sync"或"changed"或"unreadable"}`；`unreadable` 时再加 `"file_error":"<错误信息>"`。`config` 的写法和 `Persist` 落盘的一样（空集合写成 `[]`、`{}`），可以直接和文件对比 |
 
 所有错误响应的响应体都是 `{"error":"<错误信息>"}`。
 
 ### 代 429 的响应体
 
 `{"error":{"message":"<上游原文>","type":"<上游 type>","param":"<上游 param 或空串>","code":<上游原始 JSON 值>}}`
+
+响应头：白名单里的头（§1.4）、`Content-Type: application/json; charset=utf-8`，以及 `Retry-After: <整数秒>`（冷却门的剩余时间，向上取整，最大 1800）。
 
 ### 日志（slog JSON，一行一条事件）
 
@@ -514,6 +596,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康�
 | `wait` | `key`、`wait_ms` |
 | `release` | `request_id`、`attempt` |
 | `give_up` | `request_id`、`key`、`attempts` |
+| `final_429` | `request_id`、`key`、`attempt`、`elapsed_ms`：NewAPI 的终态限流被改成代 429（§1.6） |
 | `config.retry_max_changed` | `scope`、`old`、`new`、`uid` |
 | `config.reloaded` | `uid` |
 | `config.reload_failed` | `error` |
@@ -553,6 +636,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康�
 | `Registry.Get(key) *Gate` | 用 `sync.Map.LoadOrStore` 拿到同一个 `*Gate` |
 | `Registry.ResetModel(model)` | 遍历 `sync.Map`，对前缀为 `model|` 的所有 Gate 调 `OnReleased`。放行时还不知道 org，所以要按模型把这些 key 一起清零；key 的数量是模型数 × org 数，很少 |
 | `Registry.Snapshot() []GateStat` | 给 `/v1/stats` 用 |
+| `(*Gate).Remaining() time.Duration` | 冷却截止时间减去当前时间，不足 0 时为 0；给代 429 的 `Retry-After` 用（§1.4、§1.5） |
 | `Key(model, message)` | §1.5 |
 
 ### 6.4 `internal/control`
@@ -561,7 +645,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康�
 - 错误码：
   - 400：`ErrInvalidRetry`、`ErrInvalidConfig`，或者请求 JSON 不合法；
   - 404：`ErrRetryNotSet`，也就是 `DELETE` 的模型本来就没有模型级配置；
-  - 409：`ErrRestartRequired`，也就是 reload 改了 `listen`、`control_socket` 或 `newapi`（这时快照不变）；
+  - 409：`ErrRestartRequired`，也就是 reload 改了 `listen`、`control_socket` 或 `newapi`（这时快照不变）；`ErrFileChanged`，也就是 `PUT`、`DELETE` 时发现文件被手工改过、还没 reload，或者文件读不到、解析不了（这时文件和快照都不变）。错误信息里要写明"先 `nahookctl reload`"；如果手工改的是 `listen`、`control_socket` 或 `newapi`，reload 也会回 409，只能重启或者把文件改回去；
   - 500：其他写盘错误（这时文件和内存都不变）。
 - `ErrDirSync` 回 200，响应体里加 `"warning":"applied; directory fsync failed, not durable across power loss"`。这时修改已经生效。
 - 日志：写到 `Serve` 收到的 `log`（`cmd/nahook` 传入的 `obs.NewLogger(os.Stdout)`，和 proxy 共用一个）。
@@ -604,6 +688,7 @@ Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康�
 | `retry unset --model M` | `DELETE /v1/retry` |
 | `stats` | `GET /v1/stats` |
 | `reload` | `POST /v1/reload` |
+| `config show` | `GET /v1/config`，原样打印返回的 JSON |
 
 全局参数 `--socket PATH`：默认 `/run/nahook/ctl.sock`。LT 和生产主机上各只有一个 nahook 实例，都用默认路径（00-总体架构 §5）。
 
@@ -658,12 +743,13 @@ Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康�
 | `RateLimited` | `rate_limited` | 一次尝试的启动帧被判为限流 |
 | `Retries` | `retries` | 判为限流后还没到上限，进入 `Wait` |
 | `Released` | `released` | 拦截路径上放行 |
-| `GaveUp` | `gave_up` | 返回代 429 |
+| `GaveUp` | `gave_up` | 重试用完，返回代 429 |
+| `Final429` | `final_429` | NewAPI 的终态限流被改成代 429（§1.6），没有重试 |
 | `Passthrough` | `passthrough` | 不拦截的请求转发成功；或拦截路径上 NewAPI 回了非 200 或非 SSE。Caddy 对 nahook 的健康检查（每 10s 一次 `/api/status`，00 §6.1）也计在这里，空闲时每分钟约加 6 |
 | `BadGateway` | `bad_gateway` | 连不上 NewAPI，回了 502 |
 | `ClientGone` | `client_gone` | `forward`、启动帧读取或 `Wait` 因为 `r.Context()` 取消而结束 |
 
-不变量：`rate_limited = retries + gave_up`（每次判为限流后，恰好走这两条路中的一条）；每个被拦截的请求恰好以 `released`、`gave_up`、`passthrough`、`bad_gateway`、`client_gone` 之一结束。
+不变量：`rate_limited = retries + gave_up + final_429`（每次判为限流后，恰好走这三条路中的一条）；每个被拦截的请求恰好以 `released`、`gave_up`、`final_429`、`passthrough`、`bad_gateway`、`client_gone` 之一结束。
 
 ### 6.8 `cmd/nahook`
 
@@ -727,6 +813,10 @@ GitHub Release（公开）
 | socket 文件残留 | 重启时 Listen 失败 | 启动时先删掉；或交给 `RuntimeDirectory` 管理 |
 | 处理函数不读请求体，就开始等待（mockrelay 的 `hold`、`slow`、`stall`） | 请求带请求体时，net/http 要等请求体读完才启动检测断开的后台读，所以对端断开后 `r.Context()` 不会被取消，等待会一直持续到结束 | 等待之前先 `io.Copy(io.Discard, r.Body)`（Go 源码 `net/http/server.go` 里 `startBackgroundRead` 的注释：请求带请求体时，要等请求体全部读完才启动后台读）。nahook 的 `classify` 会先把请求体读进缓存，所以不受影响 |
 | 一直不读完、不关闭被拦截的那次响应体 | 连接泄漏 | 被拦截后立即 `resp.Body.Close()` |
-| 只要 200 SSE 里出现限流帧就重试 | 打开心跳时，NewAPI 会先提交 200，按 RetryTimes 重试完以后再把自己的终态错误写进流里；nahook 再重试一轮，两层重试就叠加了 | 消息以 ` (request id: <本次的 X-Oneapi-Request-Id>)` 结尾时原样放行（§1.6；`NEWAPI/controller/relay.go:99-101`）。rc.45 把这个错误写成不带 `data:` 的裸 JSON，本来就会被放行（§1.6 注释） |
+| 只要 200 SSE 里出现限流帧就重试 | 打开心跳时，NewAPI 会先提交 200，按 RetryTimes 重试完以后再把自己的终态错误写进流里；nahook 再重试一轮，两层重试就叠加了 | 消息以 ` (request id: <本次的 X-Oneapi-Request-Id>)` 结尾时不重试，直接代 429（§1.6；`NEWAPI/controller/relay.go:99-101`） |
 | 只按消息末尾的 request id 识别 NewAPI 的终态错误 | NewAPI 转发上游的 OpenAI 格式错误时不加这个后缀；心跳打开时，nahook 会把 NewAPI 重试用完后的终态错误当成上游限流，再重试一轮，上游调用被放大（T10 T-F17，h3 关护栏） | 再加一条：判定帧之前只有心跳、判定帧不带 type（§1.6 第 2 条） |
-| 手工改了配置文件，没有 reload 就执行 `nahookctl retry set/unset` | `SetRetryMax`/`UnsetRetryMax` 写回文件的是内存快照（§1.7 `clone(cur)`），文件里还没 reload 的改动（例如新加的模型）被静默覆盖。2026-10-22 在测试环境复现：手工加了一个模型，`retry set 3` 之后它从文件里消失 | 先 reload 再用 `nahookctl`（README §1.5.4 的警告）；代码层面的防护见 specaudit Q22 |
+| 认出 NewAPI 的终态限流以后原样放行 | 客户端拿到 200 和一个没有正常结束事件的流，多半当成断流处理，而不是限流；nahook 明明还没写过字节，本来可以回 429（specaudit Q23） | 不重试，代 429 并带 `Retry-After`（§1.6） |
+| 只认 `data:` 帧，漏掉 rc.45 心跳后面的裸 JSON | rc.45 的终态限流读到 EOF 被放行，上一行的改动在 LT 和生产（rc.44）上都不起作用 | `startup.Read` 的裸 JSON 规则（§1.3）：只在"之前只有心跳"的位置把一行 `{…}` 当作 data |
+| 裸 JSON 规则不要求"之前只有心跳" | 上游流里偶然出现的非字段行也会被当成错误帧解析 | 必须同时满足 `heartbeats > 0 && !dataSeen`、没有 `event:` 和 `data:`、只有这一行（§1.3） |
+| `Retry-After` 向下取整，或者用 `base` 代替剩余时间 | 不足 1 秒时写成 0，等于叫客户端立刻重试；用 `base` 会比实际窗口短（窗口是 `base << (s-1)`） | 用 `Gate.Remaining()`，向上取整，至少 1、至多 1800（§1.4） |
+| 手工改了配置文件，没有 reload 就执行 `nahookctl retry set/unset` | `SetRetryMax`/`UnsetRetryMax` 写回文件的是内存快照（§1.7 `clone(cur)`），文件里还没 reload 的改动（例如新加的模型）被静默覆盖。2026-10-22 在测试环境复现：手工加了一个模型，`retry set 3` 之后它从文件里消失 | 写回之前 `checkFile`：文件和快照按内容比较，不一样就回 409（§1.7）。按内容比较时 nil 和空集合要视为相同，否则一个刚由 `Persist` 写出的文件也会被判成"改过"。检查和 rename 之间还有毫秒级的窗口，这期间的手工改动仍会被覆盖，不再加锁防它 |

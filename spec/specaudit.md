@@ -36,8 +36,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
 | Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 已关闭：T15（`build-bd6fad86`）部署到 LT，关护栏的 h3 上复测 T-F17 通过（§7.17） |
 | Q21 | R3 | 部署·生产是官方 rc.44 没有护栏，Caddy 是 2.11.4 并带 `encode`；LT 的 Caddy 是 2.6.2 | 不明 | P1 | 00、01 | Caddy 一项已处理（D4：LT 升到 2.11.4、加回 `encode`，全部复测通过）；上线路径 D3 暂缓（用户决定先不上生产） |
-| Q22 | — | 运维·手工改配置后没 reload 就用 nahookctl 写入，改动被静默覆盖 | 脆弱 | P2 | 01 | 已写进 README 和 design §8；代码防护待用户决定是否排期 |
-| Q23 | R1 | 流式·心跳提交 200 之后，NewAPI 的终态限流被原样交给客户端（S7），客户端拿到的是 200 而不是 429 | 未细分 | P1 | 01 | 待拍板 D5（docs/analysis/hook-points.md §9.1、§9.2） |
+| Q22 | — | 运维·手工改配置后没 reload 就用 nahookctl 写入，改动被静默覆盖 | 脆弱 | P2 | 01 | 已拍板（2026-10-22）：写回前按内容比对文件、加 `nahookctl config show`，design §1.7、§5、§6.4、§6.5；由 01:T16 实现 |
+| Q23 | R1 | 流式·心跳提交 200 之后，NewAPI 的终态限流被原样交给客户端（S7），客户端拿到的是 200 而不是 429 | 未细分 | P1 | 01 | 已拍板 D5（2026-10-22）：不重试、代 429、带 `Retry-After`，design §1.3–§1.6；由 01:T16 实现 |
 | Q24 | R3 | 入口·"nahook 路由不写 `lb_try_duration`"的依据来自 Caddy 2.6.2；2.11.4 已修 dial 失败时的 POST 重试 | 不明 | P2 | 00、01 | 待测试环境实测（docs/analysis/hook-points.md §10 V3）；实测之前照旧不写 |
 | Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 已关闭：只在 Caddy 2.6.2 上成立；2.11.4 上实测压缩不会攒住事件（D4），LT 和生产都保留 `encode` |
 
@@ -125,13 +125,21 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 
 - 证据：`config.(*Store).SetRetryMax` 用内存快照的深拷贝 `clone(cur)` 修改后整体落盘（design §1.7），不读文件。2026-10-22 在测试环境复现：在 `/etc/nahook/config.json` 的 `match.models` 里手工加一个模型、不 reload，执行 `nahookctl retry set 3`（值不变），文件里的新模型消失，没有任何提示。
 - 影响：运维照 README 加模型或路径时，如果忘了先 reload、又改了重试上限，新加的拦截范围会悄悄丢掉，而且没有命令能列出内存里生效的路径和模型来发现这一点。
-- 处理：README §1.5.4、§2 和 design §8 写明"先 reload 再用 nahookctl"。代码层面可以做两件事，待用户决定是否排期：一是 `Store` 记住上次加载或写入时文件的哈希，写入前发现文件被外部改过就拒绝（控制口返回 409，提示先 reload）；二是加 `nahookctl config show`，打印内存里生效的完整配置。
+- 处理：README §1.5.4、§2 和 design §8 写明"先 reload 再用 nahookctl"。用户 2026-10-22 决定做代码防护，和 D5 合成 01:T16：
+  - `SetRetryMax`、`UnsetRetryMax` 写盘前重新读文件，和内存快照按内容比较，不一样、读不到或解析不了就回 409（design §1.7 `checkFile`）。原方案是记文件哈希，改成按内容比较：只改缩进不会被误拒，也不用改 `NewStore` 的签名。
+  - 加 `GET /v1/config` 和 `nahookctl config show`，显示内存里生效的配置，以及文件是否一致（design §5、§6.5）。
 
 ### Q23 心跳之后的终态限流以 200 交给客户端
 
 - 证据：NewAPI rc.45 的流式请求在等上游响应头时就发心跳（`relay/channel/api_request.go:550-569`），第一次心跳就向下游提交了 200；之后的终态错误由 `Relay` 的 defer 用 `c.JSON` 追加在流里（`controller/relay.go:92-110`）。`#7857` 起改成 `data: {"error"}` + `data: [DONE]`。两种形态都已实测（Q20）。nahook 现在按 design §1.6 把它认作 NewAPI 的终态错误，原样透传。
 - 影响：LT 和生产的心跳都是 1 秒，上游 1 秒内没回响应头的限流全部走这条路径。客户端收到的是一个没有正常结束事件的 200 流，而不是 429。nahook 这时还没向客户端写过字节，本来可以给出 429。
-- 处理：待拍板 D5。方案是不重试、直接代 429，并带上 `Retry-After`；见 docs/analysis/hook-points.md §9.1、§9.2。拍板后改写 01 design §1.4、§1.6，并排一个任务。
+- 处理：用户 2026-10-22 拍板 D5，和 Q22 合成 01:T16。设计落点：
+  - design §1.3：rc.45 的裸 JSON 规则。
+  - design §1.4：`Retry-After`。
+  - design §1.5：`Gate.Remaining`。
+  - design §1.6：终态限流改成代 429，不重试，照样计入冷却门。
+  - design §6.7：新计数器 `final_429`。
+  - audit T-F17、T-F18。
 
 ### Q24 `lb_try_duration` 在 2.11.4 上需要重测
 
@@ -177,7 +185,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 |---|---|---|
 | D3 | 生产上线路径：在 rc.44 上一个阶段部署 nahook 和路由（不换镜像） | 00 design §1.2 末尾"待拍板"；**暂缓**：用户 2026-10-22 决定先不上生产，先把测试环境收完 |
 | D4 | ~~上线前先把 LT 的 Caddy 换成 2.11.4、加回 `encode`，重跑测试~~ | 已完成（2026-10-22，§7.19） |
-| D5 | S7 的终态限流改成代 429（不重试），代 429 带上 `Retry-After`（冷却门的剩余时间） | docs/analysis/hook-points.md §9.1、§9.2（附架构图、场景和建议）；拍板后改写 01 design §1.4、§1.6（Q23） |
+| D5 | ~~S7 的终态限流改成代 429（不重试），代 429 带上 `Retry-After`（冷却门的剩余时间）~~ | 已拍板（2026-10-22，用户），和 Q22 合成 01:T16；§7.21 |
 
 ## 5. 开工前待查索引
 
@@ -223,6 +231,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | SPEC 从 `渠道监控/SPEC/` 迁到 NaHook 仓库的 `spec/`，以仓库为准 | `spec/README.md` |
 | 仓库改为公开；产物用 GitHub Release 分发 | 01 design §7；01 tasks T8、T9 |
 | 公开前去掉：上游 org 编号、LT 的 SSH 登录方式 | `docs/reference/渠道监控/4-4-tpm-retry.md`（快照已脱敏）；本文件 Q9 |
+| NewAPI 的终态限流改成代 429、不重试；代 429 带 `Retry-After`（D5，2026-10-22） | 01 design §0、§1.3–§1.6、§3.6、§5、§6.7、§8；01 tasks T16 |
+| 写回配置前比对文件，加 `nahookctl config show`（Q22，2026-10-22） | 01 design §1.7、§3.4、§5、§6.4、§6.5、§8；01 tasks T16 |
 
 ### 7.2 写 SPEC 时作者做的调整（需要用户知悉）
 
@@ -752,3 +762,25 @@ LT 现状：NewAPI rc.45；nahook `build-bd6fad86`；mockrelay `build-3a387b58`�
 - `header { match { status 429 } ?Retry-After N }` 编译后丢掉了"只对 429"的条件，会给所有响应补头；要用 `>`。
 - 更正：`ignoreClientGoneContext` 是在 v2.9.0 删除的（回退 #4952），不是 v2.8.0。README §7.3、§7.4 和本文件 Q21、§7.19 已改。
 - 上游 new-api#3142、PR #6446 在做同一件事，合入后会和 nahook 的重试叠加（分析 §9.6）。
+
+### 7.21 D5 和 Q22 拍板，T16 的 SPEC；V1、V2、V4 实测（2026-10-22）
+
+用户决定：D5 做，和 Q22 合成 T16；批准 V1、V2、V4，由架构侧在 LT 上执行。
+
+| 实测 | 做法 | 结果 |
+|---|---|---|
+| V1 | mockrelay 脚本 `http429` × 6，心跳开着（1s），RetryTimes 3；Responses 和 Chat 各发一次流式请求，Responses 再发一次非流式 | 直连：流式是 HTTP 429，`Content-Type: text/event-stream`，体是裸 JSON（`{"error":{…}}`，message 不带 request id），没有 `Retry-After`；mockrelay 被调用 4 次，用时 18–28ms，没有心跳。经站点：同样，nahook 透传。非流式是 `application/json`。证实 docs/analysis/hook-points.md §2.1 的推论 |
+| V2 | 在 127.0.0.1:18093、18094 起临时 Caddy 2.11.4（`admin off`、`auto_https off`，40s 后自动退出），分别用 `>Retry-After 5` 和 `?Retry-After 5` | `>`：只有 429 带上，原来的 `Retry-After: 30` 被改成 5。`?`：200 也被加上 `Retry-After: 5`，原来的 30 保留。证实 4.4 的坑 |
+| V4 | 在 127.0.0.1:18095 起临时 Caddy，用 `{http.request.body}` 的 CEL 表达式分流（90s 后自动退出）；看 nahook 计数器判断走向 | 流式（含 `"stream" : true` 和 300KB 请求体）走 nahook，200；非流式（含 300KB）直达 NewAPI，429，mockrelay 4 次，请求体完整；顶层 `"stream":false`、只在 `metadata` 里有 `"stream":true` 的请求被正则误送进 nahook（3 次重复都是 `passthrough` +1），nahook 判为非流式后透传，结果正确；临时 Caddy 没有错误日志 |
+
+临时 Caddy 都已自动退出（端口关闭，`caddy`、`nahook` 服务 active，没有动 `/etc/caddy/Caddyfile`）。文件在 LT 的 `/root/nahook-t10/hook-validate/`（测试遗留，和其他遗留一起处理）。
+
+T16 的设计决定（作者在写 SPEC 时定的，需要用户知悉）：
+
+| 点 | 决定 | 理由 |
+|---|---|---|
+| 终态限流要不要计入冷却门 | 计入：`OnRateLimit`（elapsed 是这次尝试的总耗时），不调 `ResetModel` | NewAPI 刚确认这个 key 被限流，同一个 key 上其他正在被拦截的请求也该避开；`Retry-After` 也需要冷却门有值 |
+| 新计数器还是复用 `gave_up` | 新增 `final_429` | `gave_up` 的含义是 nahook 自己的重试用完了；分开计，才看得出有多少限流是 NewAPI 那一层用完的 |
+| `Retry-After` 的上限 | 1800 秒 | 和 `gate.maxBase`（30m）相同；冷却窗口在正常配置下远小于它 |
+| Q22 用哈希还是按内容比较 | 按内容比较 | 只改缩进不会被误拒；不用改 `NewStore` 的签名；读不到或解析不了的文件同样拒绝写 |
+| NewAPI 自己透传的 429（S2、S4、S6）补不补 `Retry-After` | 不补 | 不在 D5 的范围里；它们已经是 429，nahook 也没有对应的冷却门数值 |

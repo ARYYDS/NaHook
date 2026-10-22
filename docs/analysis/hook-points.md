@@ -88,7 +88,7 @@ Relay 循环（controller/relay.go:162@rc.45），每次尝试：
 Relay 的 defer（controller/relay.go:92-110）：有 NewAPIError 时
     先在 message 末尾加 " (request id: <rid>)"（:96），再 c.JSON(状态码, {"error":…})（:107）
     ├ 还没提交过：状态码就是上面那个码；Content-Type 仍是 text/event-stream，
-    │            因为 gin 只在没有 Content-Type 时才设 application/json【推论】
+    │            因为 gin 只在没有 Content-Type 时才设 application/json（第 10 节 V1 实测）
     └ 已经提交过（心跳写过）：状态码写不出去，JSON 原样接在心跳后面，没有 "data:" 前缀
                              （测试环境实测：T10 T-F17 的 rc.45 部分，见 spec/specaudit.md Q20）
 ```
@@ -136,7 +136,7 @@ Relay 的 defer：c.JSON(状态码, {"error":…})；Content-Type 是 applicatio
 | S3 | 非流式，上游 200 + `{"error":…}` 体 | **200** / json | 体 | 不能 | 透传 | 只有读体的一层能改 |
 | S4 | NewAPI 自己限流（全局 / 模型） | 429 | 头（全局限流有 `Retry-After`）或体 | 能 | 透传 | 已经是 429，而且不该重试 |
 | S5 | 流式，上游 200，启动帧里限流 | 200 / event-stream | SSE 体（`error`、`response.failed`、Chat 的 `{"error":…}` 块） | **不能** | 拦截：冷却后重试，用完上限代 429 | nahook（现有功能） |
-| S6 | 流式，上游很快回 HTTP 429（心跳还没发，或心跳关着），RetryTimes 用完 | 429 / **event-stream**（rc.45）或 json（`#7857` 起）【推论】 | 体（裸 JSON） | 能（状态码） | 透传（intercept.go:41） | 已经是 429 |
+| S6 | 流式，上游很快回 HTTP 429（心跳还没发，或心跳关着），RetryTimes 用完 | 429 / **event-stream**（rc.45，V1 实测）或 json（`#7857` 起） | 体（裸 JSON） | 能（状态码） | 透传（intercept.go:41） | 已经是 429 |
 | S7 | 流式，心跳已提交 200，之后上游 HTTP 429，RetryTimes 用完 | 200 / event-stream | `: PING`… 之后的裸 JSON（rc.45），或 `data:{"error"}` + `[DONE]`（`#7857` 起） | 不能 | rc.45：读到 EOF 放行；`#7857` 起：规则 2 透传 | **能，但现在没做**：nahook 还没向客户端写字节（9.1） |
 | S8 | 流式，首个 delta 之后才限流 | 200 / event-stream | SSE 体 | 不能 | 已放行 | 任何一层都不能 |
 | S9 | 流式 Claude `/v1/messages`、Gemini | 200 / event-stream | `event: error` + `rate_limit_error` 等 | 不能 | 不经过 nahook（路径不在 match.paths） | 要扩展（9.4） |
@@ -203,6 +203,8 @@ case "http.request.body":
   ```
 
   代价是每个命中的请求都要把整个体读进内存，再跑一遍正则；带图片的请求体可能有好几 MB。正则里不要写 `{n}` 这类量词：以字母开头的 `{…}` 会被当成占位符。
+
+  V4 实测（临时 Caddy）：流式请求（包括 `"stream" : true` 和 300KB 的请求体）走 nahook；非流式请求（包括 300KB）直达 NewAPI，请求体完整。正则看不懂 JSON 结构：顶层 `"stream": false`、只在 `metadata` 里有 `"stream":true` 的请求也会被送进 nahook，再由 nahook 判为非流式、原样透传，结果不受影响，只是多走一跳。
 - **结论：分流交给 nahook 的 `classify`（N1），Caddy 只按 method + path 收窄。** 两边都读体没有收益。
 
 ### 4.4 响应：只有状态码和头
@@ -216,7 +218,7 @@ case "http.request.body":
   - 从 v2.8.0 开始有，标为实验功能；
   - 一旦匹配就整体缓冲到上游结束，SSE 会被憋住；
   - 2.11.4 里它的 `replace_status` 会被静默丢掉（caddy#7805，修复在 v2.11.6）。
-- `header` 指令补 `Retry-After`（测试环境 `caddy adapt` 的结果）：
+- `header` 指令补 `Retry-After`（测试环境 `caddy adapt` 的结果，V2 实测证实）：
 
   | 写法 | 编译结果 | 效果 |
   |---|---|---|
@@ -374,7 +376,7 @@ NewAPI 看到的是 HTTP 429 ──► DecideRelayRetry ──► 按 RetryTimes
 
 按收益和改动量排序。9.1 和 9.2 建议一起做；其余先不做，写明各自的触发条件。
 
-### 9.1 S7：NewAPI 的终态限流改成 429，不重试
+### 9.1 S7：NewAPI 的终态限流改成 429，不重试（已拍板 D5，T16）
 
 ```text
 现在：
@@ -395,7 +397,7 @@ NewAPI ─200 + ": PING"… + 终态错误─► nahook ── newAPIFinalError 
   - 改后：客户端收到 HTTP 429，体里是 NewAPI 的原始错误，会按限流处理。上游的调用次数不变，仍然只有 NewAPI 的那几次。
 - 建议：做。这是"限流一律变 429"最大的缺口，改动只在 `startup` 和 `proxy`。
 
-### 9.2 代 429 带 `Retry-After`
+### 9.2 代 429 带 `Retry-After`（已拍板 D5，T16）
 
 ```text
 冷却门 g.until（N7）──► 剩余时间 = until − now（向上取整到秒，至少 1）──► proxy429.Write 设置 Retry-After（N9）
@@ -440,17 +442,17 @@ NewAPI ─200 + ": PING"… + 终态错误─► nahook ── newAPIFinalError 
 
 ---
 
-## 10. 还没实测的点
+## 10. 实测
 
-都在测试环境做，都需要先请示。
+都在测试环境做，都需要先请示。V1、V2、V4 已在 2026-10-22 做完（用户批准，记录见 spec/specaudit.md §7.21）。
 
-| 编号 | 内容 | 做法 | 验证什么 |
+| 编号 | 内容 | 做法 | 结果 |
 |---|---|---|---|
-| V1 | S6 的 Content-Type | mockrelay 立即回 HTTP 429，心跳保持开着，经 Caddy 请求 | rc.45 返回 429 时，Content-Type 是否为 `text/event-stream`（2.1） |
-| V2 | `header >Retry-After` | 用另一个端口起临时 Caddy，`respond 429` 和 `respond 200` 各请求一次 | 只有 429 带上 `Retry-After`（4.4） |
-| V3 | `lb_try_duration` | 在 nahook 路由加 `lb_try_duration 5s`，停掉 nahook，发 POST | 2.11.4 上第一个请求是否也转给了 NewAPI，NewAPI 有没有被记为失败（4.5） |
-| V4 | `{http.request.body}` 分流 | 临时 Caddy 加上 4.3 的表达式，各发一次流式和非流式请求 | 只有流式的走 nahook；请求体完整到达 NewAPI |
+| V1 | S6 的 Content-Type | mockrelay 立即回 HTTP 429，心跳开着（1s），RetryTimes 3；直连和经站点各发一次 | **已测**：流式是 HTTP 429 + `Content-Type: text/event-stream`，体是裸 JSON，message 不带 request id，没有 `Retry-After`；mockrelay 被调用 4 次，没有心跳；非流式是 `application/json` |
+| V2 | `header` 补 `Retry-After` | 临时 Caddy，两个端口分别用 `>` 和 `?`；`/200`、`/429`、带原值 30 的 `/429ra` 各请求一次 | **已测**：`>` 只加在 429 上，但把 30 改成了 5；`?` 连 200 也加上了，原值 30 保留 |
+| V3 | `lb_try_duration` | 在 nahook 路由加 `lb_try_duration 5s`，停掉 nahook，发 POST | 待做：要换 Caddyfile、停 nahook，需要另行请示 |
+| V4 | `{http.request.body}` 分流 | 临时 Caddy 加上 4.3 的表达式；流式、非流式、带空格、300KB、嵌套 `"stream":true` 各发一次，看 nahook 计数器 | **已测**：只有流式的走 nahook，请求体完整；嵌套的 `"stream":true` 被误送进 nahook，nahook 透传，结果正确（4.3） |
 
 S7 在 rc.45 和关护栏的 h3 上的实际字节已经测过（T10 T-F17，spec/specaudit.md Q20），9.1 直接用它们做样本。
 
-已经做过的还有：4.3 的表达式和 4.4 的两种 `header` 写法，已在测试环境用 `caddy validate` 和 `caddy adapt` 确认能编译、看过编译结果（文件在测试主机的 `/root/nahook-t10/hook-validate/`）。
+测试文件在测试主机的 `/root/nahook-t10/hook-validate/`；临时 Caddy 都只监听 127.0.0.1，到时自动退出，没有动正式的 Caddyfile。
