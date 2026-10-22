@@ -37,6 +37,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 已关闭：T15（`build-bd6fad86`）部署到 LT，关护栏的 h3 上复测 T-F17 通过（§7.17） |
 | Q21 | R3 | 部署·生产是官方 rc.44 没有护栏，Caddy 是 2.11.4 并带 `encode`；LT 的 Caddy 是 2.6.2 | 不明 | P1 | 00、01 | Caddy 一项已处理（D4：LT 升到 2.11.4、加回 `encode`，全部复测通过）；上线路径 D3 暂缓（用户决定先不上生产） |
 | Q22 | — | 运维·手工改配置后没 reload 就用 nahookctl 写入，改动被静默覆盖 | 脆弱 | P2 | 01 | 已写进 README 和 design §8；代码防护待用户决定是否排期 |
+| Q23 | R1 | 流式·心跳提交 200 之后，NewAPI 的终态限流被原样交给客户端（S7），客户端拿到的是 200 而不是 429 | 未细分 | P1 | 01 | 待拍板 D5（docs/analysis/hook-points.md §9.1、§9.2） |
+| Q24 | R3 | 入口·"nahook 路由不写 `lb_try_duration`"的依据来自 Caddy 2.6.2；2.11.4 已修 dial 失败时的 POST 重试 | 不明 | P2 | 00、01 | 待测试环境实测（docs/analysis/hook-points.md §10 V3）；实测之前照旧不写 |
 | Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 已关闭：只在 Caddy 2.6.2 上成立；2.11.4 上实测压缩不会攒住事件（D4），LT 和生产都保留 `encode` |
 
 ## 3. 逐项说明
@@ -116,7 +118,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 ### Q21 生产基线和 LT 不一致
 
 - 证据：K8 只读核查（01 audit §5 K8）。生产 NewAPI 是官方 rc.44（digest `67bf2716…`），没有护栏；Caddy 是官方构建 v2.11.4，站点层有 `encode zstd gzip`，没有 `flush_interval -1`。LT 的 Caddy 是 Debian 包 2.6.2。rc.44 到 rc.45 的 31 个提交里，`relay/channel/openai/relay_responses.go`、`relay/helper/stream_scanner.go` 没有改动，`controller/relay.go` 只多了上游地址脱敏，rc.44 没有 `writeRelayStreamError`。
-- 影响：00 design §1.2 的三阶段计划失去前提：阶段 2（关 h3 护栏）和阶段 3（换官方镜像）不存在，部署 nahook 就立刻开始拦截。T0、T-C1–T-C4、Q17、Q18 的结论是在 Caddy 2.6.2 上得出的，2.11.4 上需要重测（`ignoreClientGoneContext` 在 v2.8.0 删除，`encode` 的 Flush 在 v2.9.0 修复）。`relayscope-agent` 读取 NewAPI 的日志，nahook 每次重试在 NewAPI 里都是一个独立请求，会多出 quota 为 0 的日志行（T-F9）。
+- 影响：00 design §1.2 的三阶段计划失去前提：阶段 2（关 h3 护栏）和阶段 3（换官方镜像）不存在，部署 nahook 就立刻开始拦截。T0、T-C1–T-C4、Q17、Q18 的结论是在 Caddy 2.6.2 上得出的，2.11.4 上需要重测（`ignoreClientGoneContext` 在 v2.9.0 删除（回退 #4952），`encode` 的 Flush 在 v2.9.0 修复）。`relayscope-agent` 读取 NewAPI 的日志，nahook 每次重试在 NewAPI 里都是一个独立请求，会多出 quota 为 0 的日志行（T-F9）。
 - 处理：待用户拍板 D3、D4（00 design §1.2 末尾）。
 
 ### Q22 nahookctl 写入覆盖未 reload 的文件改动
@@ -124,6 +126,18 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 - 证据：`config.(*Store).SetRetryMax` 用内存快照的深拷贝 `clone(cur)` 修改后整体落盘（design §1.7），不读文件。2026-10-22 在测试环境复现：在 `/etc/nahook/config.json` 的 `match.models` 里手工加一个模型、不 reload，执行 `nahookctl retry set 3`（值不变），文件里的新模型消失，没有任何提示。
 - 影响：运维照 README 加模型或路径时，如果忘了先 reload、又改了重试上限，新加的拦截范围会悄悄丢掉，而且没有命令能列出内存里生效的路径和模型来发现这一点。
 - 处理：README §1.5.4、§2 和 design §8 写明"先 reload 再用 nahookctl"。代码层面可以做两件事，待用户决定是否排期：一是 `Store` 记住上次加载或写入时文件的哈希，写入前发现文件被外部改过就拒绝（控制口返回 409，提示先 reload）；二是加 `nahookctl config show`，打印内存里生效的完整配置。
+
+### Q23 心跳之后的终态限流以 200 交给客户端
+
+- 证据：NewAPI rc.45 的流式请求在等上游响应头时就发心跳（`relay/channel/api_request.go:550-569`），第一次心跳就向下游提交了 200；之后的终态错误由 `Relay` 的 defer 用 `c.JSON` 追加在流里（`controller/relay.go:92-110`）。`#7857` 起改成 `data: {"error"}` + `data: [DONE]`。两种形态都已实测（Q20）。nahook 现在按 design §1.6 把它认作 NewAPI 的终态错误，原样透传。
+- 影响：LT 和生产的心跳都是 1 秒，上游 1 秒内没回响应头的限流全部走这条路径。客户端收到的是一个没有正常结束事件的 200 流，而不是 429。nahook 这时还没向客户端写过字节，本来可以给出 429。
+- 处理：待拍板 D5。方案是不重试、直接代 429，并带上 `Retry-After`；见 docs/analysis/hook-points.md §9.1、§9.2。拍板后改写 01 design §1.4、§1.6，并排一个任务。
+
+### Q24 `lb_try_duration` 在 2.11.4 上需要重测
+
+- 证据：Q17 和 T-C4 的结论（POST 重试时请求体已被关闭，重试失败，NewAPI 也被记一次失败）是在 Caddy 2.6.2 上得出的。2.11.4 修好了 dial 失败时关体的问题：caddy#7547 修复，进入 v2.11.2；PR #7715、#7719 进入 v2.11.4。D4 在 2.11.4 上复测 T-C4 时没加 `lb_try_duration`，第 1 个请求仍然是 13ms 的 502。
+- 影响：如果 2.11.4 上 dial 失败时可以安全重试，nahook 重启的那几秒就不会再有 502。
+- 处理：在测试环境做 V3（docs/analysis/hook-points.md §10）。实测之前，00 design §3.2、§6.1 照旧不写 `lb_try_duration`。
 
 ### Q6 被拦截那几次尝试的计费
 
@@ -163,6 +177,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 |---|---|---|
 | D3 | 生产上线路径：在 rc.44 上一个阶段部署 nahook 和路由（不换镜像） | 00 design §1.2 末尾"待拍板"；**暂缓**：用户 2026-10-22 决定先不上生产，先把测试环境收完 |
 | D4 | ~~上线前先把 LT 的 Caddy 换成 2.11.4、加回 `encode`，重跑测试~~ | 已完成（2026-10-22，§7.19） |
+| D5 | S7 的终态限流改成代 429（不重试），代 429 带上 `Retry-After`（冷却门的剩余时间） | docs/analysis/hook-points.md §9.1、§9.2（附架构图、场景和建议）；拍板后改写 01 design §1.4、§1.6（Q23） |
 
 ## 5. 开工前待查索引
 
@@ -713,8 +728,27 @@ K7（生产的心跳设置）读不到（不读数据库），需要用户在 `a
 | 加回 `encode` | 用户 | `Caddyfile.d4`（sha256 `ff0c213b72bf9c9f12d14a7db2ecaee7a1e83c873bf078132fb0b05b613d93b8`），和生产一样放在 `request_body` 前面 |
 | 最终配置复测 | 架构侧 | 功能回归全部通过；带 `--compressed` 时 nahook 路由解码后和直连逐字节相同，`slow:4` 逐帧准时，代 429 正常，默认路由的流式正常（mockrelay 的帧太短，完整链路上没有触发压缩，压缩下的行为以 K9 实测为准）；T-C2、T-C4 通过（这次 10s 内回到 nahook，在 `fail_duration` 的窗口内） |
 
-T-C1 没有重跑：nahook 路由和生产都不写 `-1`，并且 `ignoreClientGoneContext` 在 Caddy v2.8.0 已经删除。
+T-C1 没有重跑：nahook 路由和生产都不写 `-1`，并且 `ignoreClientGoneContext` 在 Caddy v2.9.0 已经删除（回退 #4952）。
 
 观察：T-F15a 有一次用了 24.7s，是冷却门的设计行为：前一项"一直限流"放弃时 streak 停在 3（只有放行才清零），这次单次尝试耗时 5s，窗口是 5s×4。
 
 LT 现状：NewAPI rc.45；nahook `build-bd6fad86`；mockrelay `build-3a387b58`；Caddy 2.11.4（hold）+ `Caddyfile.d4`。回退：`apt-mark unhold caddy && apt-get install -y --allow-downgrades caddy=2.6.2-12+deb13u1`，再把备份的 `/etc/caddy` 拷回。
+
+### 7.20 流式和非流式下各层能拿到什么、限流转 429 的挂接点（2026-10-22，只读分析）
+
+用户要求基于实际行为重新分析 Caddy，查 issues，梳理挂接点。产出 `docs/analysis/hook-points.md`。
+
+| 部分 | 怎么做的 | 结论落点 |
+|---|---|---|
+| NewAPI | 架构侧读 rc.45 源码（`git show v1.0.0-rc.45:…`）：心跳提交时机、defer 怎么写错误、上游的头抄不抄、2xx 错误不重试 | 分析 §2、§3（S1–S10） |
+| Caddy | 派一个只读调研子代理读 v2.11.4 源码和 issues；架构侧抽查关键行（replacer.go:217-230、streaming.go:247-263、reverseproxy.go:1124-1141、1326-1328），用 gh 核对全部 issue 编号和标题 | 分析 §4、§8 |
+| 测试环境 | 只读：`caddy list-modules`（132 个标准模块，没有插件）；在 `/root/nahook-t10/hook-validate/` 放两个候选文件，`caddy validate` 和 `caddy adapt`。没碰正在用的 Caddyfile，也没起进程 | 分析 §4.3、§4.4 |
+
+发现：
+
+- Caddy 原生读不到响应体，SSE 的响应头一到就提交 200，所以 R1 只能在 nahook 这一层解决（证实 01 design §0 的选型）。
+- S7（心跳之后的终态限流）现在以 200 交给客户端，可以改成代 429：登记为 Q23，待拍板 D5。
+- `lb_try_duration` 的依据来自 2.6.2，2.11.4 已修 dial 失败时的 POST 重试：登记为 Q24，待实测 V3。
+- `header { match { status 429 } ?Retry-After N }` 编译后丢掉了"只对 429"的条件，会给所有响应补头；要用 `>`。
+- 更正：`ignoreClientGoneContext` 是在 v2.9.0 删除的（回退 #4952），不是 v2.8.0。README §7.3、§7.4 和本文件 Q21、§7.19 已改。
+- 上游 new-api#3142、PR #6446 在做同一件事，合入后会和 nahook 的重试叠加（分析 §9.6）。

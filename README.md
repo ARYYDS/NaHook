@@ -328,7 +328,7 @@ nahook 把请求的 `Host` 原样转给 NewAPI，所以 NewAPI 依然知道请�
 
 1. **不写 `flush_interval`**（两个 `handle` 都不写）。SSE 会被 Caddy 自动立即 flush；在 2.6.2 上写了 `-1` 会让客户端断开传不到后端。
 2. **写 `fail_duration 10s`**。nahook 连不上时，第一次失败就把它标为不可用，后面的请求直接走 NewAPI。
-3. **nahook 路由里不写 `lb_try_duration`**。Caddy 重试 POST 时请求体已经被关闭，重试必然失败，还会把 NewAPI 也标成不可用。
+3. **nahook 路由里不写 `lb_try_duration`**。在 2.6.2 上实测：Caddy 重试 POST 时请求体已经被关闭，重试必然失败，还会把 NewAPI 也标成不可用。2.11.4 修好了 dial 失败时的重试（caddy#7547、#7715、#7719），能不能放开要在测试环境重测（[docs/analysis/hook-points.md](docs/analysis/hook-points.md) 4.5、V3）；重测之前照旧不写。
 
 #### 1.5.8 改完怎么生效
 
@@ -843,7 +843,7 @@ Caddy     nahook                         NewAPI                 上游
 | 健康检查 | `health_uri /api/status`，nahook 把它透传给 NewAPI，所以两个上游都能检查 | — |
 | 客户端断开 | Caddy 取消发往 nahook 的请求，nahook 的 `r.Context()` 被取消，等待和重试随即停止 | 实测 0.5s 内 |
 | nahook 挂掉 | 发现连不上的那个请求收到 502；`fail_duration` 把 nahook 标为不可用，之后的请求直接走 NewAPI；健康检查 10s 内也会标为不健康 | 实测首个 502 用时 13ms，之后全部正常 |
-| 不能重试 | Caddy 重试 POST 时请求体已被 Go 的 Transport 关闭，重试必然失败，还会把 NewAPI 也记一次失败，所以不写 `lb_try_duration` | caddyserver/caddy#5454；实测 |
+| 不能重试 | Caddy 重试 POST 时请求体已被 Go 的 Transport 关闭，重试必然失败，还会把 NewAPI 也记一次失败，所以不写 `lb_try_duration`。2.11.4 修好了 dial 失败时的重试，待重测 | caddyserver/caddy#5454（HTTP/1 下的同一问题）、#7547；实测（2.6.2） |
 | 超时 | `response_header_timeout 30m` 是外层上限；nahook 到 NewAPI 之间不另设 | — |
 | 压缩 | nahook 对 NewAPI 始终要明文；客户端那一侧的压缩由 Caddy 的 `encode` 负责 | 7.4 |
 | 来源 IP | `header_up X-Real-IP {remote_host}`，nahook 原样转发 | 实测 NewAPI 记录的 IP 不变 |
@@ -870,17 +870,19 @@ NewAPI 挂掉：
 
 ### 7.3 为什么 nahook 路由不能写 `flush_interval -1`
 
-在 Caddy 2.6.2 上，写了 `flush_interval -1` 的 `reverse_proxy` 会把发往后端的请求上下文换成"忽略客户端断开"的版本。nahook 在等待和重试期间不写任何字节，Caddy 也就没有机会通过写失败发现客户端已经走了：实测客户端 2 秒就断开，nahook 到第 30 秒还在把响应放行给一个早已离开的客户端（照常扣费，遇到限流还会继续重试）。不写的话，断开 1ms 内就传到后端。Caddy v2.8.0 删除了这段逻辑，但写它没有任何好处，所以一律不写。
+在 Caddy 2.6.2 上，写了 `flush_interval -1` 的 `reverse_proxy` 会把发往后端的请求上下文换成"忽略客户端断开"的版本。nahook 在等待和重试期间不写任何字节，Caddy 也就没有机会通过写失败发现客户端已经走了：实测客户端 2 秒就断开，nahook 到第 30 秒还在把响应放行给一个早已离开的客户端（照常扣费，遇到限流还会继续重试）。不写的话，断开 1ms 内就传到后端。Caddy v2.9.0 删除了这段逻辑（回退 #4952），但写它没有任何好处，所以一律不写。
 
 ### 7.4 Caddy 版本差异
 
 ```text
                        Caddy 2.6.2                         Caddy ≥ 2.9（实测 2.11.4）
-flush_interval -1      吞掉客户端断开                      已删除（v2.8.0）；我们也不写
+flush_interval -1      吞掉客户端断开                      已删除（v2.9.0）；我们也不写
 encode 压缩 SSE         首次写入超过 512 字节后开始压缩，     每个事件都会立即冲刷，逐帧到达
                        Flush 不冲刷压缩器，事件会被攒住      ─► 可以保留 encode
                        ─► 站点层不要写 encode
-POST 重试              请求体已关闭，重试必然失败             同左；不依赖重试（不写 lb_try_duration）
+POST 重试              请求体已关闭，重试必然失败             dial 失败的重试已修好（v2.11.2、v2.11.4）；
+                                                           其它往返错误默认不重试 POST；
+                                                           是否写 lb_try_duration 待重测，现在不写
 ```
 
 nahook 放行时把启动阶段读到的字节（created 加第一个 delta）一次写出，所以经过 nahook 时 Caddy 的首次写入比直连时大，在 2.6.2 上更容易触发压缩。
@@ -969,7 +971,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/...
 | `deploy/` | systemd 单元、配置样例 |
 | `scripts/` | 构建和发布脚本 |
 | `spec/` | 工程 SPEC（设计、接口、审计、排期），以这里为准 |
-| `docs/` | 测试方案（`docs/T0/`）、知识库快照（`docs/reference/` 只读） |
+| `docs/` | 测试方案（`docs/T0/`）、知识库快照（`docs/reference/` 只读）、分析（`docs/analysis/`：流式和非流式下各层能拿到什么、限流转 429 的挂接点） |
 | `ops/` | 测试环境的实验脚本 |
 | `private/` | 服务器清单、开发任务书、开工提示词（`private/prompts/`）等可能含主机信息的文件。被 `.gitignore` 排除，不进仓库；只在开发机和 Win11 上，经 Tailscale（SSH）直接传输 |
 
