@@ -27,7 +27,7 @@ nahook 是一个独立的常驻进程，部署在 Caddy 和 NewAPI 所在的宿�
 
 | 相邻模块 | 约定 |
 |---|---|
-| Caddy 2.6.2（LT 宿主机） | 只把 `POST /v1/responses`、`POST /v1/chat/completions` 交给 nahook，用 `lb_policy first` 把 NewAPI 列为第二个上游。nahook 连不上时，Caddy 直接把请求交给 NewAPI（见 00-总体架构 §3） |
+| Caddy 2.11.4（LT 和生产相同，00-总体架构 §7） | 只把 `POST /v1/responses`、`POST /v1/chat/completions` 交给 nahook，用 `lb_policy first` 把 NewAPI 列为第二个上游，配 `fail_duration 10s`、不配 `lb_try_duration`、不写 `flush_interval`。nahook 连不上时，发现失败的那个请求收到 502，之后的请求直接交给 NewAPI（00-总体架构 §3.2、§6.1） |
 | NewAPI（官方镜像，`127.0.0.1:3000`） | nahook 是它的普通 HTTP 客户端，原样转发客户端的鉴权头和来源 IP 头。nahook 依赖的 NewAPI 行为见 §1.1 |
 | 上游中转站 | 不直接打交道，nahook 只看 NewAPI 透传出来的帧 |
 | `自动调度`（v2） | v2 只在 §1.6 的"拦截"分支上加一条路，不改本 SPEC 中冷却门和重试上限的语义（`自动调度/03-switch-algorithm.md` §7） |
@@ -35,7 +35,7 @@ nahook 是一个独立的常驻进程，部署在 Caddy 和 NewAPI 所在的宿�
 ### 前置约束
 
 - 生产 NewAPI 必须**关闭** `RESPONSES_STREAM_STARTUP_GUARD_ENABLED`（h3），或者直接用官方镜像。护栏开着时 NewAPI 回的是 HTTP 429，nahook 不拦截，只透传。
-- 生产 NewAPI 面板里的 `RetryTimes` 保持现值 1，只管 HTTP 层错误。nahook 的上限和它独立。
+- NewAPI 面板里的 `RetryTimes` 保持现值（LT 是 3），只管 HTTP 层错误。nahook 的上限和它独立。
 - 客户端必须经过 Caddy。直连 `:3000` 的请求会绕过 nahook（`自动调度/07-lt-measurements.md` §1）。
 
 ## §1 核心算法
@@ -416,14 +416,15 @@ control ─► Store.SetRetryMax ─► Validate ─► Persist（临时文件 +
 ### 3.5 nahook 宕机
 
 ```text
-Caddy ─连 127.0.0.1:19080 被拒─► 按 lb_policy first 换下一个上游 ─► NewAPI :3000
+Caddy ─连 127.0.0.1:19080 被拒─► 这个请求收到 502；被动健康检查把 19080 标为不可用（fail_duration 10s）
+      ─► 之后的请求按 lb_policy first 直接交给 NewAPI :3000（00-总体架构 §3.2）
 （客户端看到的就是官方原样行为：流内限流照常以 SSE 错误送达）
 ```
 
 ### 3.6 客户端断开
 
 ```text
-客户端断开 ─► Caddy ─（是否取消发往后端的请求：由 T-C1/T-C2 实测决定）─► r.Context() 取消
+客户端断开 ─► Caddy（不写 flush_interval，取消发往后端的请求；T0、T-C2，Caddy 2.6.2 和 2.11.4 都实测过）─► r.Context() 取消
            ─► forward 和 Wait 返回 ─► 关闭到 NewAPI 的连接
 ```
 
