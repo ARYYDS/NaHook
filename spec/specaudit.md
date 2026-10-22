@@ -837,7 +837,13 @@ V-i 的依据（架构侧核实了源码）：
 
 待办：
 
-1. 合并到 main。
-2. 发布 Release。
+1. ~~合并到 main。~~ 已完成：`dev`、`main` 都快进到 `fe009dc`，`audit/T16` 已删除。
+2. ~~发布 Release。~~ 已完成，见下面"发布"。
 3. 在 LT 上部署，跑 T-F1、T-F2、T-F17、T-F18 和冒烟三项（需要用户同意）。
 4. 同步 README。
+
+发布：
+
+- Release `build-fe009dc7`（`fe009dc7429893d24050def75026bf07c68c5fde`，prerelease），由 DSH 发布，附件 5 个，DSH 下载后 `sha256sum -c` 全部 OK。
+- 架构侧在 Win11 的一次性克隆里从这个提交重新编译（go1.27.2，`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/...`），三个二进制和附件逐字节一致：`nahook` `6150466d…`、`nahookctl` `e2c416f9…`、`mockrelay` `ec5be839…`。克隆已删除。
+- `cmd/mockrelay` 自 `build-3a387b58` 以来源码没有变化，LT 上只需要替换 `nahook` 和 `nahookctl`。

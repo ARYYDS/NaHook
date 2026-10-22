@@ -204,7 +204,7 @@ L-DOC                                                                           
     - [x] control 单测：`PUT`、`DELETE` 遇到 `ErrFileChanged` 回 409，错误信息提到 reload；`GET /v1/config` 三种 `file` 状态；`config` 的写法和 `Persist` 一致
     - [x] nahookctl 单测：`config show` 发 `GET /v1/config`，原样打印；409 时退出码 1
     - [x] audit §3 的门禁全部通过（DSH `60963b8`、`870bd97`；审计 `957c3f5` 及架构侧修复，specaudit §7.22）
-    - [ ] 架构侧审计通过、合并到 main 以后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
+    - [x] 架构侧审计通过、合并到 main 以后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）：`build-fe009dc7`，specaudit §7.22
     - [ ] （LT，需要用户同意）部署新版本后跑 T-F1、T-F2、T-F17、T-F18，以及冒烟三项；README §1.5.4、§3、§4.2、§5.6、§5.8、§6.2、§6.4、§6.5 由架构侧同步
   - 冲突：只改 L-GO 车道的文件；和 T15 改的是同一批文件，T15 已合入，没有并行任务
 
