@@ -1,6 +1,8 @@
-# server inventory and other host-specific notes: the repository is public,
-# so these stay local and are copied to Win11 over SSH, never through GitHub
+# server inventory, the DSH task book and start prompts: the repository is public,
+# so these stay local and are copied to Win11 over Tailscale (SSH), never through GitHub
 /private/
+/docs/任务书-*.md
+/docs/开工提示词*.md
 
 # build outputs never enter the repository (dist lives in O:\WinCache\nahook\dist)
 /dist/

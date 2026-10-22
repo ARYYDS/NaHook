@@ -4,9 +4,9 @@
 
 | 前置项 | 状态 | 缺了它能做到哪一步 |
 |---|---|---|
-| 仓库 `ARYYDS/NaHook`（公开），在 Win11 的 `O:\NaHook` 上开发和构建（design §7） | 已定；还需要用户在 Win11 上重新执行 `gh auth login`（见 `docs/任务书-DSH.md` §1.2） | 能克隆，但推送不了，也发不了 Release |
+| 仓库 `ARYYDS/NaHook`（公开），在 Win11 的 `O:\NaHook` 上开发和构建（design §7） | 已定；还需要用户在 Win11 上重新执行 `gh auth login`（见 `private/任务书-DSH.md` §1.2，私有，不在仓库里） | 能克隆，但推送不了，也发不了 Release |
 | 产物通过 GitHub Release 分发（design §7） | 已定 | — |
-| L-GO 车道由 Win11 上的 DSH 执行；任务书和开工提示词见 `docs/` | 已定 | — |
+| L-GO 车道由 Win11 上的 DSH 执行，在长期分支 `dev` 上开发，验证通过后由架构侧合并到 `main`；任务书和开工提示词在 `private/`（不进 Git，经 Tailscale 直传 Win11） | 已定 | — |
 | LT 上的每一次替换或安装 | 都要先请示用户 | 请示之前停在那一步 |
 | LT 只做测试（2026-10-21 起和生产隔离），上面的 NewAPI 已是官方 rc.45 | 已确认 | — |
 | 用户在 LT 面板里建好测试渠道和测试令牌，并放进独立分组（00 §6.2） | 已完成（2026-10-21，用户） | — |
