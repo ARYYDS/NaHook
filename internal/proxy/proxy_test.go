@@ -931,6 +931,65 @@ func TestHeartbeatRawJSONFinalLimitBecomes429(t *testing.T) {
 	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "rate_limited": 1, "final_429": 1})
 }
 
+// TestFinal429UsesTheKeysWholeWindow pins what the terminal-limit branch does
+// with the gate (design §1.4, §1.6, §5): OnRateLimit runs on this request's key
+// without a ResetModel first, Retry-After is what is left of that key's whole
+// window rather than this attempt's base, and the final_429 event carries its
+// four fields with attempt 0.
+func TestFinal429UsesTheKeysWholeWindow(t *testing.T) {
+	up := newFakeUpstream(t, "ping_untyped_rate_limit")
+	c := testConfig(t, up.server.URL, 3)
+	h, stats, gates, logs := newTestHandler(t, c)
+
+	// Earlier interceptions of the same key left a 10s window and streak 2.
+	const key = "gpt-6-astra|org-mock"
+	g := gates.Get(key)
+	g.OnRateLimit(5*time.Second, 0, c.Gate.StreakCap)
+	g.OnRateLimit(5*time.Second, 0, c.Gate.StreakCap)
+
+	spy := &spyWriter{rec: httptest.NewRecorder(), forwards: up.count}
+	h.ServeHTTP(spy, postRequest(context.Background(), streamBody("gpt-6-astra", true)))
+
+	if spy.rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", spy.rec.Code)
+	}
+	// This attempt alone would give a 50ms floor << 2 = 200ms window, i.e. "1".
+	if secs := wantRetryAfter(t, spy.rec.Header()); secs < 9 || secs > 10 {
+		t.Fatalf("Retry-After = %d, want the about 10s left of the key's window", secs)
+	}
+
+	var stat *gate.GateStat
+	for _, s := range gates.Snapshot() {
+		if s.Key == key {
+			stat = &s
+		}
+	}
+	if stat == nil {
+		t.Fatalf("gate %s is missing from %v", key, gates.Snapshot())
+	}
+	if stat.Streak != 3 {
+		t.Fatalf("streak = %d, want 3: OnRateLimit on this key, and no reset before it", stat.Streak)
+	}
+
+	var event map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err == nil && entry["msg"] == "final_429" {
+			event = entry
+		}
+	}
+	if event == nil {
+		t.Fatalf("missing final_429 event in %s", logs.String())
+	}
+	if event["request_id"] != "req-1" || event["key"] != key || event["attempt"] != float64(0) {
+		t.Errorf("final_429 = %v, want request_id req-1, key %s, attempt 0", event, key)
+	}
+	if _, ok := event["elapsed_ms"]; !ok {
+		t.Errorf("final_429 is missing elapsed_ms: %v", event)
+	}
+	assertCounters(t, stats.Snapshot(), map[string]int64{"intercepted": 1, "rate_limited": 1, "final_429": 1})
+}
+
 // TestHeartbeatThenOtherErrorIsReleased: a terminal error that is not a rate
 // limit is released unchanged, heartbeat included, after a single request
 // (design §1.6: only rate limits are answered by nahook).

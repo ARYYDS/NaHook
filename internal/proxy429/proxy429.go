@@ -1,5 +1,6 @@
 // Package proxy429 writes the stand-in 429 that nahook returns once its retries
-// are used up (design §1.4, interface 2.2).
+// are used up, or at once for NewAPI's own terminal rate limit (design §1.4,
+// §1.6, interface 2.2).
 //
 // The body is byte-for-byte what NewAPI (h3) returns for an upstream OpenAI
 // error: the field order of NEWAPI relaykit/types/error.go:13-19, json.Marshal

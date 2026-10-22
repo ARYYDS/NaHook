@@ -607,6 +607,24 @@ func TestGetConfig(t *testing.T) {
 		t.Fatalf("body:\n got %s\nwant %s", body, want)
 	}
 
+	// The config half is the file Persist wrote, compacted: persistedShape and
+	// Persist normalise the same way (design §5).
+	var inSync configAnswer
+	if err := json.Unmarshal([]byte(body), &inSync); err != nil {
+		t.Fatalf("decode: %v (body %s)", err, body)
+	}
+	fileBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, fileBytes); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if got := string(inSync.Config); got != compact.String() {
+		t.Fatalf("config half differs from the persisted file:\n got %s\nfile %s", got, compact.String())
+	}
+
 	// A hand edit that was not reloaded is reported, while the config half keeps
 	// showing what is actually in effect.
 	edited := validConfig()

@@ -112,8 +112,9 @@ func (s *Store) persist(next *Config) error {
 }
 
 // checkFile reports whether the file still holds the configuration this store
-// published. The caller holds wmu, so a concurrent write cannot slip in between
-// the comparison and the rename that follows it. A file that cannot be read or
+// published. The caller holds wmu, so no other write through this store can slip
+// in between the comparison and the rename that follows it; a hand edit saved in
+// that window is still overwritten (design §8). A file that cannot be read or
 // parsed is refused as well: overwriting something this process cannot
 // understand would lose whatever the operator meant by it (design §1.7).
 //

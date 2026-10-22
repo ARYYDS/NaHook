@@ -40,7 +40,7 @@ const maxBase = 30 * time.Minute
 //
 // elapsed is how long that attempt took; floor is the configured lower bound
 // (gate.base_floor_ms). streakCap is the configured ceiling for the streak,
-// which config.Validate keeps within 1..23. The stored streak never exceeds
+// which config.Validate keeps within 1..22. The stored streak never exceeds
 // streakCap, and the window is computed from this call's own base, not from
 // whatever a concurrent writer stored meanwhile (design §1.5).
 func (g *Gate) OnRateLimit(elapsed, floor time.Duration, streakCap int32) {

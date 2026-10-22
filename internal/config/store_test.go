@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -416,6 +418,61 @@ func TestSameConfig(t *testing.T) {
 		if sameConfig(base, other) {
 			t.Errorf("%s: sameConfig = true, want false", tt.name)
 		}
+	}
+
+	// One case per leaf field: a field added to Config without a comparison in
+	// sameConfig would let checkFile overwrite a hand edit of that field.
+	if got := leafFields(reflect.TypeFor[Config]()); got != len(diffs) {
+		t.Fatalf("Config has %d leaf fields but %d are checked; extend sameConfig and this table", got, len(diffs))
+	}
+}
+
+// leafFields counts the non-struct fields of t, descending into nested structs.
+func leafFields(t reflect.Type) int {
+	n := 0
+	for i := range t.NumField() {
+		if f := t.Field(i); f.Type.Kind() == reflect.Struct {
+			n += leafFields(f.Type)
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// TestSetRetryMaxPersistFailureKeepsSnapshot: the file check passes, but the
+// write fails before the rename. Neither the snapshot nor the file may change,
+// and the error is not ErrDirSync, so control answers 500 (design §1.7, §6.4).
+// The temporary file Persist creates next to the configuration gets a name
+// longer than the 255 bytes a directory entry allows, which makes CreateTemp
+// fail while the configuration itself stays readable.
+func TestSetRetryMaxPersistFailureKeepsSnapshot(t *testing.T) {
+	c := validConfig()
+	short := filepath.Join(t.TempDir(), "config.json")
+	if err := Persist(short, c); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	content := readFile(t, short)
+
+	path := filepath.Join(t.TempDir(), strings.Repeat("c", 245)+".json")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Skipf("this filesystem refuses a 250-byte file name: %v", err)
+	}
+	s := NewStore(path, c)
+	before := s.Current()
+
+	_, err := s.SetRetryMax("*", 9)
+	if err == nil {
+		t.Skip("this filesystem accepts the over-long temporary name; nothing to check")
+	}
+	if errors.Is(err, ErrFileChanged) || errors.Is(err, ErrDirSync) {
+		t.Fatalf("SetRetryMax = %v, want a plain write error", err)
+	}
+	if s.Current() != before {
+		t.Fatal("a write that failed before the rename replaced the snapshot")
+	}
+	if got := readFile(t, path); !bytes.Equal(got, content) {
+		t.Fatal("a write that failed before the rename changed the file")
 	}
 }
 

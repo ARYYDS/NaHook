@@ -233,7 +233,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 // GET /v1/config → {"config":{…},"file":"in_sync"|"changed"} or, when the file
 // cannot be read, the same with "file":"unreadable" and "file_error" (design §5).
 // The snapshot and the file are observed one after the other, not atomically: a
-// write that lands between the two calls can make "file" one step behind.
+// write that lands between the two calls leaves "config" one step behind, while
+// "file" already describes the file against the newer snapshot.
 func (h *handler) getConfig(w http.ResponseWriter, r *http.Request) {
 	view := configView{Config: persistedShape(h.store.Current())}
 	inSync, err := h.store.FileStatus()

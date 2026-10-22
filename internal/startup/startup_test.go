@@ -426,6 +426,7 @@ func TestReadRawJSONRule(t *testing.T) {
 	rawRateLimit := `{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"` + ltMessage + `"}}`
 	rawOtherError := `{"error":{"type":"bad_response_status_code","code":"bad_response_status_code","message":"upstream said no"}}`
 	created := sse("response.created", `{"type":"response.created"}`)
+	typedRateLimit := sse("error", `{"type":"error","error":{"type":"tokens","code":"rate_limit_exceeded","message":"`+ltMessage+`"}}`)
 
 	tests := []struct {
 		name          string
@@ -476,6 +477,13 @@ func TestReadRawJSONRule(t *testing.T) {
 			verdict: VerdictRelease,
 		},
 		{
+			// The rate limit is the last raw line here, so only the rawLines == 1
+			// condition keeps it from being read as the deciding frame.
+			name:    "two raw lines in the same event, the rate limit last",
+			stream:  ping + `{"a":1}` + "\n" + rawRateLimit + "\n\n",
+			verdict: VerdictRelease,
+		},
+		{
 			name:    "the raw JSON sits next to an event: line",
 			stream:  ping + "event: response.ping\n" + rawRateLimit + "\n\n",
 			verdict: VerdictRelease,
@@ -489,6 +497,14 @@ func TestReadRawJSONRule(t *testing.T) {
 			name:    "a non-JSON line after a heartbeat",
 			stream:  ping + "hello\n\n",
 			verdict: VerdictRelease,
+		},
+		{
+			// A line that does not start with '{' is not taken as data: it counts
+			// as upstream data like before T16, so the typed frame after it is
+			// still read and intercepted, and the heartbeat-only flag is off.
+			name:    "a non-JSON line after a heartbeat, then a typed rate limit",
+			stream:  ping + "hello\n\n" + typedRateLimit,
+			verdict: VerdictRateLimit,
 		},
 	}
 
