@@ -782,3 +782,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/...
 | `spec/` | 工程 SPEC（设计、接口、审计、排期），以这里为准 |
 | `docs/` | 开发任务书、测试方案、知识库快照（`docs/reference/` 只读） |
 | `ops/` | 测试环境的实验脚本 |
+| `private/` | 服务器清单等含主机信息的文件。被 `.gitignore` 排除，不进仓库；只在开发机和 Win11 上，通过 SSH 直接传输 |
+
+- 仓库只保留 `main` 一个长期分支。开发时从最新的 `main` 新建 `dev`，审计用 `audit/Tn`；合并进 `main` 以后，这些分支都删掉。Release 的 `build-*` 标签保留。
+- 仓库是公开的：文件和提交信息里不写真实的主机地址、域名和数据库地址，用「LT 主机 IP」「生产站点域名」这类占位符，对照表在 `private/servers.md`。

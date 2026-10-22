@@ -1,3 +1,7 @@
+# server inventory and other host-specific notes: the repository is public,
+# so these stay local and are copied to Win11 over SSH, never through GitHub
+/private/
+
 # build outputs never enter the repository (dist lives in O:\WinCache\nahook\dist)
 /dist/
 /bin/
