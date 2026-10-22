@@ -36,6 +36,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
 | Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 已关闭：T15（`build-bd6fad86`）部署到 LT，关护栏的 h3 上复测 T-F17 通过（§7.17） |
 | Q21 | R3 | 部署·生产是官方 rc.44 没有护栏，Caddy 是 2.11.4 并带 `encode`；LT 的 Caddy 是 2.6.2 | 不明 | P1 | 00、01 | Caddy 一项已处理（D4：LT 升到 2.11.4、加回 `encode`，全部复测通过）；上线路径 D3 暂缓（用户决定先不上生产） |
+| Q22 | — | 运维·手工改配置后没 reload 就用 nahookctl 写入，改动被静默覆盖 | 脆弱 | P2 | 01 | 已写进 README 和 design §8；代码防护待用户决定是否排期 |
 | Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 已关闭：只在 Caddy 2.6.2 上成立；2.11.4 上实测压缩不会攒住事件（D4），LT 和生产都保留 `encode` |
 
 ## 3. 逐项说明
@@ -117,6 +118,12 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 - 证据：K8 只读核查（01 audit §5 K8）。生产 NewAPI 是官方 rc.44（digest `67bf2716…`），没有护栏；Caddy 是官方构建 v2.11.4，站点层有 `encode zstd gzip`，没有 `flush_interval -1`。LT 的 Caddy 是 Debian 包 2.6.2。rc.44 到 rc.45 的 31 个提交里，`relay/channel/openai/relay_responses.go`、`relay/helper/stream_scanner.go` 没有改动，`controller/relay.go` 只多了上游地址脱敏，rc.44 没有 `writeRelayStreamError`。
 - 影响：00 design §1.2 的三阶段计划失去前提：阶段 2（关 h3 护栏）和阶段 3（换官方镜像）不存在，部署 nahook 就立刻开始拦截。T0、T-C1–T-C4、Q17、Q18 的结论是在 Caddy 2.6.2 上得出的，2.11.4 上需要重测（`ignoreClientGoneContext` 在 v2.8.0 删除，`encode` 的 Flush 在 v2.9.0 修复）。`relayscope-agent` 读取 NewAPI 的日志，nahook 每次重试在 NewAPI 里都是一个独立请求，会多出 quota 为 0 的日志行（T-F9）。
 - 处理：待用户拍板 D3、D4（00 design §1.2 末尾）。
+
+### Q22 nahookctl 写入覆盖未 reload 的文件改动
+
+- 证据：`config.(*Store).SetRetryMax` 用内存快照的深拷贝 `clone(cur)` 修改后整体落盘（design §1.7），不读文件。2026-10-22 在测试环境复现：在 `/etc/nahook/config.json` 的 `match.models` 里手工加一个模型、不 reload，执行 `nahookctl retry set 3`（值不变），文件里的新模型消失，没有任何提示。
+- 影响：运维照 README 加模型或路径时，如果忘了先 reload、又改了重试上限，新加的拦截范围会悄悄丢掉，而且没有命令能列出内存里生效的路径和模型来发现这一点。
+- 处理：README §1.5.4、§2 和 design §8 写明"先 reload 再用 nahookctl"。代码层面可以做两件事，待用户决定是否排期：一是 `Store` 记住上次加载或写入时文件的哈希，写入前发现文件被外部改过就拒绝（控制口返回 409，提示先 reload）；二是加 `nahookctl config show`，打印内存里生效的完整配置。
 
 ### Q6 被拦截那几次尝试的计费
 

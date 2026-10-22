@@ -109,7 +109,33 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:19080/api/status   # 2
 
 ### 1.5 接入 Caddy
 
-在站点块里加一个只匹配两个流式路径的路由，把 nahook 放在第一个上游、NewAPI 放在第二个；站点原来的 `reverse_proxy` 原样放进兜底的 `handle {}`。以站点 `example.com` 为例：
+#### 1.5.1 两层过滤：Caddy 决定"交给谁"，nahook 决定"拦不拦"
+
+一个请求要被拦截，必须先被 Caddy 交给 nahook，再通过 nahook 自己的判定。两层各管一件事：
+
+```text
+客户端请求
+   │
+   ▼
+Caddy 站点 ── 第 1 层：@stream_relay 匹配器（method + path，在 Caddyfile 里）
+   │   不匹配 ──► handle {} ──► NewAPI（完全不经过 nahook）
+   │   匹配
+   ▼
+nahook ── 第 2 层：classify（在 /etc/nahook/config.json 里）
+   │   POST？ 路径在 match.paths 里？ 请求体是 JSON 且 "stream": true？
+   │   model 在 match.models 里（或列表为空）？ 请求体 ≤ body_limit？
+   │   任何一项不满足 ──► 逐字节透传给 NewAPI（不拦截，额外延迟 < 0.06ms）
+   │   全部满足
+   ▼
+拦截：读启动帧 → 放行 / 冷却后重试 / 代 429
+```
+
+- **两层的路径要一致**：Caddy 的 `path` 和 nahook 的 `match.paths` 写同一组路径。Caddy 多写的路径，nahook 只会透传（白走一跳）；nahook 多写的路径，Caddy 根本不会交过来（等于没写）。
+- **模型只在 nahook 里配**：Caddy 看不到请求体，没法按模型分流。
+
+#### 1.5.2 最小配置
+
+在站点块里加一个只匹配流式路径的路由，nahook 是第一个上游、NewAPI 是第二个；站点原来的 `reverse_proxy` 原样放进兜底的 `handle {}`。以站点 `example.com` 为例：
 
 ```caddy
 example.com {
@@ -147,19 +173,181 @@ example.com {
 }
 ```
 
-三条规则，每条都是实测出来的（理由见 [第 7 节](#7-与-caddy-的接口)）：
+- `@stream_relay` 里的 `method POST` 和 `path` 是"且"的关系：必须同时满足。
+- 站点里原来如果是一行直接写在站点块里的 `reverse_proxy`，建议挪进 `handle {}`：两个路由互斥，一眼就能看出哪些请求走 nahook（这也是测试环境实测过的写法）。
+- 不带匹配器的 `handle {}` 永远排在最后，所以它只接住 `@stream_relay` 没匹配上的请求。站点里如果还有别的 `handle`，把 `handle @stream_relay` 写在最前面。
+
+#### 1.5.3 拦截哪些路径
+
+**支持多个路径**：Caddy 的 `path` 后面空格分隔写多个（彼此是"或"），nahook 的 `match.paths` 写成数组。
+
+```caddy
+	@stream_relay {
+		method POST
+		path /v1/responses /v1/chat/completions
+	}
+```
+
+```json
+"match": { "paths": ["/v1/responses", "/v1/chat/completions"], "models": [] }
+```
+
+| 路径 | 能不能拦截 | 说明 |
+|---|---|---|
+| `/v1/responses` | 支持，已验证 | OpenAI Responses 流 |
+| `/v1/chat/completions` | 支持，已验证 | OpenAI Chat Completions 流 |
+| `/v1/completions` | 理论上可以，未验证 | 旧版补全接口，流的格式和 Chat 相同（`data:` 块 + `{"error":…}`）。要用先在测试环境验证 |
+| `/v1/messages`（Claude 格式） | **不支持** | 代 429 用的是 OpenAI 的错误格式，Claude 客户端认不出来；Claude 的流在第一个 `message_start` 后就会被放行 |
+| Gemini（`…:streamGenerateContent`） | **不支持** | 是否流式写在 URL 里，请求体里没有 `"stream": true`，nahook 一律透传 |
+| embeddings、images、audio 等 | 没有意义 | 不是流式，限流本来就是 HTTP 错误，由 NewAPI 的 `RetryTimes` 处理 |
+
+两边的匹配规则不一样，写的时候要注意：
+
+| | Caddy `path` | nahook `match.paths` |
+|---|---|---|
+| 匹配方式 | 精确匹配，支持 `*` 通配（`/v1/*` 前缀、`*responses` 后缀） | **只做精确匹配**，不支持通配、前缀和后缀 |
+| 大小写 | 不区分 | **区分** |
+| 查询串 `?a=b` | 不看 | 不看 |
+| 末尾斜杠 | `/v1/responses/` 和 `/v1/responses` 是两个路径 | 同左 |
+
+所以 nahook 里每个路径都要写全称，例如 `/v1/responses`，不能写 `/v1/*`。Caddy 那边也可以写 `path /v1/*`，把所有 `/v1/` 下的 POST 都交给 nahook，再由 nahook 按 `match.paths` 筛选；但不建议这样做：nahook 挂掉的那一刻会影响更多接口，其余接口还白走一跳。
+
+#### 1.5.4 拦截哪些模型
+
+**支持多个模型**：`match.models` 写成数组，按客户端请求体里的 `model` 字段**精确匹配、区分大小写**。
+
+```json
+"match": {
+  "paths":  ["/v1/responses", "/v1/chat/completions"],
+  "models": ["gpt-5-codex", "gpt-5", "gpt-5-codex-high"]
+}
+```
+
+- 写的是**客户端发来的模型名**，也就是 NewAPI 做模型重定向之前的名字。
+- 不支持前缀、后缀和通配：`gpt-5*` 不会匹配 `gpt-5-codex`。同一个模型的不同变体（例如带 `-high`、`-thinking` 后缀的）要逐个写上，或者用下面的"所有模型"。
+- **空数组 `[]` 表示所有模型。**
+- 冷却门按"模型 + 上游 org"分别计算，不同模型的限流互不影响；重试上限可以按模型单独设（[第 3 节](#3-重试次数怎么查怎么改)）。
+
+添加一个模型的步骤：
+
+```bash
+# 1. 改配置文件：在 "models" 数组里加上新的模型名
+vi /etc/nahook/config.json
+
+# 2. 立刻 reload（必须在任何 nahookctl retry set 之前，原因见下面的警告）
+nahookctl reload                       # {"ok":true}；失败会打印原因，旧配置继续生效
+journalctl -u nahook -n 3 -o cat       # 能看到 config.reloaded
+
+# 3. 可选：给新模型单独设重试上限
+nahookctl retry set 2 --model gpt-5-codex
+```
+
+新模型生效以后，它第一次被限流时，日志里会出现 `"msg":"intercept","key":"gpt-5-codex|org-…"`。
+
+> **警告：改了配置文件，要先 reload，再用 `nahookctl retry set/unset`。** `nahookctl` 修改重试上限时，写回文件的是 nahook **内存里**的配置。如果你改了文件还没 reload 就执行 `retry set`，文件里新加的模型或路径会被内存里的旧配置覆盖掉，而且不会有任何提示。
+
+`nahookctl retry set N --model M` 只改重试上限，**不会**把 M 加进拦截列表。不在 `match.models` 里的模型，设了上限也不起作用。
+
+#### 1.5.5 多个站点共用一套 nahook
+
+同一台主机上有多个站点（多个域名）都要拦截时，把路由写成 snippet，在每个站点里 `import`：
+
+```caddy
+(nahook_relay) {
+	@stream_relay {
+		method POST
+		path /v1/responses /v1/chat/completions
+	}
+	handle @stream_relay {
+		reverse_proxy 127.0.0.1:19080 localhost:3000 {
+			lb_policy       first
+			health_uri      /api/status
+			health_interval 10s
+			health_timeout  5s
+			fail_duration   10s
+			transport http {
+				keepalive               10m
+				keepalive_idle_conns    2000
+				response_header_timeout 30m
+				dial_timeout            5s
+			}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}
+
+a.example.com {
+	import nahook_relay
+	handle {
+		reverse_proxy localhost:3000
+	}
+}
+
+b.example.com {
+	import nahook_relay
+	handle {
+		reverse_proxy localhost:3000
+	}
+}
+```
+
+nahook 把请求的 `Host` 原样转给 NewAPI，所以 NewAPI 依然知道请求来自哪个站点。一个 nahook 只对接一个 NewAPI 地址（`config.newapi`）。如果不同站点后面是不同的 NewAPI 实例，每个实例各跑一套 nahook：不同的 `listen`、`control_socket` 和配置文件（`nahook -config <文件>`），`nahookctl` 用 `--socket` 指定连哪一套。
+
+#### 1.5.6 全量拦截
+
+"全量"指：这台主机上所有走 Caddy 的流式 Responses 和 Chat Completions 请求，不论什么模型，被限流时都由 nahook 处理。
+
+```json
+"match": { "paths": ["/v1/responses", "/v1/chat/completions"], "models": [] }
+```
+
+```caddy
+	@stream_relay {
+		method POST
+		path /v1/responses /v1/chat/completions
+	}
+```
+
+再在每个站点里接上路由（多站点用 [1.5.5](#155-多个站点共用一套-nahook) 的 snippet）。
+
+全量拦截也**覆盖不到**的请求，以及原因：
+
+| 请求 | 原因 | 怎么办 |
+|---|---|---|
+| 非流式请求（`"stream": false` 或不写） | 非流式的限流本来就是 HTTP 错误，不会被当成成功透传 | 由 NewAPI 面板的 `RetryTimes` 重试 |
+| Claude、Gemini 等其他格式的接口 | 见 [1.5.3](#153-拦截哪些路径) | 目前不支持 |
+| 请求体超过 `body_limit`（默认 64MiB） | 为了能原样重发，要先把请求体缓存在内存里；太大的直接透传 | 需要时调大 `body_limit`。内存最坏占用是"同时被拦截的请求数 × 请求体大小" |
+| 绕过 Caddy、直连 NewAPI 3000 端口的请求 | 根本不经过 nahook | 3000 不对公网开放 |
+| 输出开始以后才出现的错误 | 已经发给客户端的字节撤不回 | 不处理 |
+
+全量拦截的代价很小：每个流式请求在 nahook 里多一次请求体缓存和启动帧读取。实测附加延迟小于 0.06ms；`response.created` 会和第一个 delta 一起到达，第一个 token 的时间不变。
+
+#### 1.5.7 三条规则
+
+每条都是实测出来的（理由见 [第 7 节](#7-与-caddy-的接口)）：
 
 1. **不写 `flush_interval`**（两个 `handle` 都不写）。SSE 会被 Caddy 自动立即 flush；在 2.6.2 上写了 `-1` 会让客户端断开传不到后端。
 2. **写 `fail_duration 10s`**。nahook 连不上时，第一次失败就把它标为不可用，后面的请求直接走 NewAPI。
 3. **nahook 路由里不写 `lb_try_duration`**。Caddy 重试 POST 时请求体已经被关闭，重试必然失败，还会把 NewAPI 也标成不可用。
 
-改 Caddyfile 时先备份，校验通过再优雅重载：
+#### 1.5.8 改完怎么生效
+
+| 改了什么 | 怎么生效 | 会不会断开现有连接 |
+|---|---|---|
+| Caddyfile（路由、路径） | `caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl reload caddy` | 不会（优雅重载） |
+| `match.paths`、`match.models`、`body_limit`、`gate.*`、`retry.*` | `nahookctl reload` 或 `systemctl reload nahook` | 不会 |
+| 重试上限 | `nahookctl retry set …`，下一次判定就生效 | 不会 |
+| `listen`、`control_socket`、`newapi` | `systemctl restart nahook` | 会：重启的那一刻正在处理的请求断开，之后 Caddy 自动回落到 NewAPI，nahook 起来后流量回来 |
+
+改 Caddyfile 时先备份：
 
 ```bash
 cp -p /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak.$(date +%Y%m%d%H%M%S)
 # 编辑 /etc/caddy/Caddyfile
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl reload caddy
 ```
+
+目前没有命令能直接列出 nahook 内存里生效的路径和模型列表；以配置文件为准，并确认 reload 成功（`{"ok":true}`，日志里有 `config.reloaded`）。
 
 ### 1.6 上线后确认在工作
 
@@ -201,8 +389,8 @@ nahookctl stats                    # intercepted、rate_limited、released、gav
 | `control_socket` | 控制口 unix socket 路径 | 非空 | 重启 |
 | `newapi` | NewAPI 的地址 | 绝对的 http/https URL | 重启 |
 | `body_limit` | 拦截路径上缓存请求体的上限（字节）。超过的请求直接透传，不拦截 | > 0，默认 64MiB | reload |
-| `match.paths` | 只有这些路径的 `POST` 才可能被拦截 | — | reload |
-| `match.models` | 只有这些模型的流式请求才被拦截。**留空数组 `[]` 表示所有模型**；样例里的 `gpt-6-astra` 是测试用的，上线前改成你的模型列表或 `[]` | — | reload |
+| `match.paths` | 只有这些路径的 `POST` 才可能被拦截。可以写多个；要和 Caddy 的 `@stream_relay` 路径一致（[1.5.3](#153-拦截哪些路径)） | 精确匹配、区分大小写，不支持通配 | reload |
+| `match.models` | 只有这些模型的流式请求才被拦截。可以写多个；**留空数组 `[]` 表示所有模型**（[1.5.4](#154-拦截哪些模型)）。样例里的 `gpt-6-astra` 是测试用的，上线前改成你的模型列表或 `[]` | 按请求体里的 `model` 精确匹配、区分大小写，不支持通配 | reload |
 | `retry.max` | 全局重试上限：被拦截后最多再试几次 | ≥ 0；0 表示不重试，直接返回代 429 | reload 或 `nahookctl` 立即生效 |
 | `retry.per_model` | 按模型覆盖重试上限，例如 `{"gpt-6-astra": 1}` | 值 ≥ 0；键不能为空，也不能是 `*` | 同上 |
 | `gate.base_floor_ms` | 冷却窗口的下限（毫秒） | 0–1800000 | reload |
@@ -213,6 +401,7 @@ nahookctl stats                    # intercepted、rate_limited、released、gav
 - 重新加载：`systemctl reload nahook`（发 SIGHUP）或 `nahookctl reload`。新配置校验失败时 nahook 继续用旧配置，日志里记 `config.reload_failed`，进程不重启。
 - `listen`、`control_socket`、`newapi` 改了必须 `systemctl restart nahook`；用 reload 改它们会被拒绝（返回 409），快照不变。
 - 部署之后只建议通过 `nahookctl` 改重试上限；nahook 会把修改写回这个文件（临时文件 + fsync + rename），重启后依然生效。
+- **改了配置文件，要先 reload，再用 `nahookctl retry set/unset`。** `nahookctl` 写回文件的是内存里的配置，没 reload 的文件改动会被悄悄覆盖（[1.5.4](#154-拦截哪些模型) 的警告）。
 
 ---
 

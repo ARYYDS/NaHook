@@ -729,3 +729,4 @@ GitHub Release（公开）
 | 一直不读完、不关闭被拦截的那次响应体 | 连接泄漏 | 被拦截后立即 `resp.Body.Close()` |
 | 只要 200 SSE 里出现限流帧就重试 | 打开心跳时，NewAPI 会先提交 200，按 RetryTimes 重试完以后再把自己的终态错误写进流里；nahook 再重试一轮，两层重试就叠加了 | 消息以 ` (request id: <本次的 X-Oneapi-Request-Id>)` 结尾时原样放行（§1.6；`NEWAPI/controller/relay.go:99-101`）。rc.45 把这个错误写成不带 `data:` 的裸 JSON，本来就会被放行（§1.6 注释） |
 | 只按消息末尾的 request id 识别 NewAPI 的终态错误 | NewAPI 转发上游的 OpenAI 格式错误时不加这个后缀；心跳打开时，nahook 会把 NewAPI 重试用完后的终态错误当成上游限流，再重试一轮，上游调用被放大（T10 T-F17，h3 关护栏） | 再加一条：判定帧之前只有心跳、判定帧不带 type（§1.6 第 2 条） |
+| 手工改了配置文件，没有 reload 就执行 `nahookctl retry set/unset` | `SetRetryMax`/`UnsetRetryMax` 写回文件的是内存快照（§1.7 `clone(cur)`），文件里还没 reload 的改动（例如新加的模型）被静默覆盖。2026-10-22 在测试环境复现：手工加了一个模型，`retry set 3` 之后它从文件里消失 | 先 reload 再用 `nahookctl`（README §1.5.4 的警告）；代码层面的防护见 specaudit Q22 |
