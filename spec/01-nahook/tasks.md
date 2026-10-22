@@ -183,7 +183,7 @@ L-DOC                                                                           
 - [ ] **T16 NewAPI 的终态限流改成代 429、代 429 带 Retry-After；写回配置前比对文件**（L-GO）
   - 前置：T15（`build-bd6fad86`）；specaudit D5 已拍板，Q22 并入（用户 2026-10-22）；design §1.3–§1.7、§5、§6、§8 已改写
   - 改动：
-    - `internal/startup/startup.go` `Read`：裸 JSON 规则（design §1.3）。只在 `heartbeats > 0 && !dataSeen`、当前事件没有 `event:` 和 `data:`、只有一行 `{…}` 时，把这一行当作 data 交给 `inspect`
+    - `internal/startup/startup.go` `Read`：裸 JSON 规则（design §1.3）。只在 `heartbeats > 0 && !dataSeen`、当前事件的 `event:` 没有值、没有 `data:`、只有一行 `{…}` 时，把这一行当作 data 交给 `inspect`
     - `internal/gate/gate.go`：新增 `(*Gate).Remaining() time.Duration`（design §1.5）
     - `internal/proxy429/proxy429.go` `Write`：加参数 `retryAfter time.Duration`，按 design §1.4 写 `Retry-After`
     - `internal/proxy/intercept.go` `serveIntercept`：终态限流分支改成"关闭响应体 → `RateLimited` → `OnRateLimit` → `Final429` → 日志 `final_429` → `proxy429.Write(…, g.Remaining())`"；放弃分支传 `g.Remaining()`（design §1.6）
@@ -194,16 +194,16 @@ L-DOC                                                                           
     - 测试：上面每个包的单测
   - 依据：design §1.3、§1.4、§1.5、§1.6、§1.7、§5、§6.3、§6.4、§6.5、§6.7、§8 ｜ audit §1、T-F1、T-F2、T-F17、T-F18；interface 2.1–2.7、§3
   - 完成判据：
-    - [ ] startup 单测：`: PING` ×2 → 裸 `{"error":{限流}}`（不带换行，紧接 EOF）→ `VerdictRateLimit`、`HeartbeatOnly=true`、`Untyped=true`，`Prefix+Rest` 等于原始字节。原来的 `TestReadRawJSONAfterHeartbeatIsReleased` 按这个改名并改断言
-    - [ ] startup 单测：裸 JSON 后面带 `\n` 或 `\n\n` 时结果相同；裸 JSON 是非限流错误（例如 `bad_response_status_code`）→ 放行；之前没有心跳的裸 JSON → 放行，`Prefix+Rest` 等于原始字节；`: PING` → `event: response.created` → 裸 JSON → 放行（`dataSeen`）；同一事件里两行 `{…}` → 放行
-    - [ ] gate 单测：`Remaining` 在 `OnRateLimit` 之后 > 0，到期后为 0，不会是负数
-    - [ ] proxy429 单测：`retryAfter` 为 0 时没有 `Retry-After`；1ns → `1`；1.2s → `2`；2h → `1800`；其他头、状态码、响应体和原来逐字节相同
-    - [ ] proxy 单测（假 NewAPI）：心跳 + `data:{"error":限流}` + `[DONE]` → 客户端拿到 429 + `Retry-After`，上游只被请求 1 次，`rate_limited` +1、`final_429` +1、`passthrough` 不变；心跳 + 裸 JSON 限流 → 同样结果；request id 后缀规则 → 同样结果；心跳 + 非限流的终态错误 → 原样放行
-    - [ ] proxy 单测：重试用完的代 429 带 `Retry-After`，值 ≥ 1；`rate_limited = retries + gave_up + final_429` 在每个场景后都成立
-    - [ ] config 单测：文件和快照内容相同（包括 nil 和 `[]`、`{}` 的差别、缩进不同）→ 写入成功；手工加了模型 → `ErrFileChanged`，文件字节不变、快照不变；文件不是合法 JSON 或被删了 → `ErrFileChanged`；`Persist` 之后紧接着再 `SetRetryMax` → 成功；`UnsetRetryMax` 同样检查
-    - [ ] control 单测：`PUT`、`DELETE` 遇到 `ErrFileChanged` 回 409，错误信息提到 reload；`GET /v1/config` 三种 `file` 状态；`config` 的写法和 `Persist` 一致
-    - [ ] nahookctl 单测：`config show` 发 `GET /v1/config`，原样打印；409 时退出码 1
-    - [ ] audit §3 的门禁全部通过
+    - [x] startup 单测：`: PING` ×2 → 裸 `{"error":{限流}}`（不带换行，紧接 EOF）→ `VerdictRateLimit`、`HeartbeatOnly=true`、`Untyped=true`，`Prefix+Rest` 等于原始字节。原来的 `TestReadRawJSONAfterHeartbeatIsReleased` 按这个改名并改断言
+    - [x] startup 单测：裸 JSON 后面带 `\n` 或 `\n\n` 时结果相同；裸 JSON 是非限流错误（例如 `bad_response_status_code`）→ 放行；之前没有心跳的裸 JSON → 放行，`Prefix+Rest` 等于原始字节；`: PING` → `event: response.created` → 裸 JSON → 放行（`dataSeen`）；同一事件里两行 `{…}` → 放行
+    - [x] gate 单测：`Remaining` 在 `OnRateLimit` 之后 > 0，到期后为 0，不会是负数
+    - [x] proxy429 单测：`retryAfter` 为 0 时没有 `Retry-After`；1ns → `1`；1.2s → `2`；2h → `1800`；其他头、状态码、响应体和原来逐字节相同
+    - [x] proxy 单测（假 NewAPI）：心跳 + `data:{"error":限流}` + `[DONE]` → 客户端拿到 429 + `Retry-After`，上游只被请求 1 次，`rate_limited` +1、`final_429` +1、`passthrough` 不变；心跳 + 裸 JSON 限流 → 同样结果；request id 后缀规则 → 同样结果；心跳 + 非限流的终态错误 → 原样放行
+    - [x] proxy 单测：重试用完的代 429 带 `Retry-After`，值 ≥ 1；`rate_limited = retries + gave_up + final_429` 在每个场景后都成立
+    - [x] config 单测：文件和快照内容相同（包括 nil 和 `[]`、`{}` 的差别、缩进不同）→ 写入成功；手工加了模型 → `ErrFileChanged`，文件字节不变、快照不变；文件不是合法 JSON 或被删了 → `ErrFileChanged`；`Persist` 之后紧接着再 `SetRetryMax` → 成功；`UnsetRetryMax` 同样检查
+    - [x] control 单测：`PUT`、`DELETE` 遇到 `ErrFileChanged` 回 409，错误信息提到 reload；`GET /v1/config` 三种 `file` 状态；`config` 的写法和 `Persist` 一致
+    - [x] nahookctl 单测：`config show` 发 `GET /v1/config`，原样打印；409 时退出码 1
+    - [x] audit §3 的门禁全部通过（DSH `60963b8`、`870bd97`；审计 `957c3f5` 及架构侧修复，specaudit §7.22）
     - [ ] 架构侧审计通过、合并到 main 以后，用 `scripts/build.ps1`、`scripts/release.ps1` 在合并提交上发布新的 Release（同 T8）
     - [ ] （LT，需要用户同意）部署新版本后跑 T-F1、T-F2、T-F17、T-F18，以及冒烟三项；README §1.5.4、§3、§4.2、§5.6、§5.8、§6.2、§6.4、§6.5 由架构侧同步
   - 冲突：只改 L-GO 车道的文件；和 T15 改的是同一批文件，T15 已合入，没有并行任务

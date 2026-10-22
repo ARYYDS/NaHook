@@ -103,7 +103,7 @@ $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; go build -tr
 | 在代 429 里改写 message | 原样保留（design §1.4、§8） |
 | `Retry-After` 用 `base`、向下取整，或者在 NewAPI 透传出来的非 200 上也补 | 只加在代 429 上，用 `Gate.Remaining()`，向上取整，1–1800（design §1.4） |
 | 认出 NewAPI 的终态限流以后照旧放行，或者顺手再重试一轮 | 不重试，代 429（design §1.6；specaudit Q23、D5） |
-| 为了认 rc.45 的裸 JSON，把"非字段行"一律当成 data | 只在之前只有心跳、事件里只有这一行 `{…}`、没有 `event:` 和 `data:` 时才这样认（design §1.3） |
+| 为了认 rc.45 的裸 JSON，把"非字段行"一律当成 data | 只在之前只有心跳、事件里只有这一行 `{…}`、`event:` 没有值、没有 `data:` 时才这样认（design §1.3） |
 | 用文件的字节或哈希判断配置是否被改过 | 解析以后按内容比较，nil 和空集合视为相同（design §1.7 `sameConfig`）；否则只改了缩进也会被拒绝，或者 `Persist` 刚写出的文件就被判成"改过" |
 | mockrelay 监听 `127.0.0.1` | 监听 `172.17.0.1`（00 §8） |
 | 判断不出是否要拦截时就回 502 | 放行（design §1.3） |

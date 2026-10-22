@@ -784,3 +784,60 @@ T16 的设计决定（作者在写 SPEC 时定的，需要用户知悉）：
 | `Retry-After` 的上限 | 1800 秒 | 和 `gate.maxBase`（30m）相同；冷却窗口在正常配置下远小于它 |
 | Q22 用哈希还是按内容比较 | 按内容比较 | 只改缩进不会被误拒；不用改 `NewStore` 的签名；读不到或解析不了的文件同样拒绝写 |
 | NewAPI 自己透传的 429（S2、S4、S6）补不补 `Retry-After` | 不补 | 不在 D5 的范围里；它们已经是 429，nahook 也没有对应的冷却门数值 |
+
+### 7.22 T16 审计（DSH 提交 `60963b8`、`870bd97`；审计子代理 `957c3f5`；架构侧 `715b655`）
+
+审计由新派的审计子代理完成：本机读代码、codegraph，测试在 Win11 的一次性克隆里跑（没有动 `O:\NaHook`），审计结束后克隆已删除。结论：实现逐条符合 SPEC，没有 P1。
+
+DSH 回报里的自行决定，架构侧的裁决：
+
+| 事项 | 裁决 |
+|---|---|
+| `persistedShape` 放在 control 包，和 `Persist` 各有一份归一化 | 采纳；审计补了测试，把两者的结果钉在一起（V-d） |
+| `UnsetRetryMax` 先判 `ErrRetryNotSet` 再 `checkFile` | 采纳：两种情况都不写盘 |
+| "没有 `event:` 行"实现为 `eventName == ""` | 采纳；SPEC 文字统一成"`event:` 没有值"（V-g） |
+| `retryAfterSeconds` 保留 `secs < 1` 兜底 | 采纳 |
+| `GET /v1/config` 的 `config` 和 `file` 分两次读取 | 采纳：design 不要求原子；注释里滞后的方向写反了，审计已改 |
+| 409 文案 | 采纳，并补上"reload 也被拒时重启"（V-j） |
+| 第二个提交只给测试改名 | 改名采纳；但改名掩盖了写盘失败路径的覆盖丢失，审计已用原名恢复（V-c） |
+
+审计发现的问题：
+
+| 编号 | 级别 | 问题 | 处理 |
+|---|---|---|---|
+| V-a | P2 | 裸 JSON 规则里 `rawLines == 1` 和"以 `{` 开头"两个条件没有测试钉住（反向检查：删掉任一条件，测试全过） | 审计补两个子用例（`957c3f5`） |
+| V-b | P2 | 终态分支改用 `base`、先调 `ResetModel`、删掉 `final_429` 日志，三种改坏都没有测试失败 | 审计新增 `TestFinal429UsesTheKeysWholeWindow`（`957c3f5`） |
+| V-c | P2 | 改名后的写盘失败测试卡在 `checkFile`，store 层"rename 之前失败不切快照"失去覆盖 | 审计用原名恢复真正的写盘失败测试（`957c3f5`） |
+| V-d | P3 | `persistedShape` 和 `Persist` 的归一化重复，没有测试钉住 | 审计补断言（`957c3f5`） |
+| V-e | P3 | `Config` 以后新增字段时，`sameConfig` 可能漏比 | 审计用反射数叶子字段（`957c3f5`） |
+| V-f | P3 | 四处陈旧注释，包括 `gate.go:43` 的 1..23 | 审计已改（`957c3f5`） |
+| V-g | P3 | `event:` 值为空、紧跟裸 JSON 时走代 429：§1.3 伪代码允许，§8、tasks、audit §4 的文字写的却是"没有 `event:` 行" | 保留代码；四处文字统一成"`event:` 没有值" |
+| V-h | P3 | `Remaining()` 在打日志之后才取，日志写入卡住时可能取到 0，代 429 就没有 `Retry-After` | 架构侧修：两个分支都在 `OnRateLimit` 之后、打日志之前取（`715b655`）；design §1.6 同步 |
+| V-i | P3 | `Retry-After` 上限 1800 和 openai-python 的 120 秒门槛不一致 | 保留 1800，理由见下 |
+| V-j | P3 | 文件读不到，或者手工改的是只能重启生效的字段时，"先 reload"会误导 | 文案补上重启（`715b655`） |
+
+V-i 的依据（架构侧核实了源码）：
+
+- Codex CLI 把 HTTP 429 映射成 `RetryLimit`，并附上服务端给的 `retry_after`（`openai/codex` `codex-rs/codex-api/src/api_bridge.rs`）。`retry_delay` 对 `RetryLimit` 只用 `server_retry_delay()`（`codex-rs/protocol/src/error.rs`，2026-10-21 的 main 分支）。所以不带 `Retry-After` 的 429 在 Codex 里是这一轮的终态错误；带了，就按它等待后自动重试，而且没有上限。
+- openai-python 只在 ≤ 120 秒时自动重试（`_constants.py` `MAX_RETRY_AFTER_DELAY = 2 * 60`，`_base_client.py:905`、`:921`）。
+- 正常配置下窗口远小于 120 秒；超过时，不让客户端在窗口内重试才是对的。
+
+反向检查（审计子代理，Win11）：
+
+- 23 处改坏都有测试失败，只有状态复位那一处观测不到，属于防御性写法。
+- 在 `870bd97` 上有 6 处改坏后测试照样全过：V-a 两处、V-b 三处、V-c 一处。到了 `957c3f5`，这 6 处都会让测试失败。
+
+门禁（Win11，go1.27.2）：
+
+| 提交 | 结果 |
+|---|---|
+| `870bd97` | gofmt 干净；vet 正常；`-race` 11 个包全部 ok；linux 交叉编译成功；go.mod 没有 require；改动的包用 `-race -count=5` 跑，全部稳定 |
+| `957c3f5` | 同上 |
+| `715b655` | gofmt 干净；vet 正常；`-race` 11 个包全部 ok；linux 交叉编译成功；require 为 0；porcelain 为空 |
+
+待办：
+
+1. 合并到 main。
+2. 发布 Release。
+3. 在 LT 上部署，跑 T-F1、T-F2、T-F17、T-F18 和冒烟三项（需要用户同意）。
+4. 同步 README。

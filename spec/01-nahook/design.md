@@ -202,6 +202,10 @@ func Write(w http.ResponseWriter, upstream http.Header, e startup.UpstreamError,
 
 - `Retry-After` 是 nahook 自己加的头。NewAPI 的中继错误从不带它（`NEWAPI/service/error.go:87`、`controller/relay.go:92-110`@rc.45，`docs/analysis/hook-points.md` §2.3）。所以除了这个头，状态码、`Content-Type`、响应体仍和 NewAPI 的 429 逐字节一致（audit T-F1）。
 - NewAPI 自己回的非 200（包括它的 429）仍然原样透传，nahook 不给它们补 `Retry-After`（§1.6）。
+- 客户端怎么用这个头：
+  - Codex CLI 把不带 `Retry-After` 的 429 当成这一轮的终态错误，带了就按它等待后自动重试，而且不设上限。依据是 `openai/codex` 的 `codex-rs/codex-api/src/api_bridge.rs`（429 → `RetryLimit`，附上服务端给的 `retry_after`）和 `codex-rs/protocol/src/error.rs` 的 `retry_delay`（`RetryLimit` 只用 `server_retry_delay()`），2026-10-21 的 main 分支。
+  - openai-python 只在 `Retry-After` ≤ 120 秒时按它等待并重试，超过就直接抛错（`MAX_RETRY_AFTER_DELAY = 2 * 60`）。
+  - 上限仍取 1800：窗口真有这么长时，不让客户端在窗口内重试才是对的，也省上游调用（specaudit §7.22）。
 
 ### 1.5 冷却门 `gate.Gate`
 
@@ -274,9 +278,10 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
         g.OnRateLimit(elapsed, time.Duration(cfg.Gate.BaseFloorMS)*time.Millisecond, cfg.Gate.StreakCap)
             # NewAPI 刚确认这个 key 被限流：同一个 key 上其他正在被拦截的请求也要避开；
             # Retry-After 也从这里来。不调 ResetModel，也不动 n
+        ra := g.Remaining()                              # 在打日志之前取：日志写入卡住时，窗口不能被耗掉
         h.st.Inc(obs.Final429)
         log final_429{request_id: rid, key, attempt: n, elapsed_ms: elapsed}
-        proxy429.Write(w, resp.Header, res.Err, g.Remaining()); return
+        proxy429.Write(w, resp.Header, res.Err, ra); return
     if res.Verdict == startup.VerdictRelease:
         if r.Context().Err() != nil:                     # 读启动帧时客户端走了，Read 因读错误返回放行：
             resp.Body.Close(); h.st.Inc(obs.ClientGone); return   # 不写响应，也不能 ResetModel（没有真正放行）
@@ -290,11 +295,12 @@ func (h *Handler) serveIntercept(w, r, body []byte, meta reqMeta)
     g := h.gates.Get(key)
     elapsed := now - t0
     g.OnRateLimit(elapsed, time.Duration(cfg.Gate.BaseFloorMS)*time.Millisecond, cfg.Gate.StreakCap)
+    ra := g.Remaining()                                  # 同上：在下面两次打日志之前取
     max := h.store.RetryMax(meta.Model)
     log intercept{request_id: rid, key, attempt: n, elapsed_ms: elapsed, max}
     if n >= max:
         h.st.Inc(obs.GaveUp); log give_up{request_id: rid, key, attempts: n+1}
-        proxy429.Write(w, resp.Header, res.Err, g.Remaining()); return   # 上面刚调过 OnRateLimit，剩余时间 > 0
+        proxy429.Write(w, resp.Header, res.Err, ra); return
     n++
     h.st.Inc(obs.Retries)
     w0 := now
@@ -817,6 +823,6 @@ GitHub Release（公开）
 | 只按消息末尾的 request id 识别 NewAPI 的终态错误 | NewAPI 转发上游的 OpenAI 格式错误时不加这个后缀；心跳打开时，nahook 会把 NewAPI 重试用完后的终态错误当成上游限流，再重试一轮，上游调用被放大（T10 T-F17，h3 关护栏） | 再加一条：判定帧之前只有心跳、判定帧不带 type（§1.6 第 2 条） |
 | 认出 NewAPI 的终态限流以后原样放行 | 客户端拿到 200 和一个没有正常结束事件的流，多半当成断流处理，而不是限流；nahook 明明还没写过字节，本来可以回 429（specaudit Q23） | 不重试，代 429 并带 `Retry-After`（§1.6） |
 | 只认 `data:` 帧，漏掉 rc.45 心跳后面的裸 JSON | rc.45 的终态限流读到 EOF 被放行，上一行的改动在 LT 和生产（rc.44）上都不起作用 | `startup.Read` 的裸 JSON 规则（§1.3）：只在"之前只有心跳"的位置把一行 `{…}` 当作 data |
-| 裸 JSON 规则不要求"之前只有心跳" | 上游流里偶然出现的非字段行也会被当成错误帧解析 | 必须同时满足 `heartbeats > 0 && !dataSeen`、没有 `event:` 和 `data:`、只有这一行（§1.3） |
+| 裸 JSON 规则不要求"之前只有心跳" | 上游流里偶然出现的非字段行也会被当成错误帧解析 | 必须同时满足 `heartbeats > 0 && !dataSeen`、`event:` 没有值（`eventName == ""`，包括根本没有 `event:` 行）、没有 `data:`、只有这一行（§1.3） |
 | `Retry-After` 向下取整，或者用 `base` 代替剩余时间 | 不足 1 秒时写成 0，等于叫客户端立刻重试；用 `base` 会比实际窗口短（窗口是 `base << (s-1)`） | 用 `Gate.Remaining()`，向上取整，至少 1、至多 1800（§1.4） |
 | 手工改了配置文件，没有 reload 就执行 `nahookctl retry set/unset` | `SetRetryMax`/`UnsetRetryMax` 写回文件的是内存快照（§1.7 `clone(cur)`），文件里还没 reload 的改动（例如新加的模型）被静默覆盖。2026-10-22 在测试环境复现：手工加了一个模型，`retry set 3` 之后它从文件里消失 | 写回之前 `checkFile`：文件和快照按内容比较，不一样就回 409（§1.7）。按内容比较时 nil 和空集合要视为相同，否则一个刚由 `Persist` 写出的文件也会被判成"改过"。检查和 rename 之间还有毫秒级的窗口，这期间的手工改动仍会被覆盖，不再加锁防它 |
