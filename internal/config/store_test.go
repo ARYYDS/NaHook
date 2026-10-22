@@ -142,13 +142,16 @@ func TestSetRetryMaxDoesNotMutateOldSnapshot(t *testing.T) {
 	}
 }
 
-func TestSetRetryMaxPersistFailureKeepsSnapshot(t *testing.T) {
+// A store whose file does not exist (here the directory is missing too) refuses
+// the write at the file check and keeps its snapshot: nahook never writes a
+// configuration it could not read back (design §1.7).
+func TestSetRetryMaxRefusesMissingFile(t *testing.T) {
 	c := validConfig()
 	s := NewStore(filepath.Join(t.TempDir(), "absent-dir", "config.json"), c)
 	before := s.Current()
 
-	if _, err := s.SetRetryMax("*", 9); err == nil {
-		t.Fatal("SetRetryMax against an unwritable path = nil, want error")
+	if _, err := s.SetRetryMax("*", 9); !errors.Is(err, ErrFileChanged) {
+		t.Fatalf("SetRetryMax against a missing file = %v, want ErrFileChanged", err)
 	}
 	if s.Current() != before {
 		t.Fatal("snapshot changed although the write failed")
