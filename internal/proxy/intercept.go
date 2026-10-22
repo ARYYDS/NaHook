@@ -62,10 +62,13 @@ func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []
 			g := h.gates.Get(key)
 			elapsed := time.Since(t0) // includes NewAPI's own attempts and the heartbeat
 			g.OnRateLimit(elapsed, time.Duration(cfg.Gate.BaseFloorMS)*time.Millisecond, cfg.Gate.StreakCap)
+			// Read the window before logging: a stalled log write must not
+			// eat it and leave the 429 without Retry-After (design §1.6).
+			ra := g.Remaining()
 
 			h.st.Inc(obs.Final429)
 			h.log.Info("final_429", "request_id", rid, "key", key, "attempt", n, "elapsed_ms", elapsed.Milliseconds())
-			proxy429.Write(w, resp.Header, res.Err, g.Remaining())
+			proxy429.Write(w, resp.Header, res.Err, ra)
 			return
 		}
 		if res.Verdict == startup.VerdictRelease {
@@ -93,13 +96,14 @@ func (h *Handler) serveIntercept(w http.ResponseWriter, r *http.Request, body []
 		g := h.gates.Get(key)
 		elapsed := time.Since(t0)
 		g.OnRateLimit(elapsed, time.Duration(cfg.Gate.BaseFloorMS)*time.Millisecond, cfg.Gate.StreakCap)
+		ra := g.Remaining() // before the two log writes, as in the final-limit branch
 		max := h.store.RetryMax(meta.Model)
 		h.log.Info("intercept", "request_id", rid, "key", key, "attempt", n, "elapsed_ms", elapsed.Milliseconds(), "max", max)
 
 		if n >= max {
 			h.st.Inc(obs.GaveUp)
 			h.log.Info("give_up", "request_id", rid, "key", key, "attempts", n+1)
-			proxy429.Write(w, resp.Header, res.Err, g.Remaining()) // OnRateLimit just ran, so the window is still open
+			proxy429.Write(w, resp.Header, res.Err, ra)
 			return
 		}
 

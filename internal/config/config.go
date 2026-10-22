@@ -33,7 +33,7 @@ var (
 	// reloaded, or it cannot be read or parsed at all. Writing the snapshot
 	// back would silently drop those edits, so the operator has to reload first
 	// (design §1.7, specaudit Q22).
-	ErrFileChanged = errors.New("config: file changed on disk; run nahookctl reload first")
+	ErrFileChanged = errors.New("config: file changed on disk; run nahookctl reload first, or restart nahook if reload refuses it")
 )
 
 // maxStreakCap bounds gate.streak_cap so that the deadline
