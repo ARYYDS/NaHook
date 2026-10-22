@@ -35,8 +35,8 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 已关闭：`fail_duration 10s`、不写 `lb_try_duration`（00 §3.2、§6.1、§8）；T-C4 第三次通过 |
 | Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
 | Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 已关闭：T15（`build-bd6fad86`）部署到 LT，关护栏的 h3 上复测 T-F17 通过（§7.17） |
-| Q21 | R3 | 部署·生产是官方 rc.44 没有护栏，Caddy 是 2.11.4 并带 `encode`；LT 的 Caddy 是 2.6.2 | 不明 | P1 | 00、01 | 待用户拍板 D4；D3 暂缓（用户决定先不上生产） |
-| Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 已关闭：用户拍板去掉站点层 `encode`（LT 在 T10 去掉；生产本来没有，K8 时确认） |
+| Q21 | R3 | 部署·生产是官方 rc.44 没有护栏，Caddy 是 2.11.4 并带 `encode`；LT 的 Caddy 是 2.6.2 | 不明 | P1 | 00、01 | Caddy 一项已处理（D4：LT 升到 2.11.4、加回 `encode`，全部复测通过）；上线路径 D3 暂缓（用户决定先不上生产） |
+| Q18 | R3 | 流式·站点层 `encode` 在 nahook 路由上更容易被触发 | 脆弱 | P2 | 00、01 | 已关闭：只在 Caddy 2.6.2 上成立；2.11.4 上实测压缩不会攒住事件（D4），LT 和生产都保留 `encode` |
 
 ## 3. 逐项说明
 
@@ -155,7 +155,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | 编号 | 内容 | 位置 |
 |---|---|---|
 | D3 | 生产上线路径：在 rc.44 上一个阶段部署 nahook 和路由（不换镜像） | 00 design §1.2 末尾"待拍板"；**暂缓**：用户 2026-10-22 决定先不上生产，先把测试环境收完 |
-| D4 | 上线前先把 LT 的 Caddy 换成 2.11.4、加回 `encode`，重跑 T-C1–T-C4 和压缩下的逐帧测试；生产 `encode` 的去留按结果定 | 00 design §1.2 末尾"待拍板" |
+| D4 | ~~上线前先把 LT 的 Caddy 换成 2.11.4、加回 `encode`，重跑测试~~ | 已完成（2026-10-22，§7.19） |
 
 ## 5. 开工前待查索引
 
@@ -169,7 +169,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | K6 | LT 上测试分组的定价 | 01 audit §5 | 已查清（01:T9、T10） |
 | K7 | 生产主机的心跳设置 | 01 audit §5 | LT 已查清（心跳开着、间隔 1s）；生产在 K8 时确认 |
 | K8 | 生产主机是哪台、基线是否和 LT 改动前一致 | 01 audit §5 | 已查清：`api21/19`，基线不一致（Q21） |
-| K9 | 站点层 `encode` 会不会憋住 SSE | 01 audit §5 | 已处理：去掉 `encode`（D1） |
+| K9 | 站点层 `encode` 会不会憋住 SSE | 01 audit §5 | 已查清：2.6.2 会，2.11.4 不会（D4） |
 
 ## 6. 还没写 SPEC 的部分与写作顺序
 
@@ -691,3 +691,23 @@ T10 到此全部完成（00 G2 收口）。LT 现状：NewAPI rc.45；nahook `bu
 | nahook | 主机上没有 nahook 的二进制和 unit |
 
 K7（生产的心跳设置）读不到（不读数据库），需要用户在 `api19` 的面板里看。
+
+### 7.19 D4：LT 的 Caddy 和生产对齐（2026-10-22，用户批准）
+
+用户决定先不上生产（D3 暂缓），先把测试环境收完，并批准 D4。
+
+| 步骤 | 执行者 | 结果 |
+|---|---|---|
+| 备份 | 用户 | `/root/nahook-t10/etc-caddy.bak.20261022122345`、`var-lib-caddy.bak.20261022122345` |
+| 升级 | 用户 | 第一次执行时 `gpg: command not found`：LT 没装 `gpg`，命令在下载密钥那一步停下，没有改动 Caddy；`caddy-stable.list` 早在 10-04 就有了，但签名密钥一直没装上，这就是 LT 装成 Debian 2.6.2 的原因。改为先 `apt-get install -y gpg`，把密钥下载到文件后再 `gpg --dearmor`，然后 `apt-get install caddy=2.11.4`（`--force-confold` 保留 Caddyfile）、`apt-mark hold caddy`。结果 `v2.11.4`，active |
+| 升级核验 | 架构侧 | Caddyfile 未变（`d596319d…`）；2.11.4 校验通过（只有原来的"未格式化"和 80 端口提示）；原 Let's Encrypt 证书沿用（2027-01-02 到期）；HTTPS/HTTP2 正常；unit 仍以 `caddy` 用户运行同一配置 |
+| 2.11.4、不带 `encode` | 架构侧 | 功能回归（冒烟三项、T-F15a/b、Chat 限流、T-F17）全部和 2.6.2 上一致；T-C2：2.5s 时 `client_gone` +1、连接关闭、mockrelay 1 次；T-C3：NewAPI `end_reason=client_gone`；T-C4：第 1 个请求 13ms 502，之后由 NewAPI 完成，启动后 5s 回到 nahook；默认路由的流式和直连只差约 12ms |
+| K9 实测 | 架构侧 | 临时 SSE 服务（127.0.0.1:18091，首帧 2KB，之后每秒一帧）+ 临时 Caddy 2.11.4（127.0.0.1:18092，`admin off`、`encode zstd gzip`），60s 后自动退出。直连、经 Caddy 不压缩、经 Caddy zstd、经 Caddy gzip，各帧都在 0/1/2/3/4s 到达 |
+| 加回 `encode` | 用户 | `Caddyfile.d4`（sha256 `ff0c213b72bf9c9f12d14a7db2ecaee7a1e83c873bf078132fb0b05b613d93b8`），和生产一样放在 `request_body` 前面 |
+| 最终配置复测 | 架构侧 | 功能回归全部通过；带 `--compressed` 时 nahook 路由解码后和直连逐字节相同，`slow:4` 逐帧准时，代 429 正常，默认路由的流式正常（mockrelay 的帧太短，完整链路上没有触发压缩，压缩下的行为以 K9 实测为准）；T-C2、T-C4 通过（这次 10s 内回到 nahook，在 `fail_duration` 的窗口内） |
+
+T-C1 没有重跑：nahook 路由和生产都不写 `-1`，并且 `ignoreClientGoneContext` 在 Caddy v2.8.0 已经删除。
+
+观察：T-F15a 有一次用了 24.7s，是冷却门的设计行为：前一项"一直限流"放弃时 streak 停在 3（只有放行才清零），这次单次尝试耗时 5s，窗口是 5s×4。
+
+LT 现状：NewAPI rc.45；nahook `build-bd6fad86`；mockrelay `build-3a387b58`；Caddy 2.11.4（hold）+ `Caddyfile.d4`。回退：`apt-mark unhold caddy && apt-get install -y --allow-downgrades caddy=2.6.2-12+deb13u1`，再把备份的 `/etc/caddy` 拷回。

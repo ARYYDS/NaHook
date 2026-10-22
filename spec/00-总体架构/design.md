@@ -85,8 +85,7 @@ K8 只读核查（2026-10-22，生产主机 `api21/19`，43.160.222.91）：NewA
 
 - D3 场景：生产上的客户端现在就会收到流里的限流错误（这正是 nahook 要解决的问题）。原计划的阶段 2（关 h3 护栏）和阶段 3（换官方镜像）都不存在了，部署 nahook 并加上路由就立刻开始拦截。rc.44 和 LT 的 rc.45 在 nahook 依赖的代码上没有差别：`relay/channel/openai/relay_responses.go`、`relay/helper/stream_scanner.go` 两者相同，rc.44 也没有 `writeRelayStreamError`，`controller/relay.go` 只多了上游地址脱敏。
 - D3 建议：生产只有一个阶段，在现有的 rc.44 上部署 nahook（`build-bd6fad86`）和 Caddy 路由，不换镜像；验证同 P-2（journal 出现 intercept 后接 release 或 give_up，客户端拿到成功的流或 HTTP 429）；回退是去掉路由再 reload。部署前先完成 D4。
-- D4 场景：LT 的 Caddy 是 Debian 包 2.6.2，T0、T-C1–T-C4、Q17、Q18 的结论都是在 2.6.2 上得出的；生产是 2.11.4，`flush_interval -1` 的 `ignoreClientGoneContext` 在 v2.8.0 已删除，`encode` 的 Flush 在 v2.9.0 已修，重试时请求体的处理也可能不同。直接上生产，等于在生产上第一次验证 nahook 路由。
-- D4 建议：先把 LT 的 Caddy 换成和生产相同的 2.11.4（官方构建），站点层按生产的样子加回 `encode zstd gzip`，在 LT 上重跑 T-C1–T-C4，再测一次带压缩的逐帧到达（`curl --compressed -N`）。都通过以后，生产的 `encode` 保留不动；如果压缩会攒住事件，生产也去掉 `encode`。LT 的 NewAPI 保持 rc.45，不跟着降到 rc.44（上面的代码对比说明两者在 nahook 依赖的部分相同）。
+- D4 已完成（2026-10-22，用户批准，specaudit §7.19）：LT 的 Caddy 从 Debian 包 2.6.2 换成官方构建 2.11.4（`apt-mark hold`），站点层按生产加回 `encode zstd gzip`（`/root/nahook-t10/Caddyfile.d4`）。T-C2、T-C3、T-C4 和全部功能回归在 2.11.4 上都通过；带压缩时首帧 2KB 的 SSE 逐帧准时到达（zstd、gzip 都是），2.6.2 上 `encode` 攒住事件的问题在 2.11.4 上不存在。生产的 `encode` 保留不动。
 
 ### 1.3 端到端请求（两台主机的稳态）
 
@@ -187,7 +186,7 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 
 | 内容 | LT | 生产主机 |
 |---|---|---|
-| Caddyfile | `/etc/caddy/Caddyfile`；改之前先备份成 `Caddyfile.bak.<时间戳>`；加 nahook 路由之前的版本是 `Caddyfile.bak.20261021192639`；T10 之后的版本是 `/root/nahook-t10/Caddyfile.final3`（sha256 `d596319d293a93156b780ebfcc773971c70bc1a8d362afb869cb42ebc3f1518d`） | 同左（K8 核对） |
+| Caddyfile | `/etc/caddy/Caddyfile`；改之前先备份成 `Caddyfile.bak.<时间戳>`；加 nahook 路由之前的版本是 `Caddyfile.bak.20261021192639`；T10 之后的版本是 `/root/nahook-t10/Caddyfile.final3`（sha256 `d596319d293a93156b780ebfcc773971c70bc1a8d362afb869cb42ebc3f1518d`）；D4 之后是 `/root/nahook-t10/Caddyfile.d4`（sha256 `ff0c213b72bf9c9f12d14a7db2ecaee7a1e83c873bf078132fb0b05b613d93b8`） | `/etc/caddy/Caddyfile`（K8：sha256 `6ded83de…`，站点 `api19.xhub.chat`） |
 | NewAPI 编排 | `/root/container/luna-task/compose.yaml`；2026-10-21 已换成官方镜像，换之前的备份是 `compose.yaml.bak.20261021131926` | 同路径（K8 核对）；阶段 2 改环境变量，阶段 3 改镜像，改之前先备份成 `compose.yaml.bak.<时间戳>` |
 | nahook 配置 | `/etc/nahook/config.json` | 同左 |
 | systemd 单元 | `/etc/systemd/system/{nahook,mockrelay}.service` | `/etc/systemd/system/nahook.service` |
@@ -236,8 +235,8 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 **主站点的默认路由和站点层（2026-10-21 用户拍板，specaudit §7.16）**
 
 - 默认路由（`handle { … }`）也不写 `flush_interval`。写了 `-1` 时，客户端断开不会传到 NewAPI，NewAPI 会一直等到 30m 的响应头超时，然后重试、扣费；LT 改测试机之前的日志里，这样的记录有 33 次（不分路径）。去掉以后，客户端断开 1ms 内就传到后端（T0）；流式输出照常逐帧到达，Caddy 对 `text/event-stream` 会立即 flush（`streaming.go:133-137`）。T10 实测：`/v1/messages` 经站点和直连 NewAPI，逐帧到达时间只差约 12ms。
-- 站点层不写 `encode`。Caddy 2.6.2 的 `encode` 在首次写入超过 512 字节后才开始压缩，之后的 Flush 不冲刷压缩器，可能把 SSE 事件攒住（`01-nahook/audit.md` §5 K9）；经过 nahook 时首次写入更大，更容易触发（specaudit Q18）。去掉以后面板照样是压缩的：NewAPI 自己发出预压缩的前端文件（T10 实测首页带 `Content-Encoding: gzip`）。
-- LT 在 T10 改成了这个样子（`Caddyfile.final3`）；用户告知生产主站点本来就没有这两行，K8 核查时确认。
+- 站点层的 `encode` 只在 Caddy 2.6.2 上不能写：2.6.2 的 `encode` 在首次写入超过 512 字节后才开始压缩，之后的 Flush 不冲刷压缩器，可能把 SSE 事件攒住（`01-nahook/audit.md` §5 K9）；经过 nahook 时首次写入更大，更容易触发（specaudit Q18）。Caddy 2.11.4（LT 和生产现在的版本）上实测不会攒住事件（D4），所以 LT 按生产保留 `encode zstd gzip`。面板的前端文件本来就由 NewAPI 预压缩（T10 实测首页带 `Content-Encoding: gzip`）。
+- LT 在 T10 去掉了默认路由的 `-1`（`Caddyfile.final3`），D4 时按生产加回 `encode`（`Caddyfile.d4`）；生产主站点没有 `-1`（K8 已核对）。
 
 ### 6.2 LT 的测试渠道和测试令牌（用户在面板里创建）
 
@@ -294,7 +293,7 @@ WantedBy=multi-user.target
 
 | 部件 | 版本 | 出处 |
 |---|---|---|
-| Caddy | 2.6.2（不升级） | 实测 |
+| Caddy | 官方构建 2.11.4，LT 和生产相同。LT 在 2026-10-22 从 Debian 包 2.6.2 升级，`apt-mark hold caddy` | K8 实测生产；D4 |
 | nahook | Go，只用标准库；源码在 `ARYYDS/NaHook`，在 Win11 的 `O:\NaHook` 上构建 | `01-nahook/design.md` §7 |
 | LT 的 NewAPI | 官方 `calciumion/new-api@sha256:6c63c7ee9cd5bf7880df3984e99dd3ef07992d7a97538cfb2719adf9d87bc3f9`（`v1.0.0-rc.45`） | 2026-10-21 部署 |
 | 生产 NewAPI | 阶段 2：h3 `38e69e3`（`ghcr.io/alterem/new-api-h3@sha256:6249f47587fc2b6357eec5daead3afce4eae9b72410abc87a34af9077a0f4318`）；阶段 3：和 LT 相同的官方 digest。要换成别的官方版本，先在 LT 上重做 K4 核查并通过 T10 的相关审计项 | `01-nahook/audit.md` §5 K3、K4 |
@@ -315,5 +314,5 @@ WantedBy=multi-user.target
 | nahook 路由只配主动健康检查，不配 `fail_duration` | nahook 挂掉以后、下一次主动检查之前（最多 10s），每个请求都在 19080 上重试满 `lb_try_duration`（5s）后收到 502 | 写 `fail_duration 10s`（§3.2、§6.1；T10 T-C4） |
 | nahook 路由照抄主站点的 `lb_try_duration 5s`，指望重试回落到 3000 | Caddy 2.6.2 重试 POST 时请求体已被关闭，写给 3000 失败，3000 也被记一次失败；nahook 路由 10s 内全部 503 | 不写 `lb_try_duration`（§3.2；caddyserver/caddy#5454；T10 T-C4） |
 | 主站点默认路由写 `flush_interval -1` | 客户端断开传不到 NewAPI，NewAPI 等满 30m 的响应头超时以后还会重试、扣费 | 不写（§6.1；T0） |
-| 站点层写 `encode zstd gzip` | Caddy 2.6.2 可能把 SSE 事件攒在压缩器里，客户端一批一批地收到 | 不写；前端文件由 NewAPI 自己预压缩（§6.1） |
+| 在 Caddy 2.6.2 上写站点层 `encode zstd gzip` | 可能把 SSE 事件攒在压缩器里，客户端一批一批地收到 | 2.6.2 上不写；2.11.4 上实测不攒（D4），可以保留（§6.1） |
 | 生产的 3000 端口对公网开放 | 客户端直连就绕过了 nahook | 在安全组或防火墙上关掉 3000 的公网入口（`01-nahook/audit.md` §5 K5） |
