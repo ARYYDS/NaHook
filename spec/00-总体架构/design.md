@@ -8,7 +8,7 @@
 
 | 主机 | 用途 | 部件 |
 |---|---|---|
-| 测试机 LT（`lt.xhub.chat`，43.162.107.217） | 2026-10-21 起和生产隔离，只做测试 | Caddy、nahook、NewAPI（官方镜像）、Redis、mockrelay；临时的 h3 对照实例（只给 T-F1 用） |
+| 测试机 LT（`「LT 站点域名」`，「LT 主机 IP」） | 2026-10-21 起和生产隔离，只做测试 | Caddy、nahook、NewAPI（官方镜像）、Redis、mockrelay；临时的 h3 对照实例（只给 T-F1 用） |
 | 生产主机（是哪台待 K8 确认） | 线上服务 | Caddy、nahook（阶段 1 起）、NewAPI（先在 h3 上关护栏，再换官方镜像）、Redis |
 
 本专题还包括：两台主机上的端到端链路、端口和资源预算、先测试后上线的顺序、跨模块不变量。
@@ -27,8 +27,8 @@
 | 约束 | 出处 |
 |---|---|
 | LT：x86_64，Debian 13，systemd 257，Docker 29.8.2，没装 Go，内存 15GB。docker0 是 `172.17.0.1/16`；NewAPI 容器所在的网络 `luna-task_luna-task-network` 是 `172.18.0.0/16`，容器能直接连到 `172.17.0.1`（连没有程序监听的 18080 时立即返回 connection refused；宿主机防火墙链 `YJ-FIREWALL-INPUT` 为空） | 2026-10-20、10-21 实测 |
-| LT 的 NewAPI：官方 `calciumion/new-api@sha256:6c63c7ee9cd5bf7880df3984e99dd3ef07992d7a97538cfb2719adf9d87bc3f9`（`v1.0.0-rc.45`，源码 `6cf0d90b`），没有护栏；编排文件 `/root/container/luna-task/compose.yaml`；外部 MySQL 是 TDSQL-C 5.7（`10.0.0.4:3306/luna`），和生产隔离；同机 Redis | 2026-10-21 实测；数据库隔离由用户确认 |
-| LT 的 Caddy：2.6.2（Debian 包 `2.6.2-12+deb13u1`），`lt.xhub.chat` 站点配置了 `flush_interval -1` | 实测 |
+| LT 的 NewAPI：官方 `calciumion/new-api@sha256:6c63c7ee9cd5bf7880df3984e99dd3ef07992d7a97538cfb2719adf9d87bc3f9`（`v1.0.0-rc.45`，源码 `6cf0d90b`），没有护栏；编排文件 `/root/container/luna-task/compose.yaml`；外部 MySQL 是 TDSQL-C 5.7（`「LT 数据库」`），和生产隔离；同机 Redis | 2026-10-21 实测；数据库隔离由用户确认 |
+| LT 的 Caddy：2.6.2（Debian 包 `2.6.2-12+deb13u1`），`「LT 站点域名」` 站点配置了 `flush_interval -1` | 实测 |
 | 生产主机：和 LT 在 2026-10-21 之前的状态一致：NewAPI 是 h3 `38e69e3` 并打开护栏，Caddy 配置相同，外部 MySQL，同机 Redis | 用户告知，**未核实**（`01-nahook/audit.md` §5 K8） |
 
 ## §1 核心流程
@@ -74,7 +74,7 @@ T10 跑完审计清单（T-C、T-F）
 
 **待拍板：K8 发现生产主机和上面的前提不一致，上线路径要重定（specaudit §4 D3、D4）**
 
-K8 只读核查（2026-10-22，生产主机 `api21/19`，43.160.222.91）：NewAPI 是官方 `calciumion/new-api@sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84`（`v1.0.0-rc.44`，源码 `633b4c5b`），**没有护栏**；Caddy 是官方构建 **v2.11.4**，站点 `api19.xhub.chat` 没有 `flush_interval -1`，但有 `encode zstd gzip`；编排在 `/root/container/api19/compose.yaml`，数据库 `172.22.0.5:3306/new-api-api19`（和 LT 不是同一个库）；另有 `relayscope-agent`（读 NewAPI 的日志目录）和 `beszel-agent` 两个监控代理（01 audit K8）。
+K8 只读核查（2026-10-22，生产主机 `「生产主机名」`，「生产主机 IP」）：NewAPI 是官方 `calciumion/new-api@sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84`（`v1.0.0-rc.44`，源码 `633b4c5b`），**没有护栏**；Caddy 是官方构建 **v2.11.4**，站点 `「生产站点域名」` 没有 `flush_interval -1`，但有 `encode zstd gzip`；编排在 `/root/container/api19/compose.yaml`，数据库 `「生产数据库」`（和 LT 不是同一个库）；另有 `relayscope-agent`（读 NewAPI 的日志目录）和 `beszel-agent` 两个监控代理（01 audit K8）。
 
 ```text
 现在的生产                                   上线 nahook 之后
@@ -102,12 +102,12 @@ LT 上测试令牌对应的上游渠道是 mockrelay（§6.2）。
 ### 部署图
 
 ```text
-┌──────────────────────────── 测试机 LT（lt.xhub.chat）──────────────────────────────┐
+┌──────────────────────────── 测试机 LT（「LT 站点域名」）──────────────────────────────┐
 │ Caddy（systemd）:443                                                                │
 │   ├─ @stream_relay → 127.0.0.1:19080（nahook）, localhost:3000（回落）                │
 │   └─ 其他 → localhost:3000                                                          │
 │ nahook.service      127.0.0.1:19080   /run/nahook/ctl.sock   /etc/nahook/config.json  │
-│ luna-task-master    0.0.0.0:3000（官方 rc.45）→ MySQL 10.0.0.4/luna；Redis（容器网络内）│
+│ luna-task-master    0.0.0.0:3000（官方 rc.45）→ MySQL 「LT 数据库」；Redis（容器网络内）│
 │   └─ 测试渠道（独立分组）Base URL http://172.17.0.1:18080 ──┐                          │
 │ mockrelay.service   172.17.0.1:18080（只在 docker0 上监听）◄─┘                         │
 │ 临时：h3 对照实例   127.0.0.1:3002（只给 T-F1，测完就删）                               │
@@ -163,7 +163,7 @@ nahook 恢复后：下一次主动检查成功、被动失败计数过期，流�
 ### 3.3 LT 上的测试链路
 
 ```text
-curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080 ─► NewAPI :3000
+curl（测试令牌）─HTTPS─► 「LT 站点域名」（Caddy）─► nahook :19080 ─► NewAPI :3000
    ─► 测试渠道 ─► mockrelay 172.17.0.1:18080（用 /__mode 设定的脚本：rate_limit、ok、hold…）
 ```
 
@@ -186,7 +186,7 @@ curl（测试令牌）─HTTPS─► lt.xhub.chat（Caddy）─► nahook :19080
 
 | 内容 | LT | 生产主机 |
 |---|---|---|
-| Caddyfile | `/etc/caddy/Caddyfile`；改之前先备份成 `Caddyfile.bak.<时间戳>`；加 nahook 路由之前的版本是 `Caddyfile.bak.20261021192639`；T10 之后的版本是 `/root/nahook-t10/Caddyfile.final3`（sha256 `d596319d293a93156b780ebfcc773971c70bc1a8d362afb869cb42ebc3f1518d`）；D4 之后是 `/root/nahook-t10/Caddyfile.d4`（sha256 `ff0c213b72bf9c9f12d14a7db2ecaee7a1e83c873bf078132fb0b05b613d93b8`） | `/etc/caddy/Caddyfile`（K8：sha256 `6ded83de…`，站点 `api19.xhub.chat`） |
+| Caddyfile | `/etc/caddy/Caddyfile`；改之前先备份成 `Caddyfile.bak.<时间戳>`；加 nahook 路由之前的版本是 `Caddyfile.bak.20261021192639`；T10 之后的版本是 `/root/nahook-t10/Caddyfile.final3`（sha256 `d596319d293a93156b780ebfcc773971c70bc1a8d362afb869cb42ebc3f1518d`）；D4 之后是 `/root/nahook-t10/Caddyfile.d4`（sha256 `ff0c213b72bf9c9f12d14a7db2ecaee7a1e83c873bf078132fb0b05b613d93b8`） | `/etc/caddy/Caddyfile`（K8：sha256 `6ded83de…`，站点 `「生产站点域名」`） |
 | NewAPI 编排 | `/root/container/luna-task/compose.yaml`；2026-10-21 已换成官方镜像，换之前的备份是 `compose.yaml.bak.20261021131926` | 同路径（K8 核对）；阶段 2 改环境变量，阶段 3 改镜像，改之前先备份成 `compose.yaml.bak.<时间戳>` |
 | nahook 配置 | `/etc/nahook/config.json` | 同左 |
 | systemd 单元 | `/etc/systemd/system/{nahook,mockrelay}.service` | `/etc/systemd/system/nahook.service` |

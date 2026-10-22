@@ -31,7 +31,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | Q13 | R5 | 排期·T6 漏了对 T5 的依赖；T5 要等 G1，但排在 T7 前面 | 耦合 | P2 | 01 | 已关闭：`obs` 放进 T6，`cmd/nahook` 放进 T5；顺序改为 T7 → T6 → T5，T6 不依赖 T0（§7.9） |
 | Q14 | R5 | 测试·audit 用到的 mockrelay 行为（拉长输出、PING 之后再限流）在 §6.6 里没有定义；`/__log`、`http429`、`quota` 的格式没写 | 未细分 | P2 | 01 | 已关闭：design §6.6 重写，共 11 个脚本项 |
 | Q15 | R2 | 重试·打开心跳后，NewAPI 的终态错误以 200 SSE 的形式出现，nahook 会再重试一轮 | 耦合 | P1 | 01 | 已关闭：design §1.6 两条规则（request id 后缀；之前只有心跳且判定帧不带 type），T15 在 rc.45 和关护栏的 h3 上复测通过（Q20）；生产的心跳设置（K7）待查 |
-| Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 已查清（K8）：主机是 `api21/19`，基线不一致，转为 Q21 |
+| Q16 | R3 | 部署·生产主机是哪台、基线是否和 LT 改动前一致 | 不明 | P1 | 00、01 | 已查清（K8）：主机是 `「生产主机名」`，基线不一致，转为 Q21 |
 | Q17 | R3 | 部署·nahook 挂掉时 Caddy 不立即回落 | 脆弱 | P1 | 00 | 已关闭：`fail_duration 10s`、不写 `lb_try_duration`（00 §3.2、§6.1、§8）；T-C4 第三次通过 |
 | Q19 | R1 | 流式·启动阶段（含重试和冷却等待）客户端收不到任何字节，包括 NewAPI 的心跳 | 脆弱 | P2 | 01 | 已写进 01 design §1.8；影响面待 P-1、P-2 观察（和 K7 一起看） |
 | Q20 | R2 | 重试·心跳之后 NewAPI 转发的上游错误认不出来，nahook 叠加重试 | 耦合 | P1 | 01 | 已关闭：T15（`build-bd6fad86`）部署到 LT，关护栏的 h3 上复测 T-F17 通过（§7.17） |
@@ -168,7 +168,7 @@ SPEC 范围：`00-总体架构`、`01-nahook`。知识库 `渠道监控/自动�
 | K5 | 生产主机的 3000 端口是否暴露在公网 | 01 audit §5 | 已查清：没有暴露（安全组挡住） |
 | K6 | LT 上测试分组的定价 | 01 audit §5 | 已查清（01:T9、T10） |
 | K7 | 生产主机的心跳设置 | 01 audit §5 | LT 已查清（心跳开着、间隔 1s）；生产在 K8 时确认 |
-| K8 | 生产主机是哪台、基线是否和 LT 改动前一致 | 01 audit §5 | 已查清：`api21/19`，基线不一致（Q21） |
+| K8 | 生产主机是哪台、基线是否和 LT 改动前一致 | 01 audit §5 | 已查清：`「生产主机名」`，基线不一致（Q21） |
 | K9 | 站点层 `encode` 会不会憋住 SSE | 01 audit §5 | 已查清：2.6.2 会，2.11.4 不会（D4） |
 
 ## 6. 还没写 SPEC 的部分与写作顺序
@@ -406,7 +406,7 @@ SPEC 落点：
 
 | 改动 | 落点 |
 |---|---|
-| 测试环境改成 LT 整机：经 `lt.xhub.chat` 的 nahook 路由测；撤掉原来单独的一套测试实例（3001 的 SQLite NewAPI、19081 的 nahook-test、19443 的测试站点、`test.json`、`nahook-test.service`） | 00 design §0、§2、§3.3、§4、§5、§6；01 tasks T8、T9、T10；01 audit §2 |
+| 测试环境改成 LT 整机：经 `「LT 站点域名」` 的 nahook 路由测；撤掉原来单独的一套测试实例（3001 的 SQLite NewAPI、19081 的 nahook-test、19443 的测试站点、`test.json`、`nahook-test.service`） | 00 design §0、§2、§3.3、§4、§5、§6；01 tasks T8、T9、T10；01 audit §2 |
 | 测试渠道和测试令牌放进独立分组，T9 验证隔离；Base URL `http://172.17.0.1:18080` | 00 design §6.2、§8 |
 | h3 对照实例（T-F1）的启动方式写全：固定 digest，只绑定 127.0.0.1 | 00 design §6.3 |
 | 生产阶段 T11–T13 改到生产主机上，开工前先查 K8 | 00 design §1.1、§1.2；00 tasks；01 tasks T11–T13；01 audit P-1–P-3、K8 |
@@ -446,7 +446,7 @@ SPEC 落点：
 - 两次 `systemctl reload caddy` 在 14:09:55 和 14:16:50，都是 `load complete`。
 - Caddyfile 已恢复，sha256 `c688d03e…` 和备份一致；19444、19082、19083 已释放；后端进程已退出。
 
-局限：只测了 HTTP/1.1 回环。源码表明 `-1` 的行为只看配置值、和协议无关，T-C1、T-C2 在 `lt.xhub.chat` 上用 `curl --http2` 复测。
+局限：只测了 HTTP/1.1 回环。源码表明 `-1` 的行为只看配置值、和协议无关，T-C1、T-C2 在 `「LT 站点域名」` 上用 `curl --http2` 复测。
 
 顺带观察（不在 NaHook 范围内，交给用户决定）：生产主站点的所有路径都写了 `-1`。没走 nahook 的请求（非流式请求、nahook 不可用时的回落）如果在 NewAPI 回出第一个字节之前客户端就断开了，NewAPI 会一直执行到结束，上游费用照样产生。
 
@@ -531,8 +531,8 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 | Caddy 路由 | 架构侧在旁边生成新文件（00 §6.1 的路由，原 `reverse_proxy` 原样放进 `handle {}`），`caddy validate` 通过；替换和 reload 由用户执行（架构侧执行时被本机的权限分类器拦下，没有执行任何部分） | 新 Caddyfile 的 sha256 是 `d293d3f617c2ca13181f2ef3c9d59c8497a3ce4fe9b3bc26a85d98b66e9e530f`；备份 `Caddyfile.bak.20261021192639` 和 `Caddyfile.bak.t0` 逐字节相同；caddy active |
 
 验收（T9 完成判据）：
-- `https://lt.xhub.chat/api/status` 走 HTTP/2 返回 200；`nahookctl retry get` 返回 `max=3`，`stats` 正常返回。
-- 用测试令牌经 `lt.xhub.chat`（HTTP/2）：
+- `https://「LT 站点域名」/api/status` 走 HTTP/2 返回 200；`nahookctl retry get` 返回 `max=3`，`stats` 正常返回。
+- 用测试令牌经 `「LT 站点域名」`（HTTP/2）：
   - `/v1/responses`，mockrelay 为 `ok`：200，完整收到 `response.completed`；
   - `/v1/chat/completions`，`ok`：200，以 `data: [DONE]` 结束；
   - `/v1/responses`，脚本 `rate_limit, ok`：nahook 拦截，冷却门等待 46ms 后第二次尝试放行，客户端拿到 200 的完整流；mockrelay `/__log` 记了两条；
@@ -562,7 +562,7 @@ DSH 交付回报里的自行决定和风险点，架构侧的裁决：
 | T-F6 | `ok`，经 SITE 和 DIRECT 各一次；用 `GET /api/log/token`（令牌鉴权、只读，rc.45 `router/api-router.go:359`）按 request id 取消费日志 | SSE 字节相同；两条日志都是 quota 125、prompt 10、completion 3、渠道 5 | 通过 |
 | T-F8 | 把配置文件写成截断的 JSON 后 `systemctl reload nahook`，最后恢复原文件 | 日志 `config.reload_failed`（unexpected EOF）；pid 不变；`retry get` 仍是 3；`nahookctl reload` 退出码 1，返回同样的错误；期间拦截照常；恢复后 `config.reloaded`，文件哈希和原来相同 | 通过 |
 | T-F9 | `rate_limit, rate_limit, ok` 经 SITE；用 nahook 日志里每次尝试的 request id 对日志 | 两次被拦截的尝试各 1 行消费日志，quota 0，内容 "Upstream returned no usage, so nothing was charged"；放行的那次 quota 125 | 已测：每次被拦截的尝试 $0、记 1 行；一个被拦截 n 次的请求共 n+1 行日志（Q6） |
-| T-F10 | 同样的 `X-Forwarded-For`、`X-Real-IP`（203.0.113.7）经 NH 和 DIRECT 各发一次；再经 SITE 分别走 nahook 路由、默认路由，以及客户端自带 XFF。看 NewAPI 的 GIN 访问日志（消费日志的 ip 为空，测试账号没有开 IP 记录） | NH 和 DIRECT 都是 203.0.113.7；SITE 三种情况都是真实客户端 43.162.107.217 | 通过 |
+| T-F10 | 同样的 `X-Forwarded-For`、`X-Real-IP`（203.0.113.7）经 NH 和 DIRECT 各发一次；再经 SITE 分别走 nahook 路由、默认路由，以及客户端自带 XFF。看 NewAPI 的 GIN 访问日志（消费日志的 ip 为空，测试账号没有开 IP 记录） | NH 和 DIRECT 都是 203.0.113.7；SITE 三种情况都是真实客户端 「LT 主机 IP」 | 通过 |
 | T-F11 | 看权限；用 `runuser -u nobody` 执行 `stats` 和 `retry set 9` | 目录 0700、socket 0600；nobody 两次都是 permission denied，上限仍是 3 | 通过 |
 | T-F12 | `quota` | 200，原样放行；`rate_limited` 不变、`released` +1；mockrelay 1 次；和直连逐字节相同 | 通过 |
 | T-F13 | `chat_rate_limit`，走 chat 路径 | mockrelay 4 次后 429 | 通过 |
@@ -677,16 +677,16 @@ T10 到此全部完成（00 G2 收口）。LT 现状：NewAPI rc.45；nahook `bu
 
 ### 7.18 K8：生产主机只读核查（2026-10-22）
 
-用户告知生产是 `api21/19`（USGL 里 `api21/19` 和 `api19` 两条记录都是 43.160.222.91），测试遗留（LT 上的令牌副本和 `/root/nahook-t10/`）保留到生产测完再处理。核查只读：没有重启、没有写文件；编排里的密钥没有打印；没有导出日志。
+用户告知了生产主机（USGL 里有两条记录指向同一台主机），测试遗留（LT 上的令牌副本和 `/root/nahook-t10/`）保留到生产测完再处理。核查只读：没有重启、没有写文件；编排里的密钥没有打印；没有导出日志。
 
 | 项 | 结果 |
 |---|---|
 | 主机 | Debian 13，4 核，内存 7.9G（可用 6.5G），根分区 118G 用了 6% |
 | 容器 | `api19`（`calciumion/new-api:latest`，digest `67bf2716…`，rc.44，源码 `633b4c5b`，healthy）、`redis_api19`、`relayscope-agent-api19`、`beszel-agent` |
-| NewAPI 配置 | 编排 `/root/container/api19/compose.yaml`，服务名 `new-api`；环境变量里没有 `RESPONSES_STREAM_STARTUP_GUARD_ENABLED`；`ERROR_LOG_ENABLED=true`、`BATCH_UPDATE_ENABLED=true`（间隔 300）；数据库 `172.22.0.5:3306/new-api-api19`、Redis 在容器网络里 |
+| NewAPI 配置 | 编排 `/root/container/api19/compose.yaml`，服务名 `new-api`；环境变量里没有 `RESPONSES_STREAM_STARTUP_GUARD_ENABLED`；`ERROR_LOG_ENABLED=true`、`BATCH_UPDATE_ENABLED=true`（间隔 300）；数据库 `「生产数据库」`、Redis 在容器网络里 |
 | 端口 | 3000 由 docker-proxy 监听 `0.0.0.0`；80、443 是 Caddy；19080、18080 空闲 |
-| K5 | 从 LT 经公网请求 `http://43.160.222.91:3000/api/status`，6s 超时 |
-| Caddy | 官方构建 v2.11.4（dpkg 2.11.4），active；Caddyfile 53 行，sha256 `6ded83def1f40ff715396032f6bf98331d6f57db015130a3f58bdd5b976ccf2d`；站点 `api19.xhub.chat`：`reverse_proxy localhost:3000`（`least_conn`、`lb_try_duration 5s`、健康检查、`response_header_timeout 30m`、`X-Real-IP`），`encode zstd gzip`，`request_body` 512MB；没有 `flush_interval` |
+| K5 | 从 LT 经公网请求 `http://「生产主机 IP」:3000/api/status`，6s 超时 |
+| Caddy | 官方构建 v2.11.4（dpkg 2.11.4），active；Caddyfile 53 行，sha256 `6ded83def1f40ff715396032f6bf98331d6f57db015130a3f58bdd5b976ccf2d`；站点 `「生产站点域名」`：`reverse_proxy localhost:3000`（`least_conn`、`lb_try_duration 5s`、健康检查、`response_header_timeout 30m`、`X-Real-IP`），`encode zstd gzip`，`request_body` 512MB；没有 `flush_interval` |
 | 监控代理 | `relayscope-agent-api19`：挂载 NewAPI 日志目录、`agent.yaml`、spool 目录和 docker.sock；`beszel-agent`：主机网络，挂载 docker.sock，环境变量有 `HUB_URL` |
 | nahook | 主机上没有 nahook 的二进制和 unit |
 

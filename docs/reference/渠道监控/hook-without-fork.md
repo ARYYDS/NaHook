@@ -1,8 +1,8 @@
 # LT 上补丁怎么跑，以及不改官方源码的 hook
 
-## 1. LT（lt.xhub.chat）实际部署
+## 1. LT（「LT 站点域名」）实际部署
 
-主机 `VM-0-13-debian`，容器 `luna-task-master`。
+主机 `「LT 主机名」`，容器 `luna-task-master`。
 
 | 项 | 值 |
 |---|---|

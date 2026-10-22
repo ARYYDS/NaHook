@@ -10,7 +10,7 @@ hook v1 只做四件事：Caddy 接入、冷却门、抖动重试和代 429、�
 |---|---|
 | 官方源码 | `C:\code\NewAPI\NEWAPI`，`QuantumNous/new-api` `206e0fa5c`（2026-10-20 克隆，blob 按需拉取）。**本目录所有行号都按这棵树** |
 | h3 源码 | `C:\code\NewAPI\H3`，`38e69e300`（官方加上 Responses 启动护栏） |
-| LT | `lt.xhub.chat`，Caddy 2.6.2 + `new-api-h3`（`main-20261020-38e69e3`），实测日期 2026-10-20 |
+| LT | `「LT 站点域名」`，Caddy 2.6.2 + `new-api-h3`（`main-20261020-38e69e3`），实测日期 2026-10-20 |
 | 上一级的 429 笔记 | [../README.md](../README.md) |
 
 ## 文件索引（标题行号）

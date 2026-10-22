@@ -1,6 +1,6 @@
 # LT 实测（2026-10-20，全部是只读查看）
 
-主机：`lt`（`lt.xhub.chat`）。方法：用 `docker logs` 看容器 `luna-task-master` 的日志，读 Caddyfile，调用不需要鉴权的接口。
+主机：`lt`（`「LT 站点域名」`）。方法：用 `docker logs` 看容器 `luna-task-master` 的日志，读 Caddyfile，调用不需要鉴权的接口。
 
 ## 1. 部署形态
 

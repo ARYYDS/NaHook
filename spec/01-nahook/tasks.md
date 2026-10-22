@@ -42,7 +42,7 @@ L-DOC                                                                           
   - 完成判据：
     - [x] 四种组合各跑 3 次，`t0_report.py` 的 12 行明细都有结果（`hold` 行是 `peer_closed`、`peer_reset` 或 `timeout_still_open`；`stream` 行是 `write_failed` 或 `completed`）
     - [x] 按测试方案第 8 节的判定表得出结论；架构侧写进 specaudit §3 的 Q1，并回写到 00 §6.1 和 audit K1
-    - [x] 临时站点已删除，Caddyfile 的 sha256 和实验前一致，`lt.xhub.chat` 的健康检查返回 200，后端进程已停止
+    - [x] 临时站点已删除，Caddyfile 的 sha256 和实验前一致，`「LT 站点域名」` 的健康检查返回 200，后端进程已停止
   - 冲突：`/etc/caddy/Caddyfile`（见 §3）
 
 - [ ] **T1 仓库骨架和 config 包**（L-GO）
@@ -144,11 +144,11 @@ L-DOC                                                                           
   - 改动：在 LT 上：
     - 从 Release `build-<8hex>` 下载到 `/root/nahook-dist/<8hex>/`，`sha256sum -c SHA256SUMS` 通过后，再用 `install -m 0755` 安装到 `/usr/local/bin`；
     - 安装 `nahook.service`、`mockrelay.service`（00 §6.4）和 `/etc/nahook/config.json`（`retry.max=3`，`match.models` 包含 `gpt-6-astra`）；
-    - 备份 Caddyfile 后，在 `lt.xhub.chat` 站点里加 nahook 路由（00 §6.1），`caddy validate` 通过后 reload
+    - 备份 Caddyfile 后，在 `「LT 站点域名」` 站点里加 nahook 路由（00 §6.1），`caddy validate` 通过后 reload
   - 依据：00 §2、§6 ｜ audit §2
   - 完成判据：
-    - [x] `https://lt.xhub.chat/api/status` 返回 200；`nahookctl stats` 能返回
-    - [x] mockrelay 设为 `ok` 时，用测试令牌经 `lt.xhub.chat` 能拿到完整的流；mockrelay 的 `/__log` 有记录
+    - [x] `https://「LT 站点域名」/api/status` 返回 200；`nahookctl stats` 能返回
+    - [x] mockrelay 设为 `ok` 时，用测试令牌经 `「LT 站点域名」` 能拿到完整的流；mockrelay 的 `/__log` 有记录
     - [x] 隔离：用测试令牌发请求后，LT 上其他渠道没有新的调用（00 §6.2）
   - 冲突：LT `/etc/caddy/Caddyfile`（见 §3）
 
